@@ -61,12 +61,31 @@
 /*                                                                        */
 /*    That is the cheapest possible mechanism and it costs exactly one     */
 /*    thing, which is written down here rather than discovered later: with */
-/*    IMO clear, the hypervisor cannot take an interrupt of its own while  */
-/*    a partition is running either.  A hypervisor tick that ENDS a        */
-/*    partition's window therefore needs IMO SET, and with IMO set every   */
-/*    guest interrupt has to be injected through a List Register.  That is */
-/*    the change time partitioning brings, and it is a change to this      */
-/*    file and to zx_trap_handler.S rather than to any guest.              */
+/*    IMO clear, the hypervisor cannot take an IRQ of its own while a      */
+/*    partition is running either.                                        */
+/*                                                                        */
+/*    THE WAY OUT IS FIQ, NOT INJECTION, and the distinction matters       */
+/*    because one of them is a rewrite and the other is two register       */
+/*    writes.  Routing is by exception TYPE and not by INTID: HCR.FMO      */
+/*    sends physical FIQ to EL2 while HCR.IMO, left clear, leaves IRQ with */
+/*    EL1.  So the hypervisor's own timer on PPI 26 goes in GROUP 0 --     */
+/*    which is what the GIC delivers as FIQ -- and arrives at EL2 while    */
+/*    every partition interrupt stays Group 1, stays an IRQ, and is still  */
+/*    delivered straight to EL1 with no List Register anywhere.            */
+/*                                                                        */
+/*    And it is better than injection rather than merely cheaper.  With    */
+/*    FMO set, PSTATE.F is IGNORED at EL0 and EL1, so a partition cannot   */
+/*    mask the interrupt that ends its own window.  A tick delivered as an */
+/*    IRQ to EL1 could be deferred by any guest that disabled interrupts,  */
+/*    which is the whole property time partitioning must not concede.      */
+/*                                                                        */
+/*    The guest half of that arrangement is ALREADY IN PLACE: a partition  */
+/*    is granted no Group 0 interrupt and never enables ICC_IGRPEN0, so    */
+/*    nothing can deliver an FIQ to it.  What is missing is at EL2 --      */
+/*    FMO, PPI 26 in Group 0, and a real body on the FIQ vector -- and     */
+/*    none of it has been run.  Injection through the List Registers stays */
+/*    where the roadmap put it: a later phase, for bounding interrupt      */
+/*    latency, not a prerequisite for a partition tick.                    */
 /*                                                                        */
 /*  MISRA C:2012 deviations (justified)                                   */
 /*                                                                        */

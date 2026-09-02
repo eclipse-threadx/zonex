@@ -76,9 +76,11 @@
 /*                                                                        */
 /*    On lockstep silicon it demonstrates preemption and a frozen clock   */
 /*    for ONE partition on ONE logical core.  Time PARTITIONING -- a      */
-/*    hypervisor tick that ENDS a partition's window -- is not this, and  */
-/*    is not here: it needs HCR.IMO set, which changes how every guest    */
-/*    interrupt is delivered.  See docs/decisions.md D24.                 */
+/*    hypervisor tick that ENDS a partition's window -- is not this and   */
+/*    is not here.  It needs HCR.FMO and the hypervisor's own timer in    */
+/*    GROUP 0, so that its tick arrives as an FIQ at EL2 while every      */
+/*    guest interrupt stays an IRQ delivered straight to EL1, exactly as  */
+/*    it is here.  See docs/decisions.md D24.                             */
 /*                                                                        */
 /**************************************************************************/
 

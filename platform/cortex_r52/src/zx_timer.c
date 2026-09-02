@@ -38,10 +38,13 @@
 /*                                merely unread.                          */
 /*                                                                        */
 /*    The partition tick -- the hypervisor's OWN timer, on PPI 26, which  */
-/*    ends a window -- is not here yet, and cannot be until HCR.IMO is    */
-/*    set: with IMO clear a physical interrupt taken while a partition    */
-/*    runs is delivered straight to EL1, and the hypervisor would never   */
-/*    see its own timer.  See docs/decisions.md D24.                      */
+/*    ends a window -- is not here yet.  It does NOT need HCR.IMO: that   */
+/*    would route every guest IRQ to EL2 as well.  Routing is by          */
+/*    exception TYPE, so the tick goes in GROUP 0, arrives as an FIQ, and */
+/*    HCR.FMO alone brings it to EL2 while guest IRQs stay with EL1.      */
+/*    With FMO set, PSTATE.F is ignored at EL1, so a partition cannot     */
+/*    mask the interrupt that ends its own window.                        */
+/*    See docs/decisions.md D24.                                          */
 /*                                                                        */
 /*  MISRA C:2012 deviations (justified)                                   */
 /*                                                                        */

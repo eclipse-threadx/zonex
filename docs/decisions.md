@@ -966,14 +966,36 @@ Cortex-R52 does implement the virtual CPU interface — `ICH_HCR`, `ICH_VTR` and
 four List Registers, confirmed on both targets — so injection is available and
 is deliberately not used.
 
-**The cost is stated here because it becomes the next phase's whole problem:**
-with `IMO` clear the hypervisor cannot take an interrupt of its own while a
-partition is running either, *including its own timer*. A hypervisor tick that
-ENDS a partition's window therefore needs `IMO` SET — and with `IMO` set, every
-guest interrupt has to be injected through a List Register. That is a change to
-`zx_gic.c` and `zx_trap_handler.S` and to **no guest**, which is exactly why the
-shape here is worth having first: it is the version whose correctness can be
-established before the delivery mechanism becomes complicated.
+**The cost, and the way out — which is not the one this entry first claimed.**
+With `IMO` clear the hypervisor cannot take an *IRQ* of its own while a
+partition is running either. This entry originally concluded that a hypervisor
+tick therefore needs `IMO` set, and that every guest interrupt would then have to
+be injected through a List Register. **That is wrong, and the correction is
+worth more than the original claim was.**
+
+Routing is by exception **type**, not by INTID. `HCR.FMO` sends physical FIQ to
+EL2 while `HCR.IMO`, left clear, leaves IRQ with EL1. So the hypervisor's own
+timer on PPI 26 goes in **Group 0** — which is what the GIC delivers as FIQ —
+and arrives at EL2, while every partition interrupt stays Group 1, stays an IRQ,
+and is still delivered straight to EL1. No injection, no List Register, and no
+change to any guest.
+
+**And it is better than injection rather than merely cheaper.** With `FMO` set,
+`PSTATE.F` is *ignored* at EL0 and EL1, so a partition cannot mask the interrupt
+that ends its own window. A tick delivered as an IRQ to EL1 could be deferred by
+any guest that disabled interrupts — which is precisely the property time
+partitioning must not concede.
+
+**The guest half of that arrangement is already in place**, which is why the
+shape here is worth having first: a partition is granted no Group 0 interrupt and
+never enables `ICC_IGRPEN0`, so nothing can deliver an FIQ to it. What is missing
+is all at EL2 — `FMO`, PPI 26 in Group 0, and a real body on the FIQ vector — and
+none of it has been run.
+
+Injection through the List Registers stays where the roadmap put it: a later
+phase, for making interrupt latency a hypervisor-controlled and WCET-bounded
+quantity. It is not a prerequisite for a partition tick, and treating it as one
+would have made the next step look far larger than it is.
 
 ### What a partition ends up touching
 
