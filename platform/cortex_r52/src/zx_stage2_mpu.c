@@ -142,7 +142,7 @@ _Static_assert(ZX_ASM_FAULT_OFF_SPSR
 
 /* HPRBAR: BASE[31:6] | SH[4:3] | AP[2:1] | XN[0].  */
 
-static uint32_t zx_region_bar(const zx_region_t *region_ptr)
+static uint32_t zx_region_bar(const ZX_REGION *region_ptr)
 {
     return (((uint32_t)region_ptr->zx_region_base & ZX_REGION_ADDR_MASK)
             | ((region_ptr->zx_region_sh & 0x3U) << ZX_HPRBAR_SH_SHIFT)
@@ -159,10 +159,10 @@ static uint32_t zx_region_bar(const zx_region_t *region_ptr)
    reproduces the caller's inclusive limit exactly -- while keeping those bits
    away from AttrIndx, which is the trap this masking exists for.  */
 
-static uint32_t zx_region_lar(const zx_region_t *region_ptr, uint32_t enable)
+static uint32_t zx_region_lar(const ZX_REGION *region_ptr, uint32_t enable)
 {
     return (((uint32_t)region_ptr->zx_region_limit & ZX_REGION_ADDR_MASK)
-            | ((region_ptr->zx_region_attrindx & 0x7U)
+            | ((region_ptr->zx_region_attr_index & 0x7U)
                << ZX_HPRLAR_ATTRINDX_SHIFT)
             | ((enable != 0U) ? ZX_HPRLAR_EN : 0U));
 }
@@ -249,9 +249,9 @@ void zx_mair_program(void)
 /*  overlapping another is CONSTRAINED UNPREDICTABLE and aborts.           */
 /**************************************************************************/
 
-void zx_stage2_region_program(uint32_t index, const zx_region_t *region_ptr)
+void zx_stage2_region_program(uint32_t index, const ZX_REGION *region_ptr)
 {
-    if (region_ptr == (const zx_region_t *)0)
+    if (region_ptr == (const ZX_REGION *)0)
     {
         return;
     }
@@ -305,15 +305,15 @@ void zx_stage2_region_read(uint32_t index, uint32_t *base_ptr,
 /*                                                                        */
 /*  Only region 16 is implemented directly.  Generalising to 17-24 before  */
 /*  the encoding is known to work would be building on the thing under     */
-/*  test; that is step 3's job, once the answer is in.                     */
+/*  test; that waits until the answer is in.                              */
 /**************************************************************************/
 
-void zx_stage2_region_program_direct16(const zx_region_t *region_ptr)
+void zx_stage2_region_program_direct16(const ZX_REGION *region_ptr)
 {
     uint32_t bar;
     uint32_t lar;
 
-    if (region_ptr == (const zx_region_t *)0)
+    if (region_ptr == (const ZX_REGION *)0)
     {
         return;
     }

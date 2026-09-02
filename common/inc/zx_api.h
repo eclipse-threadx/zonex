@@ -109,6 +109,48 @@ extern "C" {
 /*                          Fundamental types                             */
 /**************************************************************************/
 
+/* The suite's integer type names, deliberately identical to the eight
+   typedefs every ThreadX port carries in its own tx_port.h.
+
+   ZoneX does not link ThreadX (docs/decisions.md D9), so it cannot reach
+   tx_port.h for them -- and should not: a manifest has to be readable with no
+   ThreadX checkout in sight, which is also what lets the host suite build
+   with none present.  ZoneX therefore keeps its own copy.
+
+   Copying rather than respelling them in <stdint.h> terms is the deliberate
+   choice, and the suite-wide C17 upgrade is what settles it.  That upgrade
+   changes no struct layout, no calling convention and no type name; it
+   regression-tests that a C99 application still compiles against the new
+   headers.  These names are load-bearing for that promise and therefore
+   permanent, so adopting them costs nothing later.  A manifest written in
+   uint8_t would make ZoneX the one component of the suite whose user-facing
+   contract used a different vocabulary, for no gain.
+
+   Identical typedef redeclaration is legal from C11 onwards, so an
+   application including both tx_api.h and zx_api.h is well-formed.  The
+   coupling that remains is the real cost: a port that ever respelled one of
+   these -- ULONG as unsigned long long, say -- would conflict with this copy
+   at the point of inclusion.  That is deliberately left unguarded, because a
+   hard error at the include is the outcome worth having; an #ifndef around
+   the block would hide the divergence instead.
+
+   VOID is not copied.  ThreadX spells it as a macro rather than a typedef,
+   ZoneX writes plain void and has no use for it, and an uncopied macro cannot
+   collide.
+
+   Addresses are NOT spelled with these -- see zx_addr_t below, and D5.  ULONG
+   is unsigned long, which is not pointer-width on every ABI the suite
+   targets; the suite's own C17 plan adds a static assertion to each
+   tx_port.h precisely to catch that mismatch.  */
+typedef char            CHAR;
+typedef unsigned char   UCHAR;
+typedef int             INT;
+typedef unsigned int    UINT;
+typedef long            LONG;
+typedef unsigned long   ULONG;
+typedef short           SHORT;
+typedef unsigned short  USHORT;
+
 /* An address in a partition manifest or in an MPU region descriptor.
    Deliberately a width-correct typedef rather than a bare unsigned long: the
    manifest is a data structure ZoneX means to keep across ports, and Armv8-R

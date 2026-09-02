@@ -35,7 +35,7 @@
 /*    TRM Table 8-4) and the console works anyway while EL2's caches are  */
 /*    off, which they are in this image.  So the Device region programmed */
 /*    below is not what makes the console work today; it is what makes it */
-/*    keep working when step 5 turns caches on for the timing            */
+/*    keep working once caches are turned on for the timing               */
 /*    measurements.  Programming it now, and reporting that it was        */
 /*    programmed, is what stops that from being discovered then.         */
 /*                                                                        */
@@ -275,7 +275,7 @@ uint32_t zx_board_mmio_region_count(void)
 
 void zx_board_program_mmio_regions(uint32_t first_index)
 {
-    zx_region_t region;
+    ZX_REGION region;
     uint32_t    console_index = first_index;
     uint32_t    gic_index     = first_index + 1U;
 
@@ -287,7 +287,7 @@ void zx_board_program_mmio_regions(uint32_t first_index)
     region.zx_region_ap       = ZX_AP_EL2_RW_GUEST_NONE;
     region.zx_region_xn       = ZX_XN_NEVER;
     region.zx_region_sh       = ZX_SH_NON_SHAREABLE;
-    region.zx_region_attrindx = ZX_ATTR_DEVICE;
+    region.zx_region_attr_index = ZX_ATTR_DEVICE;
     zx_stage2_region_program(console_index, &region);
 
     /* The GIC.  Phase 0 configures no interrupts, and this region exists
@@ -302,7 +302,7 @@ void zx_board_program_mmio_regions(uint32_t first_index)
     region.zx_region_ap       = ZX_AP_EL2_RW_GUEST_NONE;
     region.zx_region_xn       = ZX_XN_NEVER;
     region.zx_region_sh       = ZX_SH_NON_SHAREABLE;
-    region.zx_region_attrindx = ZX_ATTR_DEVICE;
+    region.zx_region_attr_index = ZX_ATTR_DEVICE;
     zx_stage2_region_program(gic_index, &region);
 
     /* NOTHING IS PRINTED HERE, deliberately.  This function runs BEFORE the

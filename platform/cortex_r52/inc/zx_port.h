@@ -134,7 +134,7 @@
 /**************************************************************************/
 
 /* Needed at EL2 because ZoneX must leave the EL1 MPU in a known state before
-   handing a payload the machine.  Step 2 deliberately leaves SCTLR.M CLEAR:
+   handing a payload the machine.  Stage-2 bring-up leaves SCTLR.M CLEAR:
    with stage 1 disabled the payload runs on the EL1 background map and the
    only thing under test is stage 2.  One variable at a time.  */
 
@@ -167,29 +167,16 @@
 #define ZX_HPRLAR_EN            ZX_BIT(0)
 #define ZX_HPRLAR_ATTRINDX_SHIFT 1U
 
-/* AP[2:1] for the EL2-controlled MPU, TRM Table 3-82.  Named rather than
-   numbered because there is NO encoding that grants a guest access while
-   denying EL2 -- a partition's memory is always reachable from the
-   hypervisor, and isolation between partitions comes from which regions are
-   ENABLED, never from these bits.  See docs/decisions.md D3.  */
+/* The AP, SH and XN ENCODINGS are not here.  They live in core/inc/
+   zx_manifest.h, with the region descriptor whose fields hold them, because
+   a manifest author needs them and the host-side validator needs them, and
+   neither can include a Cortex-R52 port header.  Nothing in assembly uses
+   them, which is what makes the move free.
 
-#define ZX_AP_EL2_RW_GUEST_NONE ZX_C32(0x0)
-#define ZX_AP_EL2_RW_GUEST_RW   ZX_C32(0x1)
-#define ZX_AP_EL2_RO_GUEST_NONE ZX_C32(0x2)
-#define ZX_AP_EL2_RO_GUEST_RO   ZX_C32(0x3)
-
-/* SH[1:0].  0b01 is UNPREDICTABLE for Normal memory (TRM Table 3-81), so a
-   zeroed field -- Non-shareable -- is the safe default and the only value
-   Phase 0 uses.  */
-
-#define ZX_SH_NON_SHAREABLE     ZX_C32(0x0)
-#define ZX_SH_OUTER_SHAREABLE   ZX_C32(0x2)
-#define ZX_SH_INNER_SHAREABLE   ZX_C32(0x3)
-
-/* XN.  1 = execute never.  */
-
-#define ZX_XN_EXECUTABLE        ZX_C32(0x0)
-#define ZX_XN_NEVER             ZX_C32(0x1)
+   What stays here is everything the encodings are shifted INTO -- the field
+   positions above -- plus the HMAIR byte layout below, which is this port's
+   choice of what each attribute index means rather than an architectural
+   fact.  */
 
 /**************************************************************************/
 /*                        Memory attributes: HMAIR0/1                     */
@@ -270,8 +257,8 @@
 /* What zx_el2_run_payload returns.  It is a real return: the trap handler
    restores the EL2 context that zx_el2_run_payload saved and resumes it, so a
    guest fault comes back to the hypervisor as a VALUE rather than as a jump
-   into a handler that has to decide policy with no context.  Step 3 keeps
-   this shape; it is how a partition switch will be driven.  */
+   into a handler that has to decide policy with no context.  This shape is
+   kept as partitions arrive; it is how a partition switch will be driven.  */
 
 #define ZX_RUN_YIELDED          ZX_C32(0x0)  /* payload returned, HVC #1     */
 #define ZX_RUN_FAULTED          ZX_C32(0x1)  /* stage-2 fault, EC 0x24/0x20  */
@@ -335,29 +322,15 @@
 #include "zx_console.h"
 #include "zx_fault.h"
 
+/* The region descriptor (ZX_REGION) and the AP/SH/XN encodings it holds come
+   from here.  The port programs what a manifest declares, so the descriptor
+   belongs to the manifest and not to this port: the host-side validator has
+   to build and check the same objects with no Cortex-R52 header in reach.  */
+#include "zx_manifest.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
-
-/**************************************************************************/
-/*                            Region descriptor                           */
-/**************************************************************************/
-
-/* One stage-2 region, as the manifest will eventually describe it and as
-   zx_stage2_region_program writes it.  The limit is INCLUSIVE, matching the
-   hardware rather than converting at every call site: PMSAv8-R has no size
-   field, and a length that has to be turned into an inclusive limit in three
-   places is a length that gets it wrong in one of them.  */
-
-typedef struct zx_region_struct
-{
-    zx_addr_t zx_region_base;       /* first byte, granule aligned          */
-    zx_addr_t zx_region_limit;      /* LAST byte, inclusive                 */
-    uint32_t  zx_region_ap;         /* ZX_AP_*                              */
-    uint32_t  zx_region_xn;         /* ZX_XN_*                              */
-    uint32_t  zx_region_sh;         /* ZX_SH_*                              */
-    uint32_t  zx_region_attrindx;   /* ZX_ATTR_*                            */
-} zx_region_t;
 
 /**************************************************************************/
 /*                          Identity and capability                       */
@@ -397,7 +370,7 @@ void zx_mair_program(void);
    Masks base and limit to the granule before ORing attributes in, which is
    the whole reason this is a function rather than two stores.  */
 
-void zx_stage2_region_program(uint32_t index, const zx_region_t *region_ptr);
+void zx_stage2_region_program(uint32_t index, const ZX_REGION *region_ptr);
 
 /* Read one region back through HPRSELR/HPRBAR/HPRLAR.  Read-back is not
    paranoia here: a region programmed at an index the implementation does not
@@ -412,11 +385,11 @@ void zx_stage2_region_read(uint32_t index, uint32_t *base_ptr,
    direct access stops at region 15 while 8.4 lists HPRBAR16-HPRBAR24 at
    opc1 = 5, and this function is how that contradiction is settled on the
    part rather than on paper.  Region 16 specifically, because that is the
-   first index where the two readings differ.  Step 3 generalises it once the
-   answer is known; guessing the generalisation first would be building on the
-   thing under test.  */
+   first index where the two readings differ.  The generalisation follows once
+   the answer is known; guessing it first would be building on the thing
+   under test.  */
 
-void zx_stage2_region_program_direct16(const zx_region_t *region_ptr);
+void zx_stage2_region_program_direct16(const ZX_REGION *region_ptr);
 void zx_stage2_region_read_direct16(uint32_t *base_ptr, uint32_t *limit_ptr);
 
 /* HPRENR: one enable bit per region, and the register whose width the TRM

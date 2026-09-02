@@ -80,7 +80,7 @@ static uint32_t zx_failures;
    probe and, when the deliberate EL2 fault is built in, a reprogramming of
    the same region with EL2 read-only permissions.  */
 
-static zx_region_t zx_high_probe_region;
+static ZX_REGION zx_high_probe_region;
 
 
 /**************************************************************************/
@@ -274,7 +274,7 @@ static uint32_t zx_identity_block(uint32_t regions_required)
 
 static void zx_program_regions(uint32_t board_regions)
 {
-    zx_region_t region;
+    ZX_REGION region;
     uint32_t    direct_base  = 0U;
     uint32_t    direct_limit = 0U;
     uint32_t    select_base  = 0U;
@@ -301,7 +301,7 @@ static void zx_program_regions(uint32_t board_regions)
     region.zx_region_ap       = ZX_AP_EL2_RW_GUEST_RW;
     region.zx_region_xn       = ZX_XN_EXECUTABLE;
     region.zx_region_sh       = ZX_SH_NON_SHAREABLE;
-    region.zx_region_attrindx = ZX_ATTR_NORMAL_WB;
+    region.zx_region_attr_index = ZX_ATTR_NORMAL_WB;
     zx_stage2_region_program(ZX_REGION_PAYLOAD_CODE, &region);
 
     zx_console_puts("  region  0  payload code  ");
@@ -317,7 +317,7 @@ static void zx_program_regions(uint32_t board_regions)
     region.zx_region_ap       = ZX_AP_EL2_RW_GUEST_RW;
     region.zx_region_xn       = ZX_XN_NEVER;
     region.zx_region_sh       = ZX_SH_NON_SHAREABLE;
-    region.zx_region_attrindx = ZX_ATTR_NORMAL_WB;
+    region.zx_region_attr_index = ZX_ATTR_NORMAL_WB;
     zx_stage2_region_program(ZX_REGION_PAYLOAD_DATA, &region);
 
     zx_console_puts("  region  1  payload data  ");
@@ -359,7 +359,7 @@ static void zx_program_regions(uint32_t board_regions)
     zx_high_probe_region.zx_region_ap       = ZX_AP_EL2_RW_GUEST_RW;
     zx_high_probe_region.zx_region_xn       = ZX_XN_NEVER;
     zx_high_probe_region.zx_region_sh       = ZX_SH_NON_SHAREABLE;
-    zx_high_probe_region.zx_region_attrindx = ZX_ATTR_NORMAL_WB;
+    zx_high_probe_region.zx_region_attr_index = ZX_ATTR_NORMAL_WB;
 
     zx_stage2_region_program_direct16(&zx_high_probe_region);
 

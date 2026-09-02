@@ -30,11 +30,6 @@
 /*    what makes it the part of ZoneX the host test suite can validate    */
 /*    without a model or a board (docs/decisions.md D11).                 */
 /*                                                                        */
-/*  STATUS                                                                */
-/*                                                                        */
-/*    Declared empty.  The manifest types and the validator arrive        */
-/*    together, and the host suite under test/host grows with them.       */
-/*                                                                        */
 /**************************************************************************/
 
 #ifndef ZX_MANIFEST_H
@@ -45,6 +40,241 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/**************************************************************************/
+/*                          Build-time capacities                         */
+/**************************************************************************/
+
+/* Fixed capacities rather than dynamic allocation.  Phase 0 is static
+   partitioning: there is no allocator, no filesystem and no partition
+   creation at run time, so every array below is sized at build time and the
+   validator can prove the whole system fits the hardware before it runs.
+
+   ZX_MAX_REGIONS_PER_PARTITION is 6 because the region budget, not the
+   manifest, is the scarce resource: the smallest part ZoneX targets has 20
+   EL2 regions, of which the hypervisor's own MMIO takes 2 on silicon.  Two
+   partitions of 6 regions plus a shared granule each fit that with room
+   left.  Raising it is a one-line change the boot-time region check will
+   immediately hold to account.  */
+#define ZX_MAX_PARTITIONS               4U
+#define ZX_MAX_REGIONS_PER_PARTITION    6U
+#define ZX_MAX_SHARED_RANGES            2U
+
+/**************************************************************************/
+/*                       Stage-2 region attributes                        */
+/**************************************************************************/
+
+/* AP[2:1] as stage 2 encodes it.  These are NOT the EL1 AP encodings, and
+   the difference is the one that matters for isolation: there is no encoding
+   that grants a guest access while denying EL2.  A partition is isolated
+   from another partition by which regions are ENABLED, never by permissions.
+   See docs/decisions.md D3 and docs/armv8r-el2-reference.md.  */
+#define ZX_AP_EL2_RW_GUEST_NONE     0x00U   /* 00: RW at EL2 only          */
+#define ZX_AP_EL2_RW_GUEST_RW       0x01U   /* 01: RW at any level         */
+#define ZX_AP_EL2_RO_GUEST_NONE     0x02U   /* 10: RO at EL2 only          */
+#define ZX_AP_EL2_RO_GUEST_RO       0x03U   /* 11: RO at any level         */
+
+/* XN[0].  A partition needs at least one executable region or it cannot run,
+   which the validator treats as a build error rather than a runtime
+   mystery.  */
+#define ZX_XN_EXECUTABLE            0x00U
+#define ZX_XN_NEVER                 0x01U
+
+/* SH[4:3].  0b01 is UNPREDICTABLE for Normal memory (TRM Table 3-81), so a
+   zeroed field -- Non-shareable -- is both the safe default and the only
+   value Phase 0 uses; it runs one logical core.  The other encodings are
+   named because a later multicore claim would need them, and a magic 3 in a
+   manifest would not survive review.  */
+#define ZX_SH_NON_SHAREABLE         0x00U
+#define ZX_SH_OUTER_SHAREABLE       0x02U
+#define ZX_SH_INNER_SHAREABLE       0x03U
+
+/* AttrIndx[3:1] selects one of eight bytes across HMAIR0 and HMAIR1.  The
+   count is the hardware's; which of them the hypervisor has actually WRITTEN
+   is a software fact, and a region naming an unwritten byte gets
+   Device-nGnRnE -- memory that works but is slow, with nothing to fault on.
+   The validator checks the index against a mask of written bytes for exactly
+   that reason.  */
+#define ZX_ATTR_INDEX_COUNT         8U
+
+/**************************************************************************/
+/*                            Region descriptor                           */
+/**************************************************************************/
+
+/* One stage-2 region, as a manifest declares it and as the port programs it.
+   The limit is INCLUSIVE, matching the hardware rather than converting at
+   every call site: PMSAv8-R has no size field, and a length that has to be
+   turned into an inclusive limit in three places is a length that gets it
+   wrong in one of them.
+
+   WHY THE ATTRIBUTE FIELDS ARE UCHAR AND NOT AN ENUM.  Each of them holds a
+   hardware encoding with two, four or eight legal values, so an enum reads
+   better and would let the compiler check the value.  It was measured and
+   rejected: a four-value enum is 1 byte under arm-none-eabi-gcc (AAPCS short
+   enums), 4 bytes under ATfE clang, and 4 bytes on the host.  ZoneX builds
+   with all three, so an enum field would give this struct -- the published
+   manifest contract, whose offsets are already asserted from assembly
+   elsewhere in the port -- a different layout in each lane.  UCHAR is one
+   byte in all three.  Legal-value checking therefore lives in the validator,
+   which is where it can also name the offender.  */
+
+typedef struct zx_region_struct
+{
+    zx_addr_t   zx_region_base;         /* first byte, granule aligned      */
+    zx_addr_t   zx_region_limit;        /* LAST byte, inclusive             */
+    UCHAR       zx_region_ap;           /* ZX_AP_*                          */
+    UCHAR       zx_region_xn;           /* ZX_XN_*                          */
+    UCHAR       zx_region_sh;           /* ZX_SH_*                          */
+    UCHAR       zx_region_attr_index;   /* index into HMAIR0/HMAIR1         */
+} ZX_REGION;
+
+/**************************************************************************/
+/*                          Shared memory ranges                          */
+/**************************************************************************/
+
+/* An explicitly declared, auditable exception to the no-overlap rule.
+ *
+ * WHY THIS TYPE EXISTS AT ALL.  Two partitions' regions must not overlap:
+ * PMSAv8-R has no region priority, so two ENABLED regions matching one
+ * address is CONSTRAINED UNPREDICTABLE and aborts on the S32Z280.  Phase 0
+ * nevertheless shares one read-only granule, so that the demonstrator has a
+ * positive channel to show -- a heartbeat one partition publishes and the
+ * other reads -- rather than only proving isolation by what faults.
+ *
+ * WHY IT CANNOT BE ONE SHARED REGION.  Stage-2 AP is a property of a region,
+ * not of a partition, so a single region covering the granule would have to
+ * be either writable by both readers or read-only to the publisher.  The
+ * publisher therefore covers the granule with its own writable region and
+ * each reader with a read-only one.  Those ranges coincide, which is safe
+ * only because one partition runs at a time and the two regions are never
+ * enabled together -- and that is precisely the kind of reasoning that must
+ * be written down rather than inferred.
+ *
+ * WHAT IT WEAKENS, AND WHAT IT DOES NOT.  It does not weaken the claim that
+ * a partition cannot reach another partition's private memory: every byte
+ * outside a declared range is still governed by the unconditional overlap
+ * rule.  It does mean the two partitions are not information-theoretically
+ * isolated -- the publisher can signal the reader, at one granule's
+ * bandwidth, and a reader cannot be prevented from timing those writes.  A
+ * system that needs no covert channel at all declares no shared ranges, and
+ * the validator then enforces total disjointness with no exceptions.  */
+
+typedef struct zx_shared_struct
+{
+    zx_addr_t   zx_shared_base;         /* granule aligned                  */
+    zx_addr_t   zx_shared_limit;        /* LAST byte, inclusive             */
+    UINT        zx_shared_publisher_id; /* the one partition allowed RW      */
+} ZX_SHARED;
+
+/**************************************************************************/
+/*                                Partition                               */
+/**************************************************************************/
+
+typedef struct zx_partition_struct
+{
+    UINT                zx_partition_id;
+    const CHAR         *zx_partition_name;
+
+    /* The guest image, embedded in the hypervisor's own image with .incbin
+       (docs/decisions.md D6).  These are addresses in the hypervisor's
+       memory, NOT in the partition's -- the loader copies from here into the
+       partition's code region.  */
+    zx_addr_t           zx_partition_image_start;
+    zx_addr_t           zx_partition_image_end;
+
+    /* Where the partition starts executing.  Must lie inside one of its own
+       executable regions; a 4-byte error here cost a silicon run during the
+       Cortex-R52 Modules port work, so the validator checks it.  */
+    zx_addr_t           zx_partition_entry;
+
+    const ZX_REGION    *zx_partition_regions;
+    UINT                zx_partition_region_count;
+
+    /* This partition's slot in the major frame.  ULONG rather than a
+       fixed width deliberately: steps to come compare it against a guest
+       ThreadX's own tick count, which is a ULONG.  */
+    ULONG               zx_partition_window_ticks;
+} ZX_PARTITION;
+
+/**************************************************************************/
+/*                              The manifest                              */
+/**************************************************************************/
+
+/* The whole system, in one object.
+ *
+ * WHERE IT LIVES.  In the hypervisor's own .rodata, covered by no enabled
+ * stage-2 region.  That is not a separate mechanism: ZoneX's own memory is
+ * protected by NOT being covered (docs/decisions.md D2), so a guest cannot
+ * read the manifest for the same reason it cannot read the hypervisor's
+ * code.  Stated outright here because "the manifest is unreachable from a
+ * guest" is a property a safety reviewer should not have to derive.  */
+
+typedef struct zx_manifest_struct
+{
+    const ZX_PARTITION *zx_manifest_partitions;
+    UINT                zx_manifest_partition_count;
+
+    const ZX_SHARED    *zx_manifest_shared;
+    UINT                zx_manifest_shared_count;
+
+    /* The sum of every partition's window.  Carried explicitly rather than
+       computed, so that the validator can disagree with it: a major frame
+       that does not match its parts is a manifest error, and a computed
+       field could never be wrong.  */
+    ULONG               zx_manifest_major_frame_ticks;
+} ZX_MANIFEST;
+
+/**************************************************************************/
+/*                          Compile-time checks                           */
+/**************************************************************************/
+
+/* UCHAR being one byte is what the region descriptor's layout rests on --
+   see the note on that struct.  */
+_Static_assert(sizeof(UCHAR) == 1U,
+               "UCHAR must be exactly one byte");
+
+/* Every attribute field must be able to hold its whole encoding.  Cheap, and
+   it is the check that would catch a future encoding widened past a byte.  */
+_Static_assert(ZX_AP_EL2_RO_GUEST_RO <= 0xFFU,
+               "the AP encoding no longer fits the region descriptor's field");
+_Static_assert(ZX_ATTR_INDEX_COUNT <= 0xFFU,
+               "the AttrIndx range no longer fits the region descriptor's field");
+
+/* The granule must be a power of two for the validator's alignment tests to
+   be a mask rather than a division.  */
+_Static_assert((ZX_MPU_GRANULE & (ZX_MPU_GRANULE - 1U)) == 0U,
+               "ZX_MPU_GRANULE must be a power of two");
+
+/* The four attribute fields sit in four consecutive bytes, with nothing
+   between them.  Measured to hold in all three of ZoneX's build lanes
+   (arm-none-eabi-gcc, ATfE clang, host gcc), and asserted because it is the
+   property the UCHAR-not-enum decision above was made to guarantee: a field
+   that silently gained padding or a wider type would take this with it.  */
+_Static_assert(offsetof(ZX_REGION, zx_region_attr_index)
+                   == offsetof(ZX_REGION, zx_region_ap) + 3U,
+               "the region descriptor's attribute fields are no longer "
+               "four consecutive bytes");
+
+/* On a 32-bit port -- every port ZoneX has today -- the descriptor is exactly
+   two addresses plus those four bytes, with no padding anywhere.  Pinned to
+   the measured number so that a layout change in EITHER target toolchain
+   fails the build rather than producing two images that disagree about the
+   manifest.  The host lane is excluded by the guard, not exempted: there
+   zx_addr_t is 64-bit and alignment legitimately makes the struct larger,
+   which is harmless because the host suite builds ZX_REGION objects rather
+   than reading a target's bytes.  */
+#if UINTPTR_MAX == 0xFFFFFFFFU
+_Static_assert(sizeof(ZX_REGION) == 12U,
+               "the region descriptor's size changed on a 32-bit port");
+#endif
+
+/* A manifest that declared more regions than the smallest supported part has
+   could not be programmed.  This is the compile-time half of the rule; the
+   half that matters runs at boot against the real HMPUIR, because no header
+   knows which part it is being built for.  */
+_Static_assert((ZX_MAX_PARTITIONS * ZX_MAX_REGIONS_PER_PARTITION) <= 24U,
+               "the manifest's capacity exceeds the largest Armv8-R EL2 "
+               "region count (24), so no part could program it");
 
 #ifdef __cplusplus
 }
