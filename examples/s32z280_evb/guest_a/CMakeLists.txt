@@ -159,6 +159,40 @@ if(NOT EXISTS ${TX_PORT_BSP}/entry.S)
         "release archive of the kernel alone.")
 endif()
 
+# AND THAT THE PORT ACTUALLY HAS THE OPTION THIS GUEST IS BUILT WITH.
+#
+# TX_R52_BOOT_AT_EL1 is what makes the port's reset path SKIP its EL2 block, and
+# a definition that names an option the source does not test is not an error to
+# the preprocessor -- it is simply inert.  So a ThreadX predating that option
+# builds a guest containing the whole EL2 reset path, ERET and all, which drops
+# to EL1 from EL1 and dies on its first instructions.
+#
+# THAT IS NOT HYPOTHETICAL AND IT WAS NOT CAUGHT BY ANYTHING.  The workflows pin
+# ThreadX to a commit, and the pin went stale the moment the S32Z280 bracket was
+# upstreamed: CI kept building this guest against a checkout without it, and
+# reported success, because the only symptom is an `eret` in a binary nobody
+# executes on a hosted runner.
+#
+# Grepping the source is crude and it is the only check available here: the guest
+# is a separate CMake project, it cannot ask the port what options it supports,
+# and there is no version number to compare against. Crude and loud beats
+# invisible.
+file(READ ${TX_PORT_BSP}/entry.S ZX_PORT_ENTRY_TEXT)
+string(FIND "${ZX_PORT_ENTRY_TEXT}" "TX_R52_BOOT_AT_EL1" ZX_PORT_HAS_BOOT_AT_EL1)
+unset(ZX_PORT_ENTRY_TEXT)
+
+if(ZX_PORT_HAS_BOOT_AT_EL1 EQUAL -1)
+    message(FATAL_ERROR
+        "This ThreadX checkout's ${TX_PORT_BSP}/entry.S does not know about "
+        "TX_R52_BOOT_AT_EL1.\n"
+        "The option would be silently INERT: the guest would be built with the "
+        "port's whole EL2 reset path in it, including the ERET, and would drop "
+        "to EL1 from EL1 and die on its first instructions -- while building "
+        "perfectly cleanly.\n"
+        "Point ZX_THREADX_SOURCE_DIR at a checkout that carries the boot-at-EL1 "
+        "bracket for this board.")
+endif()
+
 ###############################################################################
 # The kernel
 ###############################################################################

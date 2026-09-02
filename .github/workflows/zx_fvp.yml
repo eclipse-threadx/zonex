@@ -151,7 +151,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         repository: eclipse-threadx/threadx
-        ref: 8c681c188ee748c777185e229024255c054a49d9
+        ref: 13c8c768c73b9ce10c9605f6df8b02080440f953
         path: threadx
 
     - name: Cache the AArch32 Arm GNU toolchain
