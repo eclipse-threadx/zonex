@@ -22,11 +22,16 @@
 # The model is found by CMake, with $HOME/FVP_Base_AEMv8R_11.32_19/bin as the
 # hint.  Point ZX_FVP at a different one to override it.
 #
-# STATUS: there are no images yet.  "build" therefore configures and builds the
-# hypervisor libraries, and "test" reports that there is nothing to execute --
-# loudly, and with a zero status, because a foundation-only tree failing its own
-# CI would say nothing useful.  Once the first image lands this script starts
-# doing what its name says.
+# The suite is three runs of the same program: zx_probe.elf, which must pass,
+# and two builds that must FAIL -- zx_probe_negative.elf, whose deliberate
+# violation is aimed at an address the payload IS granted, and
+# zx_probe_starved.elf, which is told it needs more MPU regions than exist.
+# Both are registered WILL_FAIL in CMake, because a check that has never been
+# seen to fail is not evidence that it can.
+#
+# zx_probe_el2_fault.elf is built but not registered: it makes ZoneX fault at
+# EL2 on purpose, so its expected outcome IS a failure report.  Run it with
+# "ninja -C build/fvp zx-run-probe-el2-fault" and read the report.
 
 set -euo pipefail
 
@@ -63,11 +68,15 @@ case "${command}" in
         configure
         cmake --build "${BUILD}"
 
+        # An empty list is a FAILURE now that ZoneX has images: it means the
+        # CMake graph broke.  It was a zero-status notice while the repository
+        # genuinely had none.
         image_list="$(images)"
         if [ -z "${image_list}" ]; then
-            echo "ZoneX: no FVP images exist yet."
-            echo "ZoneX: the hypervisor libraries were built; nothing was executed."
-            exit 0
+            echo "ZoneX: no FVP images were found in the ninja graph." >&2
+            echo "ZoneX: ZoneX HAS images, so the build system is broken rather" >&2
+            echo "ZoneX: than the tree being incomplete." >&2
+            exit 1
         fi
 
         # shellcheck disable=SC2086

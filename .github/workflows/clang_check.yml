@@ -124,6 +124,30 @@ jobs:
           if ! cmake --build "build/clang-$name"; then
             echo "::error::$name: build failed"
             status=1
+            return
+          fi
+
+          # The IMAGES as well.  They are EXCLUDE_FROM_ALL, as ThreadX's are,
+          # so the build above reports "no work to do" for every one of them
+          # and a compile error in an image would slip past this whole lane.
+          #
+          # Named from the generated ninja graph rather than from a list kept
+          # here, so an image added to a CMakeLists.txt cannot escape the
+          # check by nobody remembering to list it.
+          local images
+          images="$(ninja -C "build/clang-$name" -t targets all 2>/dev/null \
+                    | grep -oE '^[A-Za-z0-9_]+\.elf' \
+                    | grep -v '^cmake_' | sort -u || true)"
+          if [ -z "$images" ]; then
+            echo "::error::$name: the CMake graph produced no images at all"
+            status=1
+            return
+          fi
+          echo "$name: building $(echo "$images" | wc -l) image(s)"
+          # shellcheck disable=SC2086
+          if ! cmake --build "build/clang-$name" --target $images; then
+            echo "::error::$name: an image failed to build"
+            status=1
           fi
         }
 

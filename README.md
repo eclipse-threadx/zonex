@@ -24,11 +24,32 @@ be reported rather than a condition to be recovered from.
 
 ## Status: Phase 0, under construction
 
-**There is no working hypervisor in this repository yet.** What is here is the
-repository foundation: the build system, the C17 baseline, the verified Armv8-R
-EL2 register reference, the recorded design decisions, and the CI seam. The
-translation units exist and compile; they are deliberately empty of
-implementation.
+**There is no complete hypervisor in this repository yet — but stage 2 is
+alive.** ZoneX now boots at EL2 on both targets, programs stage-2 MPU regions,
+drops to EL1, and takes, decodes and reports a stage-2 access violation by
+name. There is no ThreadX guest, no partition manifest and no scheduler yet;
+each of those assumes what the current image exists to establish.
+
+`examples/` holds the stage-2 probe: one EL2 program, one trivial EL1 payload
+and one deliberate fault. Run it with `scripts/test_fvp.sh` on the Armv8-R AEM
+FVP, or `examples/s32z280_evb/tools/run_zx_probe.sh` on the board.
+
+The suite includes builds that must **fail**, registered as such: one whose
+deliberate violation is aimed at an address the payload *is* granted, and one
+told it needs more MPU regions than exist. A check that has never been seen to
+fail is not evidence that it can.
+
+Along the way it settled four things about this architecture that the
+Cortex-R52 TRM describes ambiguously or contradicts itself about, on both a
+model and real silicon. The two most consequential:
+
+* **`HPRENR` really is wider than 16 bits**, and a bit above 15 really does
+  disable its region — proven functionally, not by reading the register back.
+* **`HPFAR` does not mean the same thing on the two targets.** The TRM
+  describes it two ways in one section, and the FVP and the S32Z280 each
+  implement a different one. ZoneX uses `HDFAR`.
+
+`docs/armv8r-el2-reference.md` carries all of it, with the measured values.
 
 Phase 0 is a partitioning demonstrator with a deliberately small scope:
 

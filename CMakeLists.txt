@@ -74,12 +74,16 @@ include(${CMAKE_CURRENT_LIST_DIR}/cmake/zx_warnings.cmake)
 
 # Defaults follow the toolchain, because the alternative -- a fixed default --
 # means every invocation of every script has to override one of them.
+#
+# ONE BOARD PER BUILD TREE.  The two example options are MUTUALLY EXCLUSIVE
+# and the check below enforces it, so the S32Z280 default is OFF rather than
+# following the toolchain the way the FVP's does.
 if(ZX_ARCH STREQUAL "host")
     set(ZX_HOST_TESTS_DEFAULT ON)
-    set(ZX_TARGET_EXAMPLES_DEFAULT OFF)
+    set(ZX_FVP_EXAMPLE_DEFAULT OFF)
 else()
     set(ZX_HOST_TESTS_DEFAULT OFF)
-    set(ZX_TARGET_EXAMPLES_DEFAULT ON)
+    set(ZX_FVP_EXAMPLE_DEFAULT ON)
 endif()
 
 option(ZX_BUILD_HOST_TESTS
@@ -87,10 +91,65 @@ option(ZX_BUILD_HOST_TESTS
        ${ZX_HOST_TESTS_DEFAULT})
 option(ZX_BUILD_FVP_EXAMPLE
        "Build the Armv8-R AEM FVP example under examples/fvp_baser_aemv8r"
-       ${ZX_TARGET_EXAMPLES_DEFAULT})
+       ${ZX_FVP_EXAMPLE_DEFAULT})
 option(ZX_BUILD_S32Z280_EXAMPLE
-       "Build the NXP S32Z280-594EVB example under examples/s32z280_evb"
-       ${ZX_TARGET_EXAMPLES_DEFAULT})
+       "Build the NXP S32Z280-594EVB example under examples/s32z280_evb. \
+Mutually exclusive with ZX_BUILD_FVP_EXAMPLE; see the check below."
+       OFF)
+
+###############################################################################
+# Which board the PORT is built for
+###############################################################################
+
+# The port library is compiled once per build tree, and two facts about it are
+# board facts rather than target facts:
+#
+#   ZX_RESET_IN_THUMB   whether the core arrives at _start in T32 state.  The
+#                       S32Z280 does, because the RTU boot instruction NXP
+#                       plants is a T32 branch; the Armv8-R AEM FVP does not.
+#                       Get this wrong and _start executes the first halfword
+#                       of its own instruction in the other state and goes
+#                       anywhere -- with no output at all.
+#
+#   ZX_CONSOLE_BOARD    whether the console is the board's UART or
+#                       semihosting.  There is no semihosting on the S32Z280,
+#                       and a semihosting trap there is not a no-op.
+#
+# Both therefore have to reach platform/cortex_r52/src/*, which
+# target_compile_definitions on an EXECUTABLE cannot do: zonex_port is a
+# separate static library and a PRIVATE definition on an image never touches
+# it.  That mistake produces an S32Z280 image with an A32 entry point and a
+# semihosting console, which builds and links cleanly and prints nothing.
+#
+# So the two boards cannot share a build tree, and this refuses rather than
+# silently building one of them wrong.  Every script and workflow in the
+# repository already configures exactly one; the check exists for the
+# invocation that does not.
+if(ZX_BUILD_FVP_EXAMPLE AND ZX_BUILD_S32Z280_EXAMPLE)
+    message(FATAL_ERROR
+        "ZX_BUILD_FVP_EXAMPLE and ZX_BUILD_S32Z280_EXAMPLE are mutually "
+        "exclusive.\n"
+        "The two boards need the port library compiled differently -- the "
+        "S32Z280 resets in T32 state and has no semihosting -- so one build "
+        "tree can serve only one of them.\n"
+        "Configure two build trees, or use test/fvp/run.sh and "
+        "test/s32z280/run.sh, which already do.")
+endif()
+
+set(ZX_PORT_BOARD_DEFINITIONS "")
+if(ZX_BUILD_S32Z280_EXAMPLE)
+    list(APPEND ZX_PORT_BOARD_DEFINITIONS ZX_RESET_IN_THUMB ZX_CONSOLE_BOARD)
+    message(STATUS "ZoneX board: NXP S32Z280-594EVB "
+                   "(T32 reset, LINFlexD_9 console)")
+elseif(ZX_BUILD_FVP_EXAMPLE)
+    message(STATUS "ZoneX board: Armv8-R AEM FVP "
+                   "(A32 reset, semihosting console)")
+elseif(NOT ZX_ARCH STREQUAL "host")
+    # A cross build with no example is the libraries on their own, which is
+    # what gcc_check.yml's plain lane does.  The port then compiles for the
+    # FVP's defaults; nothing links it, so nothing depends on that choice.
+    message(STATUS "ZoneX board: none selected; building the libraries only")
+endif()
 
 # The seam to a ThreadX checkout.  ZoneX itself does not link ThreadX -- at EL2
 # it is a standalone bare-metal program (docs/decisions.md D9) -- but the

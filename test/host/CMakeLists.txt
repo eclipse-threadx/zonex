@@ -36,10 +36,18 @@ endif()
 # binaries rather than one linked from every test source, so that a test that
 # crashes takes down its own suite and not the whole run.
 function(zx_add_host_test name)
-    add_executable(${name} ${CMAKE_CURRENT_LIST_DIR}/${name}.c)
+    add_executable(${name}
+        ${CMAKE_CURRENT_LIST_DIR}/${name}.c
+        ${CMAKE_CURRENT_LIST_DIR}/zx_console_capture.c
+    )
     target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_LIST_DIR})
     target_link_libraries(${name} PRIVATE zonex::core zonex::warnings)
     add_test(NAME host-${name} COMMAND ${name})
 endfunction()
 
+# The capture console is linked into every suite rather than only the ones
+# that print.  core/ may call zx_console_* from anywhere -- the fault reporter
+# already does -- and a suite that grew a call into one would otherwise fail
+# to LINK, which is a confusing way to discover that a test needs a console.
 zx_add_host_test(test_zx_api)
+zx_add_host_test(test_zx_fault)

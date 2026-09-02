@@ -20,10 +20,27 @@ target_sources(zonex_port PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/src/zx_el2_entry.S
     ${CMAKE_CURRENT_LIST_DIR}/src/zx_trap_handler.S
     ${CMAKE_CURRENT_LIST_DIR}/src/zx_console.c
+    ${CMAKE_CURRENT_LIST_DIR}/src/zx_el2_cpu.c
+    ${CMAKE_CURRENT_LIST_DIR}/src/zx_el2_fault_path.c
     ${CMAKE_CURRENT_LIST_DIR}/src/zx_gic.c
     ${CMAKE_CURRENT_LIST_DIR}/src/zx_stage2_mpu.c
     ${CMAKE_CURRENT_LIST_DIR}/src/zx_timer.c
 )
+
+# zx_port.h is read by the assembler as well as the compiler, so the include
+# directory has to be on the ASM command line too.  target_sources with a
+# FILE_SET below publishes it to consumers; this is what makes it visible to
+# this target's own .S files, which is a different thing and easy to assume
+# has already happened.
+target_include_directories(zonex_port PUBLIC
+    ${CMAKE_CURRENT_LIST_DIR}/inc
+)
+
+# The board facts, from the root CMakeLists.txt.  PUBLIC so that the examples
+# see them too: examples/s32z280_evb/zx_board.c does not need them today, but
+# a board file that disagreed with the port about whether there is semihosting
+# would be a very quiet bug.
+target_compile_definitions(zonex_port PUBLIC ${ZX_PORT_BOARD_DEFINITIONS})
 
 target_sources(zonex_port PUBLIC
     FILE_SET  zx_port_headers

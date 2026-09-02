@@ -15,7 +15,8 @@ SPDX-License-Identifier: MIT and CC0-1.0
 
 # Armv8-R AArch32 EL2 reference sheet
 
-*Eclipse ThreadX ZoneX. Verified 2 September 2026.*
+*Eclipse ThreadX ZoneX. Verified 2 September 2026, and measured on both
+targets the same day.*
 
 This file exists so that no ZoneX session has to re-derive a register encoding.
 Every line below was read out of the Arm Cortex-R52 Technical Reference Manual
@@ -80,10 +81,16 @@ names that belong to other architectures. It runs in CI.
    ⚠ **The FVP cannot demonstrate the need.** Its console and GIC are at
    `0x9C090000` and `0xAF000000`, inside the Device-nGnRE band, so the
    background map is accidentally correct there. Treat this like the region
-   count: a green model run says nothing about the part. (The GIC base on the
-   S32Z280 is quoted from bring-up notes rather than read out of the reference
-   manual — confirm it before relying on the exact address. The band it falls
-   in, and therefore the conclusion, is not in doubt.)
+   count: a green model run says nothing about the part.
+
+   The S32Z280's GIC base is `0x47800000`, and it is not second-hand: the SoC
+   reference manual gives no GIC address at all, but `IMP_CBAR` reports the
+   distributor base in bits [31:21] and reads `0x47800000` on the board, which
+   confirms NXP's map from the hardware itself.
+
+   ZoneX therefore spends **two** of the S32Z280's twenty EL2 regions on its own
+   MMIO — the console and the GIC — and **none** on the FVP. That difference is
+   the whole reason both targets have to be run.
 
    One more property to design around, TRM Table 8-3: for instruction access
    the background map marks `0x80000000`–`0xFFFFFFFF` execute-never, so
@@ -106,10 +113,10 @@ All are reached with `MRC`/`MCR p15, 4, <Rt>, …`. `opc1 = 4` is the Hyp bank.
 | `HSR` | `c5, c2, 0` | `EC[31:26]`, `IL[25]`, `ISS[24:0]`. |
 | `HDFAR` | `c6, c0, 0` | Data fault address. |
 | `HIFAR` | `c6, c0, 2` | Instruction fault address. |
-| `HPFAR` | `c6, c0, 4` | **The faulting address for a stage-2 fault** (TRM §3.3.42). |
-| `HMPUIR` | `c0, c0, 4` | EL2 region count in **bits [7:0]** — *not* [15:8], where `MPUIR` keeps the EL1 count. TRM Table 3-79: the value is 0, 16, 20 or 24. |
+| `HPFAR` | `c6, c0, 4` | Stage-2 fault address — **but see the HPFAR warning below: the two ZoneX targets implement two different layouts.** TRM §3.3.44 (not §3.3.42). |
+| `HMPUIR` | `c0, c0, 4` | Read-only. EL2 region count in **bits [7:0]** — *not* [15:8], where `MPUIR` keeps the EL1 count. TRM Table 3-79: the value is 0, 16, 20 or 24. |
 | `HPRSELR` | `c6, c2, 1` | `REGION[3:0]` on a 16-region implementation; **`REGION[4:0]` on 20 or 24** (TRM Tables 3-84, 3-85). Writing a value ≥ the implemented count is UNPREDICTABLE. |
-| `HPRENR` | `c6, c1, 1` | One enable bit per region; bulk enable/disable. Width — see the open question below. |
+| `HPRENR` | `c6, c1, 1` | One enable bit per region; bulk enable/disable. Width **measured**: `[19:0]` on the S32Z280, 32 bits on the FVP — see below. |
 | `HPRBAR` (indirect) | `c6, c3, 0` | Select the region with `HPRSELR` first. |
 | `HPRLAR` (indirect) | `c6, c3, 1` | Likewise. |
 | `HPRBAR<n>` (direct, n = 0…15) | `c6, c8+n[3:1], 4*n[0]` | TRM §3.3.48. |
@@ -119,7 +126,8 @@ All are reached with `MRC`/`MCR p15, 4, <Rt>, …`. `opc1 = 4` is the Hyp bank.
 | `HMAIR1` | `c10, c2, 1` | Likewise. |
 | `CNTHCTL` | `c14, c1, 0` | `PL1PCTEN[0]`, `PL1PCEN[1]`. The ThreadX Cortex-R52 port sets both. |
 | `CNTVOFF` | `MCRR p15, 4, <Rt>, <Rt2>, c14` | 64-bit. Per-guest virtual-time offset. |
-| `ICC_HSRE` | `c12, c9, 5` | GICv3 system-register interface enable for EL1. |
+| `ICC_HSRE` | `c12, c9, 5` | GICv3 system-register interface enable. `SRE[0]`, `Enable[3]`. **Every other `ICC_*`/`ICH_*` register is UNDEFINED until `SRE` is set** — see below. |
+| `ICH_VTR` | `c12, c11, 1` | `ListRegs[4:0]`, the List Register count minus one. Needs `ICC_HSRE.SRE`. |
 
 ---
 
@@ -184,13 +192,47 @@ consequences, and they shape the whole Phase-0 memory model:
 | Target | EL1 regions (`MPUIR[15:8]`) | EL2 regions (`HMPUIR[7:0]`) |
 |---|---|---|
 | Architectural (Cortex-R52) | 16, 20 or 24 | 0, 16, 20 or 24 |
-| **S32Z280-594EVB** | **20**, measured | **20** — `HMPUIR = 0x00000014`, measured on silicon |
-| Armv8-R AEM FVP | 32, measured — *not an architecturally legal R52 value* | ⚠ **unknown; measured when EL2 is brought up** |
+| **S32Z280-594EVB** | **20** — `MPUIR = 0x00001400` | **20** — `HMPUIR = 0x00000014` |
+| **Armv8-R AEM FVP** | **32** — `MPUIR = 0x00002000` | **32** — `HMPUIR = 0x00000020` |
 
-The FVP row is the point of the table. The model reported 32 EL1 regions, which
-no real Cortex-R52 can have, so **a green FVP run proves nothing about any real
-part's region budget.** Expect the same at EL2: read `HMPUIR` on the model
-rather than assuming it matches the board.
+Both rows measured on 2 September 2026 by the stage-2 probe image, which prints
+them and asserts the EL2 count against Table 3-79's permitted set.
+
+The FVP row is the point of the table, and it is now confirmed at both stages.
+**32 is not an architecturally legal Cortex-R52 value at either level**, so a
+green FVP run proves nothing about any real part's region budget. The probe
+reports the illegality loudly rather than failing on it, because on the model it
+is expected.
+
+The model is not shy about being a model elsewhere either:
+
+| | Armv8-R AEM FVP | S32Z280-594EVB |
+|---|---|---|
+| `MIDR` | `0x410FD0F0`, part **`0xD0F`** — not a Cortex-R52 part number | `0x411FD133`, part **`0xD13`** = Cortex-R52, r1p3 |
+| `ICH_VTR` | `0x9008000F` — `ListRegs` 15, so **16** List Registers | `0x90180003` — `ListRegs` 3, so **4** List Registers, matching the TRM's reset value |
+| `HSCTLR` at reset | `0x30C50818` — `TE` **clear** | `0x70C50838` — `TE` **SET** |
+| `SCTLR` at reset | `0x00C00800` — `TE` clear | `0x70C50838` — `TE` **SET** |
+| Execution state at reset | A32 | **T32** |
+| `HPRENR` implemented bits | `0xFFFFFFFF` | **`0x000FFFFF`** |
+
+`TE` set means EL2 exceptions are entered in T32 state, so an A32 vector table
+never runs and every fault presents as a silent hang. ZoneX's reset path clears
+`HSCTLR.TE` and `SCTLR.TE` before anything can fault, and records their reset
+values so that this difference is visible in every run's own output rather than
+only in this table.
+
+### `MRS Rd, CPSR` cannot read `PSTATE.T`
+
+Worth knowing before anybody tries to detect the execution state from inside an
+image. ZoneX's first executed instruction is `MRS r6, CPSR`, and it reads
+`0x000001DA` on **both** targets — while the S32Z280 is demonstrably in T32
+state at that moment (the instruction doing the reading is a T32 encoding, and
+it executes correctly) and the FVP is in A32. Two execution states, one
+reading: the `T` bit is not visible through `MRS`.
+
+A debugger can see it, which is where the `0x1FA` reading recorded during the
+Cortex-R52 port work came from. From inside an image, use `HSCTLR.TE` and
+`SCTLR.TE`, and treat the CPSR snapshot as a report of the **mode** field.
 
 ---
 
@@ -211,15 +253,27 @@ before anything is programmed.
 Every exception routed to EL2 from EL0 or EL1 arrives at **one vector,
 `HVBAR + 0x14`**, and must be decoded from `HSR.EC` (TRM Table 3-88):
 
+The whole of Table 3-88, not only the classes Phase 0 handles: an unexpected
+trap has to be reported by **name**, and a numeric `EC` in a log is a value
+somebody then has to look up while the board is still on the bench.
+
 | `EC` | Meaning |
 |---|---|
+| `0x00` | Unknown reason |
 | `0x01` | Trapped `WFI`/`WFE` |
 | `0x03` | Trapped `MCR`/`MRC`, coproc `0b1111` |
+| `0x04` | Trapped `MCRR`/`MRRC`, coproc `0b1111` |
 | `0x05` | Trapped `MCR`/`MRC`, coproc `0b1110` |
+| `0x06` | Trapped `LDC`/`STC`, coproc `0b1110` |
+| `0x07` | SIMD/floating-point access trapped by `HCPTR` |
+| `0x08` | Trapped `VMRS`, ID group trap |
+| `0x0C` | Trapped `MCRR`/`MRRC`, coproc `0b1110` |
+| `0x0E` | Illegal state exception |
 | `0x11` | `SVC` taken to Hyp |
 | `0x12` | **`HVC` executed** — the hypercall seam |
 | `0x20` | Prefetch abort **routed to** Hyp |
 | `0x21` | Prefetch abort **taken from** Hyp |
+| `0x22` | PC alignment fault |
 | `0x24` | Data abort **routed to** Hyp |
 | `0x25` | Data abort **taken from** Hyp |
 
@@ -250,59 +304,202 @@ itself — a ZoneX bug — and must be reported as one rather than folded in wit
 
 ---
 
-## Open questions
+## The two open questions, both now CLOSED on both targets
 
-Two, both narrowed while this reference sheet was written and neither yet
-proven on hardware. The EL2 bring-up work closes them and updates this section
-rather than starting a new note.
+Measured on 2 September 2026 by the stage-2 probe image, on the Armv8-R AEM FVP
+and on the S32Z280-594EVB.
 
-### ⚠ 1. `HPRENR` width — documentary answer known, hardware answer not
+### 1. `HPRENR` width — **settled: the bit tables are right, the prose is stale**
 
 TRM §3.3.46 contradicts itself. The prose says `HPRENR` *"provides direct access
 to the region enable (HPRLAR.EN) for regions 0 to 15"*. The bit tables in the
-same section say otherwise:
+same section say `[15:0]` for 16 regions, **`[19:0]` for 20** (Table 3-77) and
+**`[23:0]` for 24** (Table 3-78).
 
-| Implementation | Table | `ENABLES` field |
-|---|---|---|
-| 0 regions | 3-75 | none, RAZ |
-| 16 regions | 3-76 | `[15:0]` |
-| **20 regions** | **3-77** | **`[19:0]`** |
-| **24 regions** | **3-78** | **`[23:0]`** |
+Two independent measurements, because they answer different questions and only
+having both is conclusive:
 
-The tables are almost certainly right and the prose is a stale sentence from
-the 16-region case. **ZoneX assumes `[19:0]` on the S32Z280's 20-region
-implementation**, and that must be *proved* on the part: write a pattern with
-a bit set above 15, read it back, and confirm that the corresponding region
-actually stops matching. A register that reads back the bit while ignoring it
-would be the worst outcome and is exactly what a read-back-only test would
-miss.
+**Which bits are implemented.** All ones written to `HPRENR` before any region
+existed, then read back:
 
-Why it matters: it decides D4. A single `HPRENR` write is how a partition
-switch could cost one instruction instead of a block of region rewrites.
+| Target | Reads back | Regions | Verdict |
+|---|---|---|---|
+| S32Z280-594EVB | **`0x000FFFFF`** | 20 | exactly `[19:0]`, exactly Table 3-77 |
+| Armv8-R AEM FVP | `0xFFFFFFFF` | 32 | 32 bits for its 32 regions |
 
-### ⚠ 2. Direct access above region 15 — **settled by the TRM**
+Reset value is `0x00000000` on both, so every region starts disabled and an
+unprogrammed region with an UNKNOWN base cannot be live.
+
+**Which bits WORK.** A read-back alone would not settle it: a register that
+accepted a bit above 15 and then *ignored* it would pass that test and is the
+worst of the three possible answers, because it would make a partition switch
+implemented as one `HPRENR` write silently leave the outgoing partition's
+regions live. So the probe also tests it functionally, from EL1:
+
+* region 16 programmed over a 64-byte granule holding a known sentinel;
+* `HPRENR` bit 16 set — an EL1 read of that granule **succeeds and returns the
+  sentinel**;
+* bit 16 cleared — the same read **takes a stage-2 fault**, `EC 0x24`,
+  `DFSC 0x04`.
+
+Both targets behave identically. `HPRENR` genuinely disables a region above 15.
+
+**So D4's preferred shape is available**: a partition switch can be a single
+`HPRENR` write as far as this register is concerned. What remains unmeasured is
+its *cost*, which is what D4 is actually waiting for.
+
+### 2. Direct access above region 15 — **settled on both parts**
 
 TRM §3.3.48's prose says direct access is provided to `HPRBAR0`–`HPRBAR15`
-only. **§8.4 is more complete and settles it**, listing verbatim:
+only. §8.4 and the `c6` register summary both list `HPRBAR16`–`HPRBAR24` and
+`HPRLAR16`–`HPRLAR24` at `opc1 = 5`, `CRm = c8 + (n-16)[3:1]`, with `op2` 0/4
+for an even/odd base and 1/5 for an even/odd limit.
 
-```
-HPRBAR16-HPRBAR24     MCR p15, 5, <Rt>, c6, CRm, op2
-HPRLAR16-HPRLAR24     MCR p15, 5, <Rt>, c6, CRm, op2
-```
+The probe programs region 16 through the **direct** encoding
+(`MCR p15, 5, <Rt>, c6, c8, 0` and `…, 1`) and reads it back through the
+**indirect** path (`HPRSELR` then `HPRBAR`/`HPRLAR`). They agree on both
+targets — and region 16 then demonstrably controls access from EL1, so the
+encoding reaches the real register rather than a writable hole:
 
-with the matching `MRC` forms, and the c6 register summary agrees:
-`HPRBAR16-24 (even)` at `opc1 = 5`, `CRm` c8–c12, and `HPRBAR17-23 (odd)`
-likewise. The encoding is the `opc1 = 4` one with `opc1` changed to 5 — exactly
-as `PRBAR16`–`PRBAR24` use `opc1 = 1` where `PRBAR0`–`PRBAR15` use 0.
+| | `HPRBAR16` direct / indirect | `HPRLAR16` direct / indirect |
+|---|---|---|
+| S32Z280-594EVB | `0x31781243` / `0x31781243` | `0x31781241` / `0x31781241` |
+| Armv8-R AEM FVP | `0x00006603` / `0x00006603` | `0x00006601` / `0x00006601` |
 
-**So the EL2 MPU avoids the penalty measured at EL1 for regions ≥ 16**, where
-reaching a high region meant going through `PRSELR` with an extra `ISB` —
-542–604 cycles against 434–470 for a direct write. The whole 20-region budget
-is directly addressable.
+**§8.4 is right and §3.3.48's prose is stale.** The whole 20-region budget is
+directly addressable, so the EL2 MPU avoids the penalty measured at EL1 during
+the Cortex-R52 Modules port work for reaching a region ≥ 16 through the
+selection register — 542–604 cycles against 434–470 for a direct write.
 
-This is a documentary resolution, not a measured one. Confirm it functionally
-the first time a region ≥ 16 is programmed, and change "settled by the TRM" to
-"settled on the part" here when that happens.
+---
+
+## ⚠ `HPFAR` IS NOT THE SAME REGISTER ON THE TWO TARGETS
+
+The most consequential measurement of the EL2 bring-up work, and it is a
+divergence rather than an answer.
+
+TRM §3.3.44 describes `HPFAR` **two ways in the same section**. Figure 3-32
+draws the field as `FIPA[39:12]` occupying `HPFAR[31:4]`, which is the
+A-profile shape. Table 3-69's row beside it says the field is *"Bits [31:4] of
+the faulting address"*, which is a different value — by a factor of 256.
+
+The probe faults on an address it chose itself, granule-aligned but deliberately
+**not** 4 KB-aligned so that the two readings cannot both fit, and compares
+`HPFAR` against `HDFAR`:
+
+| Target | `HDFAR` (address touched) | `HPFAR` | Reading |
+|---|---|---|---|
+| Armv8-R AEM FVP | `0x00007040` | `0x00000070` | `FIPA[39:12]` at `[31:4]` — the **figure** |
+| S32Z280-594EVB | `0x31781200` | `0x31781200` | the address itself, `[3:0]` RES0 — the **table row** |
+
+**Each target implements a different one of the TRM's two descriptions.** There
+is therefore **no portable decode of `HPFAR` on this architecture**, and code
+that computed a faulting address from it would be right on one target and wrong
+on the other, silently, producing a plausible address either way.
+
+**`HDFAR` carries the full faulting virtual address on both, and is what ZoneX
+uses.** It is also the register an off-by-one-granule region bug has to be
+caught with, because `HPFAR` under the figure's reading resolves only to 4 KB
+and cannot say which 64-byte granule faulted.
+
+Two further properties, both measured:
+
+* `HPFAR` is **not updated for a fault taken from Hyp mode**. A deliberate EL2
+  permission fault at `0x31781240` left `HPFAR` holding `0x31781200` from the
+  previous guest fault while `HDFAR` correctly read `0x31781240`. So `HPFAR` is
+  meaningful only for `EC 0x24`/`0x20`, and ZoneX's fault report omits any
+  reading of it for `EC 0x25`/`0x21`.
+* Under the figure's reading the FVP's `HPFAR` would also carry `FIPA[39:32]`,
+  which no 32-bit address can hold. On the S32Z280 those bits are part of the
+  address, so interpreting them as `FIPA[39:32]` yields `0x31` — "above 4 GB" —
+  which is how the report detects that the figure's reading does not apply.
+
+---
+
+## Data-abort fault status codes, measured
+
+The TRM defers the `ISS` layout to the Armv8-R architecture supplement, which
+was not available. These are the AArch32 data-abort `ISS` positions common to
+Armv8, confirmed against real syndromes on both targets:
+
+| `ISS` bits | Field | Measured behaviour |
+|---|---|---|
+| `[5:0]` | `DFSC` | **`0x04`** when no enabled EL2 region matched · **`0x0C`** when a region matched and `AP` denied the access |
+| `[6]` | `WnR` | 1 on the probe's write, 0 on its read — both confirmed |
+| `[24]` | `ISV` | set in every syndrome observed |
+
+Full syndromes, for reference:
+
+| Event | `HSR` | Vector | Target |
+|---|---|---|---|
+| Guest write to an ungranted granule | `0x93810044` | `+0x14` | both |
+| Guest read of a region disabled via `HPRENR` | `0x93810004` | `+0x14` | both |
+| **EL2's own** write to a region marked `AP = 0b10` | `0x9600004C` | `+0x10` | both |
+
+The last row is worth its own note: it confirms TRM Table 3-82 from the other
+direction. `AP = 0b10` really is read-only **at EL2**, and an EL2 write to such
+a region aborts.
+
+---
+
+## Exceptions taken FROM Hyp mode do not all update `HSR`
+
+Only `HVBAR + 0x0C`, `+0x10` and `+0x14` carry a syndrome. Reset, undefined
+instruction, `SVC` from Hyp, IRQ and FIQ do not update `HSR` at all, so `HSR`
+read after one of those holds whatever the last syndrome-bearing exception left
+in it — **stale, not wrong**.
+
+Measured: an `ICH_VTR` read taken as an Undefined Instruction exception at EL2
+arrived at `+0x04` with `HSR` still holding `0x0FE33017` (`EC 0x03`) from
+earlier. `ELR_hyp` is the useful register in that case — disassemble it.
+
+ZoneX's fault report distinguishes the two cases rather than accusing the
+hardware of contradicting itself, which is what it did before this was
+understood.
+
+---
+
+## `ICC_HSRE.SRE` gates every other GIC system register
+
+`ICH_VTR` — and every other `ICC_*` and `ICH_*` system register — is
+**UNDEFINED until `ICC_HSRE.SRE` is set**. This is not a documentation nicety:
+reading `ICH_VTR` first takes an Undefined Instruction exception at EL2, which
+is how it was found on the FVP.
+
+ZoneX's reset path therefore sets `ICC_HSRE.SRE` and `ICC_HSRE.Enable` before
+the identity block reads anything GIC-shaped. EL1 needs both set anyway to
+acknowledge an interrupt at all.
+
+---
+
+## The hypervisor's own console must be Device-attributed before it is used
+
+The sharpest practical consequence of "`BR` grants permission, not attributes",
+and the FVP cannot show it at all.
+
+On the S32Z280 the console is LINFlexD_9 at `0x42980000`, inside the
+`0x40000000`–`0x5FFFFFFF` band that Table 8-4 makes **Normal, Write-Through
+cacheable**. With `HSCTLR.BR=1` and the EL2 MPU not yet enabled, the console is
+*reachable* — and it does not work correctly. Normal memory permits gathering
+and reordering **even with caches off**, which corrupts a polled UART's
+register protocol.
+
+Measured: the whole identity block printed as legible-but-wrong text,
+characters intermittently corrupted, looking exactly like a marginal baud rate.
+Programming a Device-attributed EL2 region for the console and setting
+`HSCTLR.M` **before the first print** fixes it completely — the same run showed
+corrupt text before that point and clean text after.
+
+So the order is:
+
+1. `HMAIR0`/`HMAIR1`;
+2. the hypervisor's own MMIO regions — console, GIC;
+3. `HSCTLR.BR` and `HSCTLR.M`;
+4. **then** the console, and anything printed;
+5. the partition regions;
+6. `HCR.VM`.
+
+See `docs/decisions.md` D2 and D15.
 
 ---
 
@@ -320,7 +517,12 @@ Every fact above is cited by section, figure or table number against these
 documents, so a reader with the PDFs can check any line without needing the
 same local copy anybody else used.
 
-The **Armv8-R Architecture Reference Manual supplement** is the source that
-would settle open question 1 without hardware, and it was not consulted when
-this sheet was written. Obtaining it is the cheapest way to close that question
-if the hardware run is delayed.
+The **Armv8-R Architecture Reference Manual supplement** was not consulted when
+this sheet was written, and both of the questions it would have settled have
+since been settled on hardware instead — on two targets, which turned out to
+matter: they disagree about `HPFAR`, and no document would have predicted that.
+
+It is still the right source for one thing this sheet does not have: the
+authoritative `ISS` layout for a data abort. The fault status codes above are
+measured, and measurement can only confirm the encodings the hardware happened
+to produce.

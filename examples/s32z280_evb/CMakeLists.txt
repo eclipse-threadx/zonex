@@ -15,26 +15,91 @@
 #
 # ZoneX on the NXP S32Z280-594EVB.
 #
-# STATUS: no images yet.  The first one lands with the EL2 bring-up work,
-# alongside the FVP's.
-# This target is build-only in CI: it needs silicon, and a hosted runner has
-# none.  Running it is a bench activity driven by the gdb harness that lands
-# with the first image.
+# BUILD-ONLY IN CI.  Running needs silicon, and a hosted runner has none, so
+# this is a bench activity driven by tools/run_zx_probe.sh.
 #
-# What is already known about this board, measured rather than assumed, and
-# recorded here so the first image is not written against guesses:
+# What is already known about this board, measured rather than assumed:
 #
 #   * HMPUIR reads 0x00000014 -- 20 EL2 regions, matching its 20 EL1 regions.
 #     That is the whole budget the hypervisor's own mapping and every guest's
-#     stage-2 mapping share.
+#     stage-2 mapping share, and TWO of those go to the hypervisor's own MMIO
+#     (see zx_board.c and docs/decisions.md D2).
 #
 #   * SCTLR.TE and HSCTLR.TE reset SET on this part.  A32 vectors then never
 #     run and every fault presents as a silent hang, which is the single most
-#     expensive way to lose a day on this board.
+#     expensive way to lose a day on this board.  ZX_RESET_IN_THUMB below is
+#     the other half of the same fact: the core resets in Thumb STATE too.
 #
 #   * Two enabled MPU regions matching one address abort here.  PMSAv8-R has
-#     no region priority, and this part does not tolerate the overlap.
+#     no region priority and this part does not tolerate the overlap.
 #
 # See docs/armv8r-el2-reference.md.
 
-message(STATUS "ZoneX: the S32Z280 example builds no images yet.")
+set(ZX_S32Z_DIR   ${CMAKE_CURRENT_LIST_DIR})
+set(ZX_COMMON_DIR ${CMAKE_CURRENT_LIST_DIR}/../common)
+
+# See the note in the FVP example: a bare-metal image has one flat memory map
+# and access control belongs to the MPU, so an RWX segment is expected.
+if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
+    set(ZX_LINK_QUIET_RWX -Wl,--no-warn-rwx-segments)
+else()
+    set(ZX_LINK_QUIET_RWX)
+endif()
+
+function(zx_add_s32z_probe target_name)
+    add_executable(${target_name} EXCLUDE_FROM_ALL
+        ${ZX_COMMON_DIR}/zx_probe_main.c
+        ${ZX_COMMON_DIR}/zx_payload.S
+        ${ZX_S32Z_DIR}/zx_board.c
+    )
+
+    target_include_directories(${target_name} PRIVATE
+        ${ZX_S32Z_DIR}
+        ${ZX_COMMON_DIR}
+    )
+
+    # ZX_RESET_IN_THUMB and ZX_CONSOLE_BOARD are NOT set here.  They have to
+    # reach platform/cortex_r52/src/*, which a PRIVATE definition on an
+    # executable cannot do -- zonex_port is a separate static library.  They
+    # come from the root CMakeLists.txt instead, as a property of the build
+    # tree, which is also what makes the two boards mutually exclusive in one.
+    #
+    # Setting them here was the first version of this file and it produced an
+    # image with an A32 entry point and a semihosting console.  It built, it
+    # linked, and it would have printed nothing.
+
+    target_link_libraries(${target_name} PRIVATE
+        eclipse-threadx::zonex
+        zonex::warnings
+    )
+
+    target_link_options(${target_name} PRIVATE
+        -T${ZX_S32Z_DIR}/zx_link.lds
+        -nostartfiles
+        -Wl,-Map=${target_name}.map
+        ${ZX_LINK_QUIET_RWX}
+    )
+
+    set_target_properties(${target_name} PROPERTIES
+        LINK_DEPENDS ${ZX_S32Z_DIR}/zx_link.lds
+    )
+endfunction()
+
+zx_add_s32z_probe(zx_probe.elf)
+zx_add_s32z_probe(zx_probe_negative.elf)
+target_compile_definitions(zx_probe_negative.elf PRIVATE ZX_PROBE_NEGATIVE_TEST)
+zx_add_s32z_probe(zx_probe_el2_fault.elf)
+target_compile_definitions(zx_probe_el2_fault.elf PRIVATE
+                           ZX_PROBE_PROVOKE_EL2_FAULT)
+
+# Claims to need more EL2 regions than any Armv8-R implementation can have, so
+# that the REFUSAL path is exercised.  Like the negative build, it must FAIL,
+# and it is a build rather than a temporary edit so the demonstration stays
+# reproducible.
+zx_add_s32z_probe(zx_probe_starved.elf)
+target_compile_definitions(zx_probe_starved.elf PRIVATE ZX_PROBE_STARVE_REGIONS)
+
+# No add_test here.  A CTest entry that cannot run without a board and a
+# Windows-side debug server would fail every hosted run, and a suite that is
+# expected to fail teaches everybody to ignore it.  tools/run_zx_probe.sh is
+# the entry point, and it checks its own preconditions.

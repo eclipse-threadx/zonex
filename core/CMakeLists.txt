@@ -36,6 +36,7 @@ target_sources(zonex_core PUBLIC
     BASE_DIRS ${CMAKE_CURRENT_LIST_DIR}/../common/inc
               ${CMAKE_CURRENT_LIST_DIR}/inc
     FILES     ${CMAKE_CURRENT_LIST_DIR}/../common/inc/zx_api.h
+              ${CMAKE_CURRENT_LIST_DIR}/../common/inc/zx_console.h
               ${CMAKE_CURRENT_LIST_DIR}/inc/zx_fault.h
               ${CMAKE_CURRENT_LIST_DIR}/inc/zx_manifest.h
               ${CMAKE_CURRENT_LIST_DIR}/inc/zx_mm.h

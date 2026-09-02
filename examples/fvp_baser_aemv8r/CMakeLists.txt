@@ -15,24 +15,21 @@
 #
 # ZoneX on the Armv8-R AEM FVP (FVP_BaseR_AEMv8R).
 #
-# STATUS: no images yet.  The first one -- boot at EL2, program one stage-2
-# region, take a fault and decode it -- lands with the EL2 bring-up work.  This
-# file exists now so that the option, the model discovery and the CTest
-# registration are in place before there is anything to run, rather than being
-# invented alongside the first image.
+# Two things to keep in mind here:
 #
-# Two things to keep in mind when the first image lands here:
+#   * Images are EXCLUDE_FROM_ALL, as ThreadX's are.  A bare "ninja" builds
+#     none of them, and "ctest" then fails with "application file not found"
+#     rather than with anything that names the real problem.  test/fvp/run.sh
+#     reads the image list out of the ninja graph and builds them explicitly.
 #
-#   * Images are EXCLUDE_FROM_ALL, as ThreadX's are.  That means a bare
-#     "ninja" builds none of them, and "ctest" then fails with "application
-#     file not found" rather than with anything that names the real problem.
-#     Build the image targets explicitly.
-#
-#   * The FVP is not a Cortex-R52.  It reported 32 EL1 MPU regions, which is
-#     not an architecturally legal R52 value -- 16, 20 and 24 are the legal
-#     ones -- so a green FVP run proves nothing about any real part's region
-#     budget.  Expect the same at EL2, and read HMPUIR on the model rather
-#     than assuming it matches the S32Z280's 20.
+#   * The FVP is not a Cortex-R52.  It reports 32 EL1 MPU regions and 32 EL2
+#     regions, and 32 is not an architecturally legal R52 value -- 16, 20 and
+#     24 are.  A green FVP run proves the code is right and proves nothing
+#     about any real part's region budget.  zx_probe.elf says so in its own
+#     output rather than leaving it to this comment.
+
+set(ZX_FVP_DIR    ${CMAKE_CURRENT_LIST_DIR})
+set(ZX_COMMON_DIR ${CMAKE_CURRENT_LIST_DIR}/../common)
 
 # The model.  find_program caches into ZX_FVP_BASER_AEMV8R, so CI can override
 # the hint with -DZX_FVP_BASER_AEMV8R=<path> and no change to this file.
@@ -46,4 +43,142 @@ else()
     message(STATUS "ZoneX: FVP_BaseR_AEMv8R not found; FVP run targets unavailable.")
 endif()
 
-message(STATUS "ZoneX: the FVP example builds no images yet.")
+# A bare-metal image has one flat DRAM region and no OS page permissions;
+# access control belongs to the MPU, so an RWX segment is expected here rather
+# than a mistake.  GNU ld has warned about them since binutils 2.39 and takes
+# this flag to stay quiet.  ld.lld does not warn and rejects the flag outright,
+# failing the link with "unknown argument", so the suppression is chosen by
+# toolchain rather than spelled into every target.
+if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
+    set(ZX_LINK_QUIET_RWX -Wl,--no-warn-rwx-segments)
+else()
+    set(ZX_LINK_QUIET_RWX)
+endif()
+
+# One function, because the negative-test and provoke-a-fault variants are the
+# same image with one definition changed.  Building them from a shared function
+# is what keeps them honest: a negative test that had drifted from the positive
+# one would prove nothing about it.
+function(zx_add_fvp_probe target_name)
+    add_executable(${target_name} EXCLUDE_FROM_ALL
+        ${ZX_COMMON_DIR}/zx_probe_main.c
+        ${ZX_COMMON_DIR}/zx_payload.S
+        ${ZX_FVP_DIR}/zx_board.c
+    )
+
+    target_include_directories(${target_name} PRIVATE
+        ${ZX_FVP_DIR}
+        ${ZX_COMMON_DIR}
+    )
+
+    target_link_libraries(${target_name} PRIVATE
+        eclipse-threadx::zonex
+        zonex::warnings
+    )
+
+    target_link_options(${target_name} PRIVATE
+        -T${ZX_FVP_DIR}/zx_link.lds
+        -nostartfiles
+        -Wl,-Map=${target_name}.map
+        ${ZX_LINK_QUIET_RWX}
+    )
+
+    # -T is not a dependency CMake knows about, so editing the linker script
+    # would not trigger a relink and a stale image would be tested against new
+    # region boundaries.  Declare it.
+    set_target_properties(${target_name} PROPERTIES
+        LINK_DEPENDS ${ZX_FVP_DIR}/zx_link.lds
+    )
+endfunction()
+
+# The image the suite runs.
+zx_add_fvp_probe(zx_probe.elf)
+
+# T7's negative verification: the same image with the deliberate violation
+# aimed at an address the payload IS granted.  It must report FAILED, and it
+# is kept as a build rather than as a temporary edit so that "the check has
+# been seen to fail" stays reproducible instead of being a claim in a log.
+#
+# Registered with CTest as a WILL_FAIL test, which is the only way a suite can
+# assert that a check is capable of failing.
+zx_add_fvp_probe(zx_probe_negative.elf)
+target_compile_definitions(zx_probe_negative.elf PRIVATE ZX_PROBE_NEGATIVE_TEST)
+
+# Deliberately provokes a fault at EL2 itself, to prove the EC 0x25 path
+# exists and reports differently from a guest violation.  NOT registered with
+# CTest: its expected outcome is a hypervisor-fault report, and a suite taught
+# to accept that as a pass would accept it everywhere.  Run it by hand, read
+# the report, and record it.
+zx_add_fvp_probe(zx_probe_el2_fault.elf)
+target_compile_definitions(zx_probe_el2_fault.elf PRIVATE
+                           ZX_PROBE_PROVOKE_EL2_FAULT)
+
+# Claims to need more EL2 regions than any Armv8-R implementation can have, so
+# that the REFUSAL path is exercised.  Like the negative build, it must FAIL,
+# and it is a build rather than a temporary edit so the demonstration stays
+# reproducible.
+zx_add_fvp_probe(zx_probe_starved.elf)
+target_compile_definitions(zx_probe_starved.elf PRIVATE ZX_PROBE_STARVE_REGIONS)
+
+###############################################################################
+# Running on the model
+###############################################################################
+
+if(ZX_FVP_BASER_AEMV8R)
+    find_package(Python3 COMPONENTS Interpreter)
+
+    if(Python3_FOUND)
+        set(ZX_FVP_RUNNER ${CMAKE_CURRENT_LIST_DIR}/../../test/fvp/run_fvp_test.py)
+
+        add_test(NAME zx-fvp-probe
+                 COMMAND ${Python3_EXECUTABLE} ${ZX_FVP_RUNNER}
+                         --elf $<TARGET_FILE:zx_probe.elf>
+                         --fvp ${ZX_FVP_BASER_AEMV8R})
+
+        # The negative build must FAIL.  WILL_FAIL rather than a second runner
+        # flag, so that the assertion lives in the suite definition where it
+        # can be read, and so that a negative build which started passing --
+        # meaning the violation stopped being detected -- fails the suite.
+        add_test(NAME zx-fvp-probe-negative
+                 COMMAND ${Python3_EXECUTABLE} ${ZX_FVP_RUNNER}
+                         --elf $<TARGET_FILE:zx_probe_negative.elf>
+                         --fvp ${ZX_FVP_BASER_AEMV8R})
+        set_tests_properties(zx-fvp-probe-negative PROPERTIES WILL_FAIL TRUE)
+
+        # And the refusal path, for the same reason: a branch that has never
+        # been taken is not evidence that it works.
+        add_test(NAME zx-fvp-probe-starved
+                 COMMAND ${Python3_EXECUTABLE} ${ZX_FVP_RUNNER}
+                         --elf $<TARGET_FILE:zx_probe_starved.elf>
+                         --fvp ${ZX_FVP_BASER_AEMV8R})
+        set_tests_properties(zx-fvp-probe-starved PROPERTIES WILL_FAIL TRUE)
+
+        add_custom_target(zx-run-probe
+            COMMAND ${ZX_FVP_BASER_AEMV8R}
+                    -C cluster0.NUM_CORES=1
+                    -C bp.vis.disable_visualisation=1
+                    -C bp.terminal_0.start_telnet=0
+                    -C bp.pl011_uart0.out_file=-
+                    -C bp.pl011_uart0.unbuffered_output=1
+                    -a $<TARGET_FILE:zx_probe.elf>
+            DEPENDS zx_probe.elf
+            USES_TERMINAL
+            COMMENT "Running the ZoneX stage-2 probe on FVP_BaseR_AEMv8R..."
+        )
+
+        add_custom_target(zx-run-probe-el2-fault
+            COMMAND ${ZX_FVP_BASER_AEMV8R}
+                    -C cluster0.NUM_CORES=1
+                    -C bp.vis.disable_visualisation=1
+                    -C bp.terminal_0.start_telnet=0
+                    -C bp.pl011_uart0.out_file=-
+                    -C bp.pl011_uart0.unbuffered_output=1
+                    -a $<TARGET_FILE:zx_probe_el2_fault.elf>
+            DEPENDS zx_probe_el2_fault.elf
+            USES_TERMINAL
+            COMMENT "Provoking a deliberate EL2 fault on FVP_BaseR_AEMv8R..."
+        )
+    else()
+        message(STATUS "ZoneX: Python3 not found; FVP CTest entries unavailable.")
+    endif()
+endif()

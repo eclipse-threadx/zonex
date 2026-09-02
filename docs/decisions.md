@@ -116,6 +116,21 @@ Table 8-3).
 original entry claimed zero region cost outright, which is true of code and
 data and false of MMIO.*
 
+*Amended again, 2 September 2026, after the first EL2 image ran on both
+targets. The prediction above was right, and the reality was worse than
+predicted: the console does not merely need Device attributes eventually, it
+needs them **before the hypervisor prints its first line**. Reached through the
+background map as Normal memory, LINFlexD_9 gave legible-but-CORRUPTED output
+— Normal memory permits gathering and reordering even with caches off, and
+that breaks a polled UART's register protocol. The whole identity block arrived
+looking like a marginal baud rate, which is a far harder failure to recognise
+than no output at all. See D15 for the ordering that follows, and
+`docs/armv8r-el2-reference.md` for the measurement.*
+
+*Also now measured rather than budgeted: ZoneX spends exactly **two** of the
+S32Z280's twenty EL2 regions on its own MMIO — the console and the GIC — and
+**none** of the FVP's.*
+
 ---
 
 ## D3 — What isolates one partition from another · **settled**
@@ -143,26 +158,34 @@ before PMSAv8-R's lack of region priority rules it out.
 
 ---
 
-## D4 — How the region set is switched · **open until measured on silicon**
+## D4 — How the region set is switched · **mechanism proven; cost still open**
 
 **Preferred: program every partition's regions once at boot and switch with a
 single `HPRENR` write.** Fall back to rewriting the region block directly.
 
-The preference depends on two things that are not yet proven. `HPRENR` must
-really be 20 bits wide on a 20-region implementation — the TRM contradicts
-itself and open question 1 in `docs/armv8r-el2-reference.md` tracks it. And the
-whole budget must fit: 20 regions, two partitions, plus whatever the console
-and the guest images need.
+*Updated 2 September 2026: the two facts this preference depended on are now
+measured, and both came out in its favour.*
 
-The fallback is measured, on the S32Z280 and at EL1, during the Cortex-R52
-Modules port work: a direct region write costs 434–470 cycles, against
-542–604 through `PRSELR` for a region ≥ 16. ZoneX avoids that second
-number entirely — open question 2 established that `HPRBAR16`–`HPRBAR24` are
-directly addressable at `opc1 = 5`, so the high regions cost the same as the
-low ones.
+**`HPRENR` really is wider than 16 bits**, on both targets — `0x000FFFFF`
+implemented on the S32Z280's 20 regions, exactly TRM Table 3-77, against prose
+in the same section claiming regions 0 to 15. And it does not merely accept a
+bit above 15, it acts on one: with bit 16 set an EL1 read of the granule region
+16 covers succeeds, and with it clear the same read takes a stage-2 fault. That
+functional test is the one that mattered — a register that accepted the bit and
+ignored it would have passed a read-back test and made a one-write partition
+switch silently leave the outgoing partition's regions live.
 
-**This is a worst-case-execution-time decision, so it is settled with a
-measurement on silicon, not with an argument now.**
+**And the high regions are directly addressable**, `opc1 = 5`, confirmed on both
+parts by programming region 16 directly and reading it back through the
+selection register. So the fallback does not carry the penalty measured at EL1
+during the Cortex-R52 Modules port work for a region ≥ 16 — 542–604 cycles
+against 434–470 for a direct write. The whole budget costs the same per region.
+
+**What is still open is the COST of the `HPRENR` write itself**, and the budget
+arithmetic: 20 regions on the S32Z280, minus two for the hypervisor's own MMIO
+(D2), leaves 18 for every partition and guest. That is a
+worst-case-execution-time decision, so it stays open until it is measured on
+silicon rather than argued now.
 
 ---
 
@@ -229,10 +252,21 @@ LINFlexD_9 on the S32Z280.** Semihosting is chosen for the model because it
 needs no peripheral and therefore cannot be broken by a wrong memory map,
 which makes it the right thing to bring up *before* the MPU is trusted.
 LINFlexD_9 is what the board has, and what the Cortex-R52 bring-up already
-uses. Note the consequence recorded in D2: LINFlexD_9 sits at `0x4298_0000`,
-in a Normal-cacheable band of the background map, so it needs a
-Device-attributed EL2 region — the console is the first thing that proves the
-hypervisor's own MMIO regions are programmed correctly.
+uses.
+
+*Confirmed 2 September 2026, and the consequence is sharper than D2 originally
+put it.* Semihosting on the model really is immune to the memory map — it is a
+debug trap and touches no memory at all. LINFlexD_9 is the opposite: it sits at
+`0x4298_0000`, in a Normal-cacheable band of the background map, and reached
+that way it produces **corrupted output rather than no output**, which is the
+harder failure to recognise. So the console is not merely the first thing that
+*proves* the hypervisor's own MMIO regions are right; on silicon it does not
+work until they are. D15 records the ordering that forces.
+
+One thing this bought that was not expected: because the two backends differ,
+the SAME image printing cleanly on both targets is itself evidence about the
+region programming. A run whose text arrives intact on the board has
+demonstrated a correct Device region, without a separate test for it.
 
 **Still open: how two partitions share a console.** That decision arrives when
 there are two of them, and the options are:
@@ -387,3 +421,139 @@ S32Z280 `entry.S` has no `TX_R52_BOOT_AT_EL1` option — the FVP one does — an
 silicon guest cannot start at EL1 without it. That is the reason the seam is a
 path to a checkout rather than a released tarball for now, and it will stop
 being one as soon as that option is upstream.
+
+---
+
+## D15 — The order protection is turned on in · **settled 2 Sep 2026**
+
+**HMAIR, then the hypervisor's own MMIO regions, then `HSCTLR.BR` and
+`HSCTLR.M`, then the console, then the partition regions, then `HCR.VM`.**
+
+Turning protection on is two steps, not one, and they are separated because the
+hypervisor needs the first one *before it can trust its own console*.
+
+`HSCTLR.M` enables the EL2-controlled MPU, which governs EL2's own accesses.
+`HCR.VM` makes that same region set apply to EL0/EL1 as stage 2. The first
+image wrote them together, in that order, at the point where the partition
+regions were ready — which is the obvious arrangement and is wrong on any board
+whose console sits below `0x60000000`. There the console is reached through the
+background map as **Normal** memory, and Normal memory reorders and gathers
+even with caches off, which corrupts a polled UART's register protocol. The
+identity block printed as legible-but-wrong text (D2).
+
+So the console's Device-attributed region has to exist, and `HSCTLR.M` has to
+be set, before anything is printed. Three consequences follow and all three are
+implemented rather than noted:
+
+* **`HMPUIR` is read before any region is written**, because it decides whether
+  there are enough regions at all and writing `HPRSELR` with a value at or
+  above the implemented count is UNPREDICTABLE.
+* **`zx_stage2_enable` refuses to set `HCR.VM` when `HSCTLR.M` is clear.** That
+  combination would apply stage 2 against a region set the hardware is not
+  consulting: the guest would run unprotected while every check appeared to
+  pass, which is the worst outcome available in this file.
+* **The board hook that programs those regions prints nothing.** It runs before
+  the console is trustworthy, so its output arrives corrupted — which the first
+  version did, dropping two garbled lines into the middle of an otherwise clean
+  log and reporting its own diagnosis as a defect.
+
+The order is identical on both targets even though only one of them needs it.
+A program that took a different path on the model would be proving something
+about a path the silicon never runs.
+
+---
+
+## D16 — A guest fault comes back to the hypervisor as a VALUE · **settled**
+
+**`zx_el2_run_payload` saves EL2's own SP, LR and callee-saved registers, ERETs
+to EL1, and does not return through that ERET. The trap handler restores that
+context and resumes it with a result code, so from C the whole excursion looks
+like a call returning `ZX_RUN_YIELDED`, `ZX_RUN_FAULTED` or `ZX_RUN_TRAPPED`.**
+
+The alternative — decide what to do about the fault in the vector — is how a
+small hypervisor usually starts and it does not survive contact with policy. A
+handler running on the Hyp stack, with the guest's registers gone and nothing
+but `HSR` to go on, has no context in which to decide whether a partition
+should be reported, restarted, or simply not scheduled again. Turning the fault
+into a return value puts that decision in code that can be read, and it costs
+about a dozen instructions.
+
+It also made this step's own regression possible. Every phase of the stage-2
+probe is an ordinary function call whose outcome is checked, including the
+phases that are *expected* to fault, so a fault is a result rather than the end
+of the run. Without that, the image could only ever demonstrate one violation —
+the last one.
+
+**The exception is a fault taken FROM Hyp mode**, `EC 0x21` or `0x25`. There is
+nothing safe to resume there: ZoneX faulted on its own access, so whatever
+invariant the saved context assumed may already be false. Those vectors report
+and stop, with their own message and their own exit code, and they are never
+folded in with a guest violation — a Phase-0 run that reported a hypervisor bug
+as a partition being stopped at its boundary would pass while proving nothing.
+
+Two `HVC` immediates rather than one, for the same reason: `HVC #0` is the empty
+Phase-0 hypercall vector and returns to the guest transparently, `HVC #1` is a
+guest handing control back. Counting the first and resuming on the second is
+what lets a run distinguish "the payload came back on purpose" from "the
+payload was taken from".
+
+---
+
+## D17 — One board per build tree · **settled 2 Sep 2026**
+
+**`ZX_BUILD_FVP_EXAMPLE` and `ZX_BUILD_S32Z280_EXAMPLE` are mutually exclusive,
+and the root `CMakeLists.txt` refuses a configuration that sets both.**
+
+Two facts about the port are board facts, not target facts: whether the core
+arrives at `_start` in T32 state, and whether the console is semihosting or the
+board's UART. Both have to reach `platform/cortex_r52/src/*`, and
+`target_compile_definitions` on an *executable* cannot do that — `zonex_port`
+is a separate static library and a `PRIVATE` definition on an image never
+touches it.
+
+This is recorded as a decision because the mistake is silent. The first version
+of the S32Z280 example set both definitions on its own targets, and produced an
+image with an A32 entry point and a semihosting console. It configured, it
+compiled, it linked, and on the board it would have executed the first halfword
+of its own first instruction in the wrong state and gone somewhere arbitrary —
+with no output of any kind to say so.
+
+So the definitions come from the build tree, and the two boards cannot share
+one. Every script and workflow in the repository already configures exactly
+one; the check exists for the invocation that does not.
+
+---
+
+## D18 — `HDFAR`, not `HPFAR` · **settled 2 Sep 2026, by measurement**
+
+**ZoneX takes the faulting address of a stage-2 violation from `HDFAR`.
+`HPFAR` is reported, and not relied on.**
+
+Not a preference. The Cortex-R52 TRM describes `HPFAR` two ways in the same
+section — Figure 3-32 draws `FIPA[39:12]` at `HPFAR[31:4]`, Table 3-69's row
+beside it says "Bits [31:4] of the faulting address" — and **the two ZoneX
+targets implement different ones**:
+
+| Target | `HDFAR` | `HPFAR` | Reading |
+|---|---|---|---|
+| Armv8-R AEM FVP | `0x00007040` | `0x00000070` | the figure |
+| S32Z280-594EVB | `0x31781200` | `0x31781200` | the table row |
+
+Measured, on 2 September 2026, by faulting on an address the image chose to be
+granule-aligned but deliberately not 4 KB-aligned, so that the two readings
+could not both fit. The two answers differ by a factor of 256, and each is
+plausible on its own — so a hypervisor that computed an address from `HPFAR`
+would be quietly wrong on one of its two targets.
+
+`HDFAR` carries the full faulting virtual address on both. It is also the
+register an off-by-one-granule region bug has to be caught with: under the
+figure's reading `HPFAR` resolves only to 4 KB and cannot say which 64-byte
+granule faulted.
+
+The fault report prints `HPFAR` raw, computes **both** readings, and names
+which one the target it is running on implements. That is deliberate: the
+divergence is a fact about the architecture's documentation that the next
+person needs, and a report that quietly picked one reading would hide it.
+`HPFAR` is also not updated at all for a fault taken from Hyp mode, so the
+report omits any reading of it there rather than presenting a stale value as an
+address.

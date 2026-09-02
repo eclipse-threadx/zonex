@@ -30,7 +30,16 @@
 #   * Never pipe a run through tail or head.  Redirect to a file and read the
 #     file; the pipe truncates exactly the part that matters when a run hangs.
 #
-# STATUS: there are no images yet.  See test/fvp/run.sh for the same note.
+# WHAT "test" RUNS.  examples/s32z280_evb/tools/run_zx_probe.sh, which checks
+# its own preconditions, captures the console to a file BEFORE the image runs,
+# and judges the run from both the console and memory.  The negative and
+# region-starvation builds are run the same way, by name:
+#
+#   examples/s32z280_evb/tools/run_zx_probe.sh build/s32z280 zx_probe_negative.elf
+#   examples/s32z280_evb/tools/run_zx_probe.sh build/s32z280 zx_probe_starved.elf
+#   examples/s32z280_evb/tools/run_zx_probe.sh build/s32z280 zx_probe_el2_fault.elf
+#
+# All three must FAIL; the last one makes ZoneX fault at EL2 on purpose.
 
 set -euo pipefail
 
@@ -60,18 +69,18 @@ case "${command}" in
 
         image_list="$(images)"
         if [ -z "${image_list}" ]; then
-            echo "ZoneX: no S32Z280 images exist yet."
-            echo "ZoneX: the hypervisor libraries were built; nothing was flashed."
-            exit 0
+            echo "ZoneX: no S32Z280 images were found in the ninja graph." >&2
+            echo "ZoneX: ZoneX HAS images, so the build system is broken rather" >&2
+            echo "ZoneX: than the tree being incomplete." >&2
+            exit 1
         fi
 
         # shellcheck disable=SC2086
         cmake --build "${BUILD}" --target ${image_list}
 
         if [ "${command}" = "test" ]; then
-            echo "ZoneX: running on the S32Z280 needs the board and the gdb harness," >&2
-            echo "ZoneX: which arrives with the first image." >&2
-            exit 1
+            exec "${ROOT}/examples/s32z280_evb/tools/run_zx_probe.sh" \
+                 "${BUILD}" zx_probe.elf
         fi
         ;;
     *)

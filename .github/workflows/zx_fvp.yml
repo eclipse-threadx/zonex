@@ -30,14 +30,19 @@ name: zx_fvp
 # repository-variable arrangement for the model, because Arm has no stable
 # unauthenticated download URL for it.
 #
-# STATUS: the repository contains no images at all yet.  The workflow builds the
-# hypervisor libraries and says loudly that it executed nothing.  Once the first
-# image lands this workflow starts doing what its name says.  The "no images"
-# path is a warning rather than a failure ON PURPOSE and only while that is
-# true -- see the comment at the check itself.
+# WHAT IT RUNS.  zx_probe.elf, which must PASS, plus two builds of the same
+# image that must FAIL -- one whose deliberate violation is aimed at an address
+# the payload is granted, and one told it needs more MPU regions than exist.
+# Both are registered WILL_FAIL, because a check that has never been seen to
+# fail is not evidence that it can.  CTest runs all three.
+#
+# zx_probe_el2_fault.elf is deliberately NOT registered: its expected outcome
+# is a hypervisor-fault report, and a suite taught to accept that as a pass
+# would accept it everywhere.  It is run by hand.
 #
 # The S32Z280 targets are not run here and never will be.  They need silicon;
-# gcc_check.yml builds them.
+# gcc_check.yml builds them, and
+# examples/s32z280_evb/tools/run_zx_probe.sh runs them on a bench.
 
 on:
   push:
@@ -239,20 +244,20 @@ jobs:
                   | grep -oE '^[A-Za-z0-9_]+\.elf' \
                   | grep -v '^cmake_' | sort -u || true)"
 
-        # A warning, not a failure -- and ONLY while the repository genuinely
-        # has no images, which is true only until the first one lands.  At that
-        # moment, change this to "::error::" and a non-zero exit: from then on,
-        # an empty image list means the CMake graph broke, and a workflow that
-        # shrugs at that is the hole this file exists to close.
+        # An ERROR, since the EL2 bring-up work landed.  This was a warning
+        # while the repository genuinely had no images; from the moment the
+        # first one exists, an empty list means the CMake graph broke, and a
+        # workflow that shrugs at that is the hole this file exists to close.
         if [ -z "$images" ]; then
-          echo "::warning::ZoneX has no FVP images yet. Nothing was executed."
+          echo "::error::No FVP images were found in the CMake graph. ZoneX has images, so this means the graph broke."
           {
-            echo "### ZoneX FVP execution: NOTHING TO RUN"
+            echo "### ZoneX FVP execution: NO IMAGES FOUND"
             echo ""
-            echo "The hypervisor libraries built, but the repository contains no images yet."
-            echo "The first one lands with the EL2 bring-up work."
+            echo "The hypervisor libraries built, but the ninja graph named no \`*.elf\` targets."
+            echo "ZoneX does have FVP images, so this is a build-system failure rather than"
+            echo "a repository that has not got there yet."
           } >>"$GITHUB_STEP_SUMMARY"
-          exit 0
+          exit 1
         fi
 
         echo "Building $(echo "$images" | wc -l) images"
