@@ -33,8 +33,11 @@ name: zx_fvp
 # WHAT IT RUNS.  zx_probe.elf, which must PASS, plus two builds of the same
 # image that must FAIL -- one whose deliberate violation is aimed at an address
 # the payload is granted, and one told it needs more MPU regions than exist.
-# Both are registered WILL_FAIL, because a check that has never been seen to
-# fail is not evidence that it can.  CTest runs all three.
+# Both are registered with the runner's "--expect fail", because a check that
+# has never been seen to fail is not evidence that it can.  CTest runs all
+# three.  (CTest's WILL_FAIL is deliberately NOT used: it inverts the exit
+# status and nothing else, so it cannot tell a reported failure from an image
+# that was never built.  See test/fvp/run_fvp_test.py.)
 #
 # zx_probe_el2_fault.elf is deliberately NOT registered: its expected outcome
 # is a hypervisor-fault report, and a suite taught to accept that as a pass

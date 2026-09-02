@@ -26,8 +26,8 @@
 # and two builds that must FAIL -- zx_probe_negative.elf, whose deliberate
 # violation is aimed at an address the payload IS granted, and
 # zx_probe_starved.elf, which is told it needs more MPU regions than exist.
-# Both are registered WILL_FAIL in CMake, because a check that has never been
-# seen to fail is not evidence that it can.
+# Both are registered with "--expect fail" in CMake, because a check that has
+# never been seen to fail is not evidence that it can.
 #
 # zx_probe_el2_fault.elf is built but not registered: it makes ZoneX fault at
 # EL2 on purpose, so its expected outcome IS a failure report.  Run it with

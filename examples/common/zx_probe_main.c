@@ -640,7 +640,7 @@ static void zx_phase_violation(void)
         "\n"
         "  Expected here: ATTEMPTED set, SURVIVED set, two failing checks,\n"
         "  no stage-2 fault from this phase, and ZONEX RESULT: FAILED.  The\n"
-        "  CTest entry for this build carries WILL_FAIL, so this build\n"
+        "  CTest entry for this build expects FAILED, so this build\n"
         "  starting to PASS -- meaning the violation stopped being detected\n"
         "  -- fails the suite.\n");
 #endif

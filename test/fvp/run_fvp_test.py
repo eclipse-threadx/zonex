@@ -25,9 +25,38 @@ that its absence is a failure.
 
 ZoneX prints "ZONEX RESULT: ..." rather than "RESULT: ...", so the two suites'
 markers cannot be confused if their logs are ever concatenated.
+
+WHY --expect EXISTS, AND WHY CTest's WILL_FAIL IS NOT USED INSTEAD
+
+Some ZoneX images are built to fail: the negative build aims its violation at
+an address the payload IS granted, and the starved build claims more regions
+than any implementation has.  Their whole purpose is to show that a check is
+capable of failing, which is the only evidence that the check works.
+
+The obvious way to assert that is CTest's WILL_FAIL property, and this suite
+used it until it was caught being wrong.  WILL_FAIL inverts the exit status and
+nothing else, so it cannot tell the outcome we want -- "the image ran and
+reported its own failure" -- from the outcomes we do not:
+
+  * the image was never built (these targets are EXCLUDE_FROM_ALL, so a plain
+    `ninja && ctest` leaves them absent), and the runner failed to find it;
+  * the model was missing, or refused the command line;
+  * the image hung and hit the timeout.
+
+Every one of those exits non-zero, so WILL_FAIL called every one of them a
+pass.  Observed: with the images unbuilt, the two negative tests reported
+`Passed` on "application file not found" -- two green lines asserting nothing
+whatever about stage 2.  A negative test that passes because nothing ran is
+worse than no test, because it is counted.
+
+So the assertion moves in here, where the verdict itself can be read.  The
+property WILL_FAIL was chosen for is kept: a negative build that starts PASSING
+-- meaning the violation stopped being detected -- still fails the suite, under
+`--expect fail`, by printing the pass mark it must not print.
 """
 
 import argparse
+import os
 import subprocess
 import sys
 
@@ -50,7 +79,74 @@ def as_text(stream):
     return stream
 
 
-def run(elf, fvp, timeout):
+def judge(output, expect):
+    """Compare the captured console against what this image was built to do.
+
+    Returns a process exit status.  Ordering matters in both branches: the
+    mark that must NOT appear is tested before the one that must, so an image
+    printing both is reported as broken rather than as whichever came first.
+    """
+    if expect == "pass":
+        if FAIL_MARK in output:
+            print("FAIL: the image reported failing checks.", file=sys.stderr)
+            for line in output.splitlines():
+                if line.startswith("  [FAIL]"):
+                    print("   " + line.strip(), file=sys.stderr)
+            return 1
+
+        if PASS_MARK not in output:
+            print(
+                "FAIL: no ZoneX verdict line was found. The image neither "
+                "passed nor reported failure, so it did not reach its "
+                "verdict.",
+                file=sys.stderr,
+            )
+            return 1
+
+        print("PASS")
+        return 0
+
+    # expect == "fail": this image was built to violate something, and the
+    # run is judged on whether the violation was DETECTED and NAMED.
+    if PASS_MARK in output:
+        print(
+            "FAIL: the image reported ALL CHECKS PASSED, but it was built to "
+            "fail. The check it was built to violate has stopped detecting "
+            "the violation -- so the corresponding positive test is no "
+            "longer evidence of anything.",
+            file=sys.stderr,
+        )
+        return 1
+
+    if FAIL_MARK not in output:
+        print(
+            "FAIL: no ZoneX verdict line was found. A negative build must "
+            "REPORT its own failure, not merely fail to run: an image that "
+            "was never built, a model that would not start, or a hang all "
+            "produce no verdict, and none of them is evidence that the "
+            "check works.",
+            file=sys.stderr,
+        )
+        return 1
+
+    print("PASS (the expected failure was reported)")
+    return 0
+
+
+def run(elf, fvp, timeout, expect):
+    # Checked before the model is launched, and checked for every value of
+    # --expect.  These images are EXCLUDE_FROM_ALL, so "not built yet" is the
+    # normal state of a fresh tree rather than an exotic error, and it must
+    # never reach the verdict logic as an absent-verdict run.
+    if not os.path.isfile(elf):
+        print(
+            f"FAIL: no image at {elf}. It is EXCLUDE_FROM_ALL, so `ninja` "
+            "alone does not build it; name the image as a build target "
+            "before running the suite.",
+            file=sys.stderr,
+        )
+        return 1
+
     command = [
         fvp,
         "-C", "cluster0.NUM_CORES=1",
@@ -70,6 +166,12 @@ def run(elf, fvp, timeout):
             command, capture_output=True, text=True, timeout=timeout
         )
         output = as_text(completed.stdout) + as_text(completed.stderr)
+    except FileNotFoundError:
+        print(
+            f"FAIL: the model binary {fvp} could not be executed.",
+            file=sys.stderr,
+        )
+        return 1
     except subprocess.TimeoutExpired as expired:
         print(as_text(expired.stdout) + as_text(expired.stderr))
         print(
@@ -82,23 +184,7 @@ def run(elf, fvp, timeout):
 
     print(output)
 
-    if FAIL_MARK in output:
-        print("FAIL: the image reported failing checks.", file=sys.stderr)
-        for line in output.splitlines():
-            if line.startswith("  [FAIL]"):
-                print("   " + line.strip(), file=sys.stderr)
-        return 1
-
-    if PASS_MARK not in output:
-        print(
-            "FAIL: no ZoneX verdict line was found. The image neither passed "
-            "nor reported failure, so it did not reach its verdict.",
-            file=sys.stderr,
-        )
-        return 1
-
-    print("PASS")
-    return 0
+    return judge(output, expect)
 
 
 def main():
@@ -108,9 +194,15 @@ def main():
     parser.add_argument(
         "--timeout", type=int, default=180, help="seconds before declaring a hang"
     )
+    parser.add_argument(
+        "--expect",
+        choices=("pass", "fail"),
+        default="pass",
+        help="the verdict this image was built to print (default: pass)",
+    )
     arguments = parser.parse_args()
 
-    return run(arguments.elf, arguments.fvp, arguments.timeout)
+    return run(arguments.elf, arguments.fvp, arguments.timeout, arguments.expect)
 
 
 if __name__ == "__main__":

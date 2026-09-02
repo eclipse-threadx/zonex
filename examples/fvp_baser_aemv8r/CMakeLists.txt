@@ -99,8 +99,8 @@ zx_add_fvp_probe(zx_probe.elf)
 # is kept as a build rather than as a temporary edit so that "the check has
 # been seen to fail" stays reproducible instead of being a claim in a log.
 #
-# Registered with CTest as a WILL_FAIL test, which is the only way a suite can
-# assert that a check is capable of failing.
+# Registered with CTest under "--expect fail", so that the suite asserts the
+# check is capable of failing AND that the failure was actually reported.
 zx_add_fvp_probe(zx_probe_negative.elf)
 target_compile_definitions(zx_probe_negative.elf PRIVATE ZX_PROBE_NEGATIVE_TEST)
 
@@ -135,23 +135,31 @@ if(ZX_FVP_BASER_AEMV8R)
                          --elf $<TARGET_FILE:zx_probe.elf>
                          --fvp ${ZX_FVP_BASER_AEMV8R})
 
-        # The negative build must FAIL.  WILL_FAIL rather than a second runner
-        # flag, so that the assertion lives in the suite definition where it
-        # can be read, and so that a negative build which started passing --
-        # meaning the violation stopped being detected -- fails the suite.
+        # The negative build must report FAILED.  "--expect fail" rather than
+        # CTest's WILL_FAIL, which this suite used until it was caught being
+        # wrong: WILL_FAIL inverts the exit status and nothing else, so it
+        # cannot distinguish "the image reported its own failure" from "the
+        # image was never built", "the model would not start" or "it hung".
+        # All of those exit non-zero, and WILL_FAIL called all of them passes
+        # -- observed, with these EXCLUDE_FROM_ALL images unbuilt, as two
+        # green lines asserting nothing about stage 2 at all.
+        #
+        # The property WILL_FAIL was chosen for survives the change: a
+        # negative build that starts PASSING, meaning the violation stopped
+        # being detected, still fails the suite.  See test/fvp/run_fvp_test.py.
         add_test(NAME zx-fvp-probe-negative
                  COMMAND ${Python3_EXECUTABLE} ${ZX_FVP_RUNNER}
                          --elf $<TARGET_FILE:zx_probe_negative.elf>
-                         --fvp ${ZX_FVP_BASER_AEMV8R})
-        set_tests_properties(zx-fvp-probe-negative PROPERTIES WILL_FAIL TRUE)
+                         --fvp ${ZX_FVP_BASER_AEMV8R}
+                         --expect fail)
 
         # And the refusal path, for the same reason: a branch that has never
         # been taken is not evidence that it works.
         add_test(NAME zx-fvp-probe-starved
                  COMMAND ${Python3_EXECUTABLE} ${ZX_FVP_RUNNER}
                          --elf $<TARGET_FILE:zx_probe_starved.elf>
-                         --fvp ${ZX_FVP_BASER_AEMV8R})
-        set_tests_properties(zx-fvp-probe-starved PROPERTIES WILL_FAIL TRUE)
+                         --fvp ${ZX_FVP_BASER_AEMV8R}
+                         --expect fail)
 
         add_custom_target(zx-run-probe
             COMMAND ${ZX_FVP_BASER_AEMV8R}
