@@ -276,6 +276,137 @@ _Static_assert((ZX_MAX_PARTITIONS * ZX_MAX_REGIONS_PER_PARTITION) <= 24U,
                "the manifest's capacity exceeds the largest Armv8-R EL2 "
                "region count (24), so no part could program it");
 
+/**************************************************************************/
+/*                          Validator error codes                         */
+/**************************************************************************/
+
+/* One code per rule, and no code shared between two rules.  That is what
+   makes a failure a diagnosis rather than a hint: "the manifest is invalid"
+   sends a reader back to the manifest, ZX_MANIFEST_LIMIT_UNALIGNED with a
+   partition and region index sends them to the line.
+
+   The numbering is dense and stable.  These reach a boot-time console
+   message and a host test's expected value, so renumbering them is a
+   breaking change to both.  */
+
+#define ZX_MANIFEST_SUCCESS                 0x00U
+#define ZX_MANIFEST_NULL_POINTER            0x01U
+#define ZX_MANIFEST_NO_PARTITIONS           0x02U
+#define ZX_MANIFEST_TOO_MANY_PARTITIONS     0x03U
+#define ZX_MANIFEST_DUPLICATE_ID            0x04U
+#define ZX_MANIFEST_NO_REGIONS              0x05U
+#define ZX_MANIFEST_TOO_MANY_REGIONS        0x06U
+#define ZX_MANIFEST_BASE_UNALIGNED          0x07U
+#define ZX_MANIFEST_LIMIT_UNALIGNED         0x08U
+#define ZX_MANIFEST_LIMIT_BELOW_BASE        0x09U
+#define ZX_MANIFEST_BAD_AP                  0x0AU
+#define ZX_MANIFEST_BAD_XN                  0x0BU
+#define ZX_MANIFEST_BAD_SH                  0x0CU
+#define ZX_MANIFEST_ATTR_OUT_OF_RANGE       0x0DU
+#define ZX_MANIFEST_ATTR_NOT_WRITTEN        0x0EU
+#define ZX_MANIFEST_SELF_OVERLAP            0x0FU
+#define ZX_MANIFEST_PARTITION_OVERLAP       0x10U
+#define ZX_MANIFEST_MMIO_OVERLAP            0x11U
+#define ZX_MANIFEST_NO_EXECUTABLE_REGION    0x12U
+#define ZX_MANIFEST_NO_WRITABLE_REGION      0x13U
+#define ZX_MANIFEST_ENTRY_NOT_EXECUTABLE    0x14U
+#define ZX_MANIFEST_IMAGE_RANGE_INVALID     0x15U
+#define ZX_MANIFEST_IMAGE_TOO_LARGE         0x16U
+#define ZX_MANIFEST_ZERO_WINDOW             0x17U
+#define ZX_MANIFEST_FRAME_MISMATCH          0x18U
+#define ZX_MANIFEST_TOO_MANY_SHARED         0x19U
+#define ZX_MANIFEST_SHARED_NOT_ONE_GRANULE  0x1AU
+#define ZX_MANIFEST_SHARED_NO_PUBLISHER     0x1BU
+#define ZX_MANIFEST_SHARED_BAD_AP           0x1CU
+#define ZX_MANIFEST_REGION_BUDGET           0x1DU
+
+/**************************************************************************/
+/*                          What the validator saw                        */
+/**************************************************************************/
+
+/* Where the offending declaration is.  Two locations, not one, because the
+   overlap rules have two offenders and naming only one of them is half a
+   diagnosis -- a reader told "partition 1 region 2 overlaps something" still
+   has to find the something.
+
+   Unused fields hold ZX_MANIFEST_NO_INDEX rather than zero.  Zero is a valid
+   partition and region index, so a zeroed field is indistinguishable from a
+   real one, and that is exactly the sort of ambiguity a fault report must not
+   have.  */
+
+#define ZX_MANIFEST_NO_INDEX    0xFFFFFFFFU
+
+typedef struct zx_manifest_fault_struct
+{
+    UINT    zx_fault_status;            /* ZX_MANIFEST_*                     */
+    UINT    zx_fault_partition;         /* or ZX_MANIFEST_NO_INDEX           */
+    UINT    zx_fault_region;            /* or ZX_MANIFEST_NO_INDEX           */
+    UINT    zx_fault_other_partition;   /* second offender, overlaps only    */
+    UINT    zx_fault_other_region;      /* second offender, overlaps only    */
+} ZX_MANIFEST_FAULT;
+
+/**************************************************************************/
+/*                    Facts the manifest cannot carry                     */
+/**************************************************************************/
+
+/* Everything the validator needs that is NOT a property of the manifest.
+ *
+ * Passed in rather than read from hardware, which is what lets one function
+ * serve both callers: the host suite hands it made-up values and gets
+ * coverage, and the boot path hands it the real HMPUIR and the real HMAIR it
+ * just programmed.  A validator that read CP15 itself could only ever run on
+ * the target, and the rules worth testing exhaustively are the arithmetic
+ * ones.
+ *
+ * zx_env_attr_written_mask is a bitmask of AttrIndx values the hypervisor has
+ * actually written into HMAIR0/HMAIR1 -- bit n set means index n is
+ * programmed.  It is here because "which indices exist" is architectural
+ * while "which ones mean anything" is a software fact, and a region naming an
+ * unwritten index gets Device-nGnRnE: memory that works, slowly, with nothing
+ * to fault on.  That is the failure this mask exists to make impossible.  */
+
+typedef struct zx_manifest_env_struct
+{
+    const ZX_REGION    *zx_env_mmio_regions;
+    UINT                zx_env_mmio_region_count;
+    UINT                zx_env_attr_written_mask;
+    UINT                zx_env_region_budget;   /* HMPUIR count on a target  */
+} ZX_MANIFEST_ENV;
+
+/**************************************************************************/
+/*                              The validator                             */
+/**************************************************************************/
+
+/* Checks a manifest against every rule and returns the FIRST failure.
+ *
+ * Pure: no hardware access, no static state, no allocation, and the same
+ * inputs always give the same answer.  That is not stylistic -- it is what
+ * makes the function host-testable to a coverage floor, and what lets the
+ * boot path call it without ordering constraints.
+ *
+ * First failure rather than a list, because a manifest with two errors is
+ * fixed one error at a time anyway, and accumulating them would need storage
+ * the caller has to size.
+ *
+ * fault_ptr may be a null pointer if the caller wants only the status.  */
+
+ZX_NODISCARD UINT zx_manifest_verify(const ZX_MANIFEST *manifest_ptr,
+                                     const ZX_MANIFEST_ENV *env_ptr,
+                                     ZX_MANIFEST_FAULT *fault_ptr);
+
+/* True when two INCLUSIVE ranges share at least one byte.
+ *
+ * Exposed because the overlap rules are the ones most worth testing directly,
+ * and because it is the only piece of arithmetic here that has a wrapping
+ * trap in it: computing a length, or an exclusive end, from a range that
+ * reaches the top of the address space wraps to zero and makes a real overlap
+ * look like none.  Written as two comparisons so nothing is computed at all.  */
+
+ZX_NODISCARD UINT zx_manifest_ranges_overlap(zx_addr_t first_base,
+                                             zx_addr_t first_limit,
+                                             zx_addr_t second_base,
+                                             zx_addr_t second_limit);
+
 #ifdef __cplusplus
 }
 #endif

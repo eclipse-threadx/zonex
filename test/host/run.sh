@@ -61,6 +61,22 @@ case "${command}" in
     coverage)
         configure
         cmake --build "${BUILD}"
+
+        # DELETE THE COUNTERS FIRST, or the report is a lie.
+        #
+        # gcov ACCUMULATES: a .gcda file left from an earlier run is added to
+        # by the next one, never replaced.  So a second coverage run over the
+        # same build tree reports the union of both, and coverage can only
+        # ever appear to go up.  A line whose only test was just deleted still
+        # reads as covered, and the floor below cannot fail.
+        #
+        # This was measured, not feared: disabling one rule's tests and
+        # re-running still reported 100%, and the floor passed.  CI never sees
+        # it because every run starts from a fresh checkout, which is exactly
+        # why it survives -- the machine that gets the wrong answer is the
+        # contributor's, checking whether their own change dropped coverage.
+        find "${BUILD}" -name '*.gcda' -delete
+
         ctest --test-dir "${BUILD}" --output-on-failure
         # Rooted at the repository so the report names files the way the
         # repository does.  gcovr writes its intermediate .gcov files into the
@@ -75,6 +91,35 @@ case "${command}" in
               --html-details "${ROOT}/coverage_report/index.html" \
               --xml "${ROOT}/coverage_report/coverage.xml" \
               --print-summary
+
+        # THE FLOOR, and it is deliberately narrow.
+        #
+        # A repository-wide threshold cannot work here: much of core/ is only
+        # true on the model or on silicon and the host suite cannot reach it,
+        # which is why ZoneX does not hold the suite's usual figure over the
+        # whole tree (docs/decisions.md D11).  A floor set to whatever the
+        # tree happens to measure today would mean nothing either -- it says
+        # "no worse than when somebody set it" and not one thing about the
+        # code.
+        #
+        # So the floor is set where a real number is defensible: the manifest
+        # validator, which is a pure function with no hardware in it and no
+        # excuse for an unreached line.  100% is not aspirational -- it is
+        # what it measures, on lines and on branches both.  A rule added
+        # without a case that fails it will drop this and fail the build,
+        # which is the entire point: a validator rule nothing has ever seen
+        # reject anything is not a rule, it is a comment.
+        #
+        # Reported separately from the report above so that the number being
+        # enforced is visible next to the failure, rather than the build
+        # dying with a threshold the reader has to go and look up.
+        echo ""
+        echo "Enforcing the coverage floor on the manifest validator:"
+        gcovr --root "${ROOT}" \
+              --filter "${ROOT}/core/src/zx_manifest_verify.c" \
+              --txt - \
+              --fail-under-line 100 \
+              --fail-under-branch 100
         ;;
     *)
         echo "Usage: $0 [build|test|coverage]" >&2

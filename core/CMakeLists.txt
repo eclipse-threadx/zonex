@@ -22,6 +22,7 @@
 
 target_sources(zonex_core PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/src/zx_fault.c
+    ${CMAKE_CURRENT_LIST_DIR}/src/zx_manifest_verify.c
     ${CMAKE_CURRENT_LIST_DIR}/src/zx_mm_setup.c
     ${CMAKE_CURRENT_LIST_DIR}/src/zx_partition_manager.c
     ${CMAKE_CURRENT_LIST_DIR}/src/zx_schedule.c
