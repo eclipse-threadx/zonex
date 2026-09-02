@@ -158,10 +158,12 @@ before PMSAv8-R's lack of region priority rules it out.
 
 ---
 
-## D4 — How the region set is switched · **mechanism proven; cost still open**
+## D4 — How the region set is switched · **settled 2 Sep 2026; cost measured on the model, silicon pending**
 
-**Preferred: program every partition's regions once at boot and switch with a
-single `HPRENR` write.** Fall back to rewriting the region block directly.
+**One `HPRENR` mask write.** Region descriptors are programmed once at boot,
+each partition owns a fixed block of indices, and a switch changes which
+blocks are enabled. Rewriting the region block directly remains the fallback
+and is no longer expected to be needed.
 
 *Updated 2 September 2026: the two facts this preference depended on are now
 measured, and both came out in its favour.*
@@ -181,11 +183,30 @@ selection register. So the fallback does not carry the penalty measured at EL1
 during the Cortex-R52 Modules port work for a region ≥ 16 — 542–604 cycles
 against 434–470 for a direct write. The whole budget costs the same per region.
 
-**What is still open is the COST of the `HPRENR` write itself**, and the budget
-arithmetic: 20 regions on the S32Z280, minus two for the hypervisor's own MMIO
-(D2), leaves 18 for every partition and guest. That is a
-worst-case-execution-time decision, so it stays open until it is measured on
-silicon rather than argued now.
+**The cost ratio is now measured, and it is what the design rested on.** On
+the model a mask switch is 13 cycles against 54 for a single region descriptor
+write, so a block rewrite at three regions per partition would cost roughly
+twelve times the mask — and unlike the mask, its cost would grow with the
+incoming partition's region count, which is the property a WCET argument
+cannot have.
+
+**This is why the direct encodings above index 15 are not generalised.** They
+work, proven on both parts, but they would speed up an operation that happens
+once at boot. Unrolling them means roughly a hundred inline `MCR`/`MRC`
+statements, because coprocessor register numbers must be compile-time
+constants. That cost buys nothing while the switch is a mask.
+
+**Still open: the figures above are the model's**, and a functional model does
+not model timing. The number a safety customer is quoted has to come from the
+part. The measurement path itself is in the image and runs on every target, so
+this closes with a board session rather than with new code.
+
+The budget arithmetic is unchanged: 20 regions on the S32Z280, minus two for
+the hypervisor's own MMIO (D2), leaves 18 for every partition and guest.
+
+The one case that would reopen the mechanism is two partitions needing
+different *attributes* on one address, which no manifest the validator accepts
+can ask for today.
 
 ---
 

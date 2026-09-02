@@ -503,6 +503,77 @@ See `docs/decisions.md` D2 and D15.
 
 ---
 
+## The PMU cycle counter, and the one register that is not where you expect
+
+`CNTFRQ` reads zero on both targets, so the generic timer cannot be used as a
+clock. `PMCCNTR` needs no frequency, and cycles are the unit a WCET argument is
+made in anyway.
+
+| Register | Encoding | Note |
+|---|---|---|
+| `PMCR` | `p15, 0, c9, c12, 0` | `E[0]` enable, `C[2]` reset cycles, `D[3]` divide-by-64 — leave `D` clear |
+| `PMCNTENSET` | `p15, 0, c9, c12, 1` | bit 31 is the cycle counter |
+| `PMCCNTR` | `p15, 0, c9, c13, 0` | the counter |
+| **`PMCCFILTR`** | **`p15, 0, c14, c15, 7`** | **CRn = c14, not c9** — TRM Table 3-15 |
+
+⚠ **`PMCCFILTR` is the trap.** Every other PMU register in this list is under
+`c9`; `PMCCFILTR` sits under `c14` with the direct event-register encodings.
+Writing it at `c9, c14, 7` — the plausible guess, and `PMUSERENR`'s
+neighbourhood — is UNDEFINED. Measured cost: an undefined-instruction
+exception at EL2 on the first PMU write, arriving at `HVBAR + 0x04`, which
+carries no syndrome, so `HSR` was stale and only the vector identified it.
+
+It also decides whether Hyp mode is counted at all. The TRM defers the bit
+layout to the architecture, as it does for the data-abort `ISS`; bit 27
+(`NSH`) is what makes the counter advance in the mode ZoneX actually executes
+in. A counter enabled without it reads zero forever, which is
+indistinguishable from a part with no PMU — so ZoneX asks whether the counter
+is advancing before it times anything.
+
+**Measured, 2 September 2026, Armv8-R AEM FVP:**
+
+| | cycles |
+|---|---|
+| counter-read overhead | 5 |
+| `HPRENR` mask switch (a partition switch) | 13 |
+| one region descriptor write | 54 |
+
+**These are model figures and are not timing.** The FVP is a functional model.
+They are reported because the *ratio* is the design argument — a mask switch
+against a per-region write — and because printing them on every run keeps the
+measurement path exercised. The numbers to quote come from silicon.
+
+---
+
+## The hypervisor-to-guest mailbox
+
+A partition's data window opens with a fixed block of words the hypervisor
+writes and the guest reads back, declared in `examples/common/zx_guest_abi.h`.
+It exists because a guest excursion carries exactly one argument while a probe
+needs both somewhere to report and something to aim at.
+
+It is free because **stage-2 `AP` cannot deny EL2**: the same property that
+stops `AP` from isolating one partition from another is what lets the
+hypervisor write into a partition's memory without spending a region or a
+permission on it.
+
+| Offset | Word | Written by |
+|---|---|---|
+| `0x00` | progress bits | guest |
+| `0x04` | the guest's own sentinel | guest |
+| `0x08` | address to probe | EL2 |
+| `0x0C` | what the guest read | guest |
+| `0x10` | address of the shared granule | EL2 |
+| `0x14` | value to publish, or the sentinel to use | EL2 |
+
+The progress word carries the isolation claim **negatively**: the
+probe-survived bit being *clear* after an excursion is the evidence that
+stage 2 stopped the access. A check whose pass condition is the absence of
+something has to be able to fail, which is what the widened-region build
+exists to show.
+
+---
+
 ## Sources
 
 | Document | Identifier |
