@@ -236,6 +236,37 @@
 #define ZX_ICC_HSRE_ENABLE      ZX_BIT(3)
 
 /**************************************************************************/
+/*                    The interrupts ZoneX knows about                    */
+/**************************************************************************/
+
+/* Three timer interrupts arrive as PPIs on this core (TRM section 9), and
+   which one a partition gets is a design decision rather than a detail:
+
+     30  the PHYSICAL timer.  A partition must not have it -- its time keeps
+         running while the partition is descheduled, and a guest reading it
+         can therefore observe that it was not running.
+     27  the VIRTUAL timer.  What a partition gets, because CNTVOFF freezes
+         its counter while the partition is off the core.
+     26  the HYPERVISOR timer.  ZoneX's own, and the reason a partition may
+         not reach the redistributor: the enable bit for this INTID lives in
+         the same frame as the enable bit for INTID 27.
+
+   See docs/decisions.md D7.  The guest restates INTID 27 as
+   ZX_GUEST_TIMER_INTID in examples/common/zx_guest_abi.h -- it is a separate
+   program and cannot include this header -- and the example that includes
+   both asserts the two agree at compile time.  */
+
+#define ZX_PPI_PHYSICAL_TIMER   30U
+#define ZX_PPI_VIRTUAL_TIMER    27U
+#define ZX_PPI_HYPERVISOR_TIMER 26U
+
+/* What ICC_IAR1 returns when nothing was pending.  It must NOT be given an
+   end-of-interrupt.  */
+
+#define ZX_INTID_SPURIOUS       1023U
+
+
+/**************************************************************************/
 /*                     Semihosting (FVP console and exit)                 */
 /**************************************************************************/
 
@@ -328,6 +359,31 @@
    belongs to the manifest and not to this port: the host-side validator has
    to build and check the same objects with no Cortex-R52 header in reach.  */
 #include "zx_manifest.h"
+
+/**************************************************************************/
+/*                 Where a board's GICv3 frames actually are              */
+/*                                                                        */
+/*  PASSED IN RATHER THAN COMPILED IN, because this translation unit is    */
+/*  the PART's and not a board's.  The Cortex-R52 layer knows the register */
+/*  offsets inside a GICv3 -- which are architectural -- and knows nothing */
+/*  about where the frames sit, which is a board fact and lives in the     */
+/*  example's zx_platform.h.  A #include of a board header here is how a   */
+/*  port stops being portable between the two targets it already has.      */
+/*                                                                        */
+/*  A redistributor is TWO consecutive 64 KB frames per core: the RD frame */
+/*  carries GICR_WAKER, and the SGI frame carries the enable, group,       */
+/*  priority and configuration bits for INTIDs 0 to 31.  Both are needed   */
+/*  and they are named separately because getting them the wrong way round */
+/*  writes plausible values into the wrong registers and reads back zero.  */
+/**************************************************************************/
+
+typedef struct ZX_GIC_LAYOUT_STRUCT
+{
+    zx_addr_t   zx_gic_dist_base;       /* GICD                            */
+    zx_addr_t   zx_gic_rd_base;         /* GICR, the RD frame              */
+    zx_addr_t   zx_gic_sgi_base;        /* GICR, the SGI frame             */
+
+} ZX_GIC_LAYOUT;
 
 #ifdef __cplusplus
 extern "C" {
@@ -461,6 +517,159 @@ void zx_stage2_enable_set(uint32_t mask);
  * platform/cortex_r52/src/zx_timer.c.  */
 
 void zx_el2_prepare_guest_el1(uint32_t counter_hz);
+
+/**************************************************************************/
+/*                       The GIC, which EL2 owns whole                    */
+/*                                                                        */
+/*  Implemented in zx_gic.c.  Every function here touches memory-mapped    */
+/*  GIC state, which is exactly the state no partition is given: the       */
+/*  distributor is one per system and the redistributor is one per CORE,   */
+/*  so the frame that holds a partition's timer enable also holds the      */
+/*  hypervisor's.  A guest reaches only its own CPU interface, which is    */
+/*  system registers.                                                     */
+/**************************************************************************/
+
+/* Bring the distributor and this core's redistributor up.  Returns non-zero
+   when the redistributor reported its children awake, zero when the bounded
+   wait ran out -- which is a real outcome and not a hang, because a GIC that
+   never wakes would otherwise stop the boot with nothing printed.  */
+
+ZX_NODISCARD uint32_t zx_gic_el2_init(const ZX_GIC_LAYOUT *gic_ptr);
+
+/* Enable one PPI for delivery to EL1: Group 1, level-triggered, at the given
+   priority.  Level and not edge because the generic timer asserts a level.  */
+
+void zx_gic_enable_guest_ppi(const ZX_GIC_LAYOUT *gic_ptr, uint32_t intid,
+                             uint32_t priority);
+
+/* Disable one PPI again.  A partition that is not running must not have an
+   interrupt of its own delivered, and this is how a window ends cleanly.  */
+
+void zx_gic_disable_guest_ppi(const ZX_GIC_LAYOUT *gic_ptr, uint32_t intid);
+
+/* READ BACK what was programmed, for the same reason the region set is read
+   back: a write that went to the wrong offset does not fault, it does
+   nothing, and a partition that silently never receives its timer looks
+   exactly like a kernel whose scheduler is broken.  */
+
+ZX_NODISCARD uint32_t zx_gic_ppi_is_enabled(const ZX_GIC_LAYOUT *gic_ptr,
+                                            uint32_t intid);
+ZX_NODISCARD uint32_t zx_gic_ppi_is_group1(const ZX_GIC_LAYOUT *gic_ptr,
+                                           uint32_t intid);
+ZX_NODISCARD uint32_t zx_gic_ppi_priority(const ZX_GIC_LAYOUT *gic_ptr,
+                                          uint32_t intid);
+
+/* How many priority bits this GIC actually implements, discovered by writing
+   all ones to one INTID's priority byte and reading back what stuck.  The low
+   bits vanish, so two priorities differing only there collapse together --
+   which is the difference between an interrupt that can preempt another and
+   one that quietly cannot.  Restores the byte it borrowed.  */
+
+ZX_NODISCARD uint32_t zx_gic_priority_bits(const ZX_GIC_LAYOUT *gic_ptr,
+                                           uint32_t intid);
+
+/**************************************************************************/
+/*                  The clock a partition is allowed to see               */
+/*                                                                        */
+/*  Implemented in zx_timer.c.  A partition reads time through the VIRTUAL */
+/*  counter, which is the physical one minus CNTVOFF, and CNTVOFF is the   */
+/*  hypervisor's.  Advancing it by exactly the time a partition spent off   */
+/*  the core is what makes a descheduled partition's clock FROZEN rather   */
+/*  than merely unread -- the difference between temporal partitioning and */
+/*  time slicing that a guest can observe.  See docs/decisions.md D7.      */
+/**************************************************************************/
+
+/* The physical counter, which no partition can reach.  64-bit, read as a
+   pair.  */
+
+ZX_NODISCARD uint64_t zx_read_cntpct(void);
+
+/* Bounded: read the physical counter twice and say whether it moved.
+   Programming CNTFRQ does not START the counter, and on one of the two ZoneX
+   targets it is left stopped at reset -- so this is the check that stands
+   between a partition granted a timer and a run that ends in a timeout.  */
+
+ZX_NODISCARD uint32_t zx_counter_is_running(void);
+
+/* Set this partition's virtual time to zero and start it running.  Called
+   once, when a partition is (re)loaded, so that every excursion of a guest
+   begins from the same point on its own clock -- which is what makes two
+   runs of the same guest comparable.  */
+
+void zx_el2_guest_time_reset(void);
+
+/* Freeze and unfreeze the partition's virtual counter.  suspend() records
+   the physical count; resume() adds everything that elapsed since to
+   CNTVOFF, so the virtual counter never advanced.  With one partition the
+   gap being closed is the hypervisor's own work between excursions; with
+   more than one it is the other partitions' windows.  */
+
+void zx_el2_guest_time_suspend(void);
+void zx_el2_guest_time_resume(void);
+
+/* A resume that does NOT give the time back.  It exists so that the freeze
+   can be seen to FAIL, and it keeps the bookkeeping so that what breaks is
+   the mechanism rather than the measurement.  */
+
+void zx_el2_guest_time_resume_uncredited(void);
+
+/* CNTVOFF as it stands, for reporting.  A number nobody can see is a
+   mechanism nobody can check.  */
+
+ZX_NODISCARD uint64_t zx_el2_guest_time_offset(void);
+
+/* The partition's OWN clock, now: the physical counter seen past CNTVOFF,
+   which is the number a guest reading CNTVCT would get.  */
+
+ZX_NODISCARD uint64_t zx_el2_guest_virtual_count(void);
+
+/* And the two halves of the last freeze point: the physical count when the
+   partition stopped, and what its own clock read at that instant.
+ *
+ * These are what make the freeze CHECKABLE.  The invariant is exact --
+ * after a resume, zx_el2_guest_virtual_count() equals
+ * zx_el2_guest_virtual_when_suspended() -- and the physical distance between
+ * the two instants is the interval the partition was excluded from.
+ * Measuring either one anywhere else measures the drift that CNTVOFF has not
+ * corrected yet, which looks exactly like a broken freeze.  */
+
+ZX_NODISCARD uint64_t zx_el2_guest_time_suspended_at(void);
+ZX_NODISCARD uint64_t zx_el2_guest_virtual_when_suspended(void);
+
+/* And where the counter was when the partition was given the core back.
+ *
+ * (suspended_at, resumed_at) is the interval the partition was excluded
+ * from, as the MECHANISM measured it, which is what CNTVOFF is credited
+ * with.  A check of the freeze compares the offset's actual movement -- read
+ * back out of the register -- against exactly this interval, and every term
+ * in that comparison is then a hardware read rather than a restatement of
+ * the arithmetic being checked.
+ *
+ * Reading the counter again from outside does not give the same number: on
+ * the S32Z280 a CNTPCT read crosses into an 8 MHz clock domain, so the few
+ * reads between a resume and a check cost 64 counts of real time.  Measured,
+ * on the board.  */
+
+ZX_NODISCARD uint64_t zx_el2_guest_time_resumed_at(void);
+
+/* Stop a partition's virtual timer.  Per-guest state, and the reason it is
+   here rather than left to the guest is that a partition can be taken from
+   at any instant -- including with its timer armed and its level asserted at
+   the GIC.  */
+
+void zx_el2_guest_timer_stop(void);
+
+/* Spend a known interval at EL2, measured in counter counts.
+ *
+ * A hypervisor has no reason to wait; this exists so that "a partition's
+ * clock does not advance while it is not running" can be CHECKED, which
+ * needs a real interval in which the partition is not running.  Measuring
+ * the gap across whatever work happened to be there is not good enough and
+ * was tried: the model's console costs it no simulated time, so the gap was
+ * zero counts long and both the positive and the deliberately-broken build
+ * reported the clock frozen.  */
+
+void zx_el2_dwell(uint32_t counts);
 
 /**************************************************************************/
 /*                    Making a copied image executable                    */

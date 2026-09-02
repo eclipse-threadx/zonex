@@ -203,12 +203,22 @@ SECTIONS
 
     /* THE BLOB IS NOT EMPTY, and this is the check that catches an .incbin
        whose file was missing or a linker input pattern that matched
-       nothing.  Asserted against the size of the image header rather than
+       nothing.  Asserted against the END OF THE IMAGE HEADER rather than
        against zero, because a blob too small to carry its own header is
        just as useless as one of no size at all -- and the loader's magic
-       check would then be reading past the end of the section.  */
+       check would then be reading past the end of the section, which is
+       the out-of-bounds read this assert exists to prevent.
 
-    ASSERT((__zx_guest_a_blob_end - __zx_guest_a_blob_start) > 0x50,
+       0x90 is ZX_GUEST_IMAGE_OFF_MAGIC + 4, from
+       examples/common/zx_guest_abi.h.  A linker script cannot include a C
+       header, so the number is restated here -- and it is restated WRONG
+       the moment the header moves, which is exactly what happened when the
+       mailbox grew to two granules and pushed the entry branch and the
+       header from 0x40 to 0x80.  The bound stayed at 0x50, so a blob of
+       0x51 to 0x8F bytes linked cleanly and the magic check read past the
+       section into whatever followed it.  */
+
+    ASSERT((__zx_guest_a_blob_end - __zx_guest_a_blob_start) >= 0x90,
            "the embedded guest image is empty or too small to carry its header")
 
     ASSERT((__zx_guest_a_blob_end - __zx_guest_a_blob_start)

@@ -112,15 +112,71 @@ void zx_board_report(void)
 /*  something starts it.                                                   */
 /*                                                                        */
 /*  ZoneX programs CNTFRQ from this so that a guest reading it gets a      */
-/*  number rather than a zero.  Starting the counter itself is a different */
-/*  job and belongs with interrupt delivery, which Phase 0 does not have    */
-/*  yet -- so a guest that tried to WAIT on this timer would still wait     */
-/*  forever, and the cooperative guest deliberately does not.              */
+/*  number rather than a zero.  STARTING the counter is a separate hook,   */
+/*  zx_board_counter_start below, and on this model it is not optional.    */
 /**************************************************************************/
 
 uint32_t zx_board_counter_hz(void)
 {
     return (uint32_t)ZX_FVP_SYSTEM_COUNTER_HZ;
+}
+
+
+/**************************************************************************/
+/*  zx_board_counter_start                                                */
+/*                                                                        */
+/*  ONE REGISTER, AND IT IS THE DIFFERENCE BETWEEN A PREEMPTIVE GUEST AND  */
+/*  A HARNESS TIMEOUT.                                                    */
+/*                                                                        */
+/*  This model's system counter is STOPPED at reset and the model says so  */
+/*  in its own parameters: bp.refcounter.non_arch_start_at_default=0,      */
+/*  documented as "firmware is expected to enable the timer at boot time". */
+/*  So a guest granted the virtual timer here, on a run where nobody wrote */
+/*  CNTCR, arms a comparator against a counter that will never reach it    */
+/*  and blocks for ever.                                                  */
+/*                                                                        */
+/*  Read-modify-write rather than a plain store, because CNTCR carries     */
+/*  more than EN -- HDBG and the frequency-change fields -- and a run that */
+/*  had been started under a debugger with any of them set would have them */
+/*  quietly cleared by a store.                                            */
+/*                                                                        */
+/*  The frame is reachable with no EL2 region because it sits in the       */
+/*  Device-nGnRE band of this model's background map.  On a board where it */
+/*  did not, this function would need a region first -- which is the same  */
+/*  ordering problem the console has on the S32Z280, and the reason        */
+/*  zx_board_program_mmio_regions runs before anything is printed.         */
+/**************************************************************************/
+
+void zx_board_counter_start(void)
+{
+    ZX_REG32(ZX_FVP_CNT_CONTROL_BASE + ZX_FVP_CNTCR) |=
+        (uint32_t)ZX_FVP_CNTCR_EN;
+}
+
+
+/**************************************************************************/
+/*  zx_board_gic_layout                                                   */
+/*                                                                        */
+/*  A redistributor is TWO consecutive 64 KB frames per core, and they are */
+/*  named separately because swapping them writes plausible values into    */
+/*  the wrong registers and reads back zero -- a GIC that was configured   */
+/*  and does nothing, with no fault to point at it.                        */
+/*                                                                        */
+/*  Both addresses were confirmed in-model by reading GICD_PIDR2 and       */
+/*  GICR_PIDR2 during the Cortex-R52 port work; both read 0x3B, which is   */
+/*  GICv3.                                                                 */
+/**************************************************************************/
+
+void zx_board_gic_layout(ZX_GIC_LAYOUT *layout_ptr)
+{
+    if (layout_ptr == (ZX_GIC_LAYOUT *)0)
+    {
+        return;
+    }
+
+    layout_ptr->zx_gic_dist_base = (zx_addr_t)ZX_FVP_GICD_BASE;
+    layout_ptr->zx_gic_rd_base   = (zx_addr_t)ZX_FVP_GICR_RD_BASE;
+    layout_ptr->zx_gic_sgi_base  = (zx_addr_t)ZX_FVP_GICR_SGI_BASE;
 }
 
 

@@ -87,6 +87,43 @@ void console_set_quiet(unsigned int quiet);
 void guest_yield(void);
 
 /**************************************************************************/
+/*                    The clock a partition is granted                    */
+/*                                                                        */
+/*  A partition owns no timer device.  What it has is the VIRTUAL timer    */
+/*  and the virtual counter, whose zero point the hypervisor moves with    */
+/*  CNTVOFF so that time does not pass while the partition is not running. */
+/*  Every one of these is a system-register access; none of them touches a */
+/*  device, and none of them can be denied to EL1 -- it is the PHYSICAL    */
+/*  counter that ZoneX keeps out of a partition's reach.                   */
+/*                                                                        */
+/*  board_init below decides whether the timer is armed at all, from a     */
+/*  word the hypervisor left in the mailbox.  These are separate from it   */
+/*  so that the guest APPLICATION can ask its own questions -- above all   */
+/*  "is this counter moving?", which is what stands between a target whose */
+/*  system counter was never started and a run that ends in a timeout.     */
+/**************************************************************************/
+
+/* CNTFRQ, which only the hypervisor can have written.  Zero means nobody
+   did, and dividing by it is a divide by zero rather than a slow tick.  */
+
+unsigned long guest_counter_frequency(void);
+
+/* The low half of CNTVCT.  Enough to answer "is it moving"; deliberately
+   not enough to be mistaken for a wall clock.  */
+
+unsigned long guest_virtual_count(void);
+
+/* Restart the down-count, which also deasserts the timer's level output.
+   Called on every tick from inside the interrupt handler.  */
+
+void guest_tick_reload(void);
+
+/* Read the virtual counter twice, bounded, and say whether it moved.  The
+   bound is what makes this a check rather than a second way to hang.  */
+
+unsigned int guest_counter_is_moving(void);
+
+/**************************************************************************/
 /*                            The stage-1 MPU                             */
 /**************************************************************************/
 

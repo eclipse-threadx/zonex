@@ -21,14 +21,19 @@
 @   are here because both sides of the hypervisor boundary have to agree
 @   about where they are:
 @
-@     +0x00   the readback mailbox, one granule, zero-filled
-@     +0x40   one branch to the kernel's own reset symbol
-@     +0x80   the guest's OWN EL1 vector table
+@     +0x00   the readback mailbox, two granules, zero-filled
+@     +0x80   one branch to the kernel's own reset symbol
+@     +0x84   the image header: which window this image was linked for
 @
-@   The offsets are declared in examples/common/zx_guest_abi.h and asserted
-@   by the guest's linker script, so a section that grew past its slot fails
-@   the LINK rather than moving an entry point the hypervisor computes as a
-@   constant.
+@   Those three ARE the contract, and only those three: they are declared in
+@   examples/common/zx_guest_abi.h and asserted by the guest's linker script,
+@   so a section that grew past its slot fails the LINK rather than moving an
+@   entry point the hypervisor computes as a compile-time constant.
+@
+@   The guest's own EL1 vector table follows, 32-byte aligned as VBAR
+@   requires, and its address is deliberately NOT part of the contract: the
+@   guest writes VBAR from the symbol, so the linker may put the table
+@   wherever it likes and the hypervisor never needs to know where.
 @
 @ WHY THE MAILBOX IS ASSEMBLED HERE AND NOT DECLARED IN C
 @
@@ -50,11 +55,39 @@
 @   So the guest replaces VBAR with the table below, in which a data abort
 @   RECORDS ITS SYNDROME IN THE MAILBOX AND HANDS CONTROL BACK.  That is what
 @   makes a stage-1 fault a reported event.  It also demonstrates something a
-@   later step needs anyway: VBAR is per-guest state, a guest owns it, and a
+@   later phase needs anyway: VBAR is per-guest state, a guest owns it, and a
 @   partition switch has to save and restore it.
 @
 @   Replacing it is ordinary guest code -- VBAR is writable at EL1 -- and
 @   requires no change whatever to ports/cortex_r52.
+@
+@ WHICH TABLE WINS FOR AN INTERRUPT, AND WHY IT IS NOT THIS ONE
+@
+@   Once a partition has a timer of its own, one vector in this table stops
+@   being a diagnostic and becomes the kernel's scheduling path.  Two tables
+@   then have a claim on it: this one, which the guest installed, and the
+@   port's, whose IRQ vector is a branch into _tx_thread_context_save and is
+@   the only correct way to enter a ThreadX interrupt handler.
+@
+@   The answer is BOTH, in the only order that works.  VBAR keeps pointing
+@   here -- so a fault is still reported rather than halting the model -- and
+@   the IRQ slot is a single branch to the port's own el1_irq_entry.  The
+@   context save, the handler call and the restore are then the PORT'S code,
+@   unmodified and identical to the one a standalone kernel runs.
+@
+@   Writing an interrupt entry sequence here instead was the alternative, and
+@   it would have been a second implementation of the most delicate assembly
+@   in the port: _tx_thread_context_save adjusts LR to find the point of
+@   interrupt, and the branch to it must be a plain B rather than a BL for
+@   exactly that reason.  A guest that gets that subtly wrong does not fail
+@   at the vector -- it corrupts one thread's resume address and fails
+@   somewhere else entirely.
+@
+@   el1_irq_entry exists only when the guest is built with the port's
+@   TX_R52_USE_THREADX_IRQ, which is also what makes the port call board_init
+@   from its low-level initialisation.  The ZoneX guest is always built with
+@   it; whether a tick actually arrives is decided per excursion by a word in
+@   the mailbox, so the cooperative and preemptive runs are the same bytes.
 @
 @ WHY A STAGE-1 FAULT AND A STAGE-2 FAULT CANNOT BE CONFUSED
 @
@@ -71,12 +104,19 @@
     .arm
 
 /**************************************************************************/
-/*  The readback mailbox: one granule at the window base.                 */
+/*  The readback mailbox: two granules at the window base.                 */
 /*                                                                        */
-/*  Sixteen words of zero, in its own loaded section.  The hypervisor      */
+/*  Thirty-two words of zero, in its own loaded section.  The hypervisor   */
 /*  writes the handover fields into it after copying the image and reads    */
 /*  the reported ones out afterwards; stage-2 AP cannot deny EL2 access to  */
 /*  a partition's memory, which is what makes the mailbox free.            */
+/*                                                                        */
+/*  The second granule is what a guest with a timer of its own has to say,  */
+/*  and it costs nothing at stage 2 -- the partition window is one region   */
+/*  covering the whole of it.  It does cost the guest's stage-1 region for  */
+/*  the mailbox 64 more bytes, and it moves the entry branch, which is why  */
+/*  the offsets in zx_guest_abi.h and the ASSERTs in the guest's linker     */
+/*  script both name 0x80 rather than 0x40.                                */
 /**************************************************************************/
 
     .section .zx_guest_mailbox, "aw", %progbits
@@ -260,5 +300,35 @@ zx_guest_trap_pabt_hang:
     ZX_GUEST_TRAP_OTHER zx_guest_trap_undef,    ZX_GS_UNDEF
     ZX_GUEST_TRAP_OTHER zx_guest_trap_svc,      ZX_GS_OTHER
     ZX_GUEST_TRAP_OTHER zx_guest_trap_reserved, ZX_GS_OTHER
-    ZX_GUEST_TRAP_OTHER zx_guest_trap_irq,      ZX_GS_IRQ
     ZX_GUEST_TRAP_OTHER zx_guest_trap_fiq,      ZX_GS_OTHER
+
+/**************************************************************************/
+/*  zx_guest_trap_irq -- one branch, into the port's own IRQ vector body.  */
+/*                                                                        */
+/*  A PLAIN B AND NOT A BL, and the difference is not stylistic.  The      */
+/*  first thing el1_irq_entry does is branch to _tx_thread_context_save,   */
+/*  which adjusts LR to recover the point of interrupt.  Arriving there    */
+/*  with LR pointing back into this file would save a resume address       */
+/*  inside a trampoline, and the thread would return to the wrong place    */
+/*  the next time it was scheduled -- a corruption that shows up nowhere   */
+/*  near the vector that caused it.                                        */
+/*                                                                        */
+/*  Nothing else happens here.  Recording the interrupt in the mailbox     */
+/*  would mean touching a register before the port's context save had run, */
+/*  which is the one thing that path requires nobody does.  The counting   */
+/*  is done in board_irq_handler, which the port calls once the context is */
+/*  safe.                                                                  */
+/*                                                                        */
+/*  WHEN NO TICK WAS GRANTED this vector is installed and never taken: the */
+/*  guest's CPU interface is left disabled, so the GIC has nowhere to      */
+/*  deliver to.  An interrupt arriving anyway would land in the kernel's   */
+/*  own handler and be counted as an unexpected INTID, which is a better   */
+/*  outcome than the previous behaviour -- reporting and yielding -- that  */
+/*  it replaces, because it says WHICH interrupt arrived.                  */
+/**************************************************************************/
+
+    .global zx_guest_trap_irq
+    .type   zx_guest_trap_irq, %function
+zx_guest_trap_irq:
+    b       el1_irq_entry
+    .size   zx_guest_trap_irq, . - zx_guest_trap_irq

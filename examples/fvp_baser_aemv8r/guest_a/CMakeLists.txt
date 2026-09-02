@@ -72,15 +72,35 @@ set(GUEST_DIR ${CMAKE_CURRENT_LIST_DIR})
 #                             exists to defer to, and it was written that way
 #                             from the start of the Cortex-R52 port.
 #   tx_initialize_low_level.S publishes the system stack and first free
-#                             address.  Built WITHOUT TX_R52_USE_THREADX_IRQ,
-#                             so it creates no tick and calls no board_init:
-#                             this guest takes no interrupts.
+#                             address.  Built WITH TX_R52_USE_THREADX_IRQ, so
+#                             it calls board_init -- which the ZoneX guest
+#                             support supplies -- and so that entry.S routes
+#                             the EL1 IRQ vector into _tx_thread_context_save.
+#                             The guest's OWN vector table is still what VBAR
+#                             points at; its IRQ slot is one branch into the
+#                             port's vector body, so the interrupt entry
+#                             sequence is the port's own and unmodified.
+#                             WHETHER A TICK ACTUALLY ARRIVES is decided per
+#                             excursion by a word in the mailbox, not by this
+#                             build, so the cooperative run and the preemptive
+#                             run are the same bytes.
 #
 #   console.c    NOT used -- the guest has no UART, it hypercalls.
-#   gicv3.c      NOT used -- the distributor is shared between partitions and
-#                belongs to the hypervisor.
-#   timer.c      NOT used -- a partition's clock is the hypervisor's to hand
-#                out, so that a descheduled partition's time can be frozen.
+#   gicv3.c      NOT used, and this is the sharpest of the omissions.  Every
+#                register it touches is MEMORY-MAPPED: the distributor, which
+#                is one per system, and the redistributor, which is one per
+#                CORE and holds the enable bits for every partition's PPIs and
+#                for the hypervisor's own timer.  A partition that could write
+#                that frame could disable the interrupt that ends its window.
+#                So ZoneX keeps all of it and enables this partition's timer
+#                PPI on its behalf; the guest brings up only its CPU
+#                interface, which is system registers and needs no device.
+#                See guest_interrupts_init in zx_guest_bsp.c.
+#   timer.c      NOT used -- it drives the PHYSICAL timer, whose time keeps
+#                running while a partition is descheduled, and it starts the
+#                system counter, which is a system-wide resource.  The guest
+#                arms the VIRTUAL timer instead, in zx_guest_bsp.c, and ZoneX
+#                starts the counter and moves CNTVOFF.
 #   mpu.c        NOT used -- its region table describes a whole board,
 #                including a device window at 0x80000000 this partition does
 #                not own.  The guest programs its own three regions instead.
@@ -149,7 +169,15 @@ function(zx_add_guest target_name)
         ${TX_PORT_BSP}/tx_initialize_low_level.S
     )
 
-    target_compile_definitions(${target_name} PRIVATE TX_R52_BOOT_AT_EL1)
+    # TX_R52_BOOT_AT_EL1 skips the port's own EL2 configuration block -- ZoneX
+    # is the EL2 monitor that block exists to defer to.  TX_R52_USE_THREADX_IRQ
+    # gives the port's EL1 IRQ vector its real body and makes the low-level
+    # initialisation call board_init.  Both are the port's OWN options, used as
+    # the port documents them; neither is a ZoneX patch to ports/cortex_r52.
+    target_compile_definitions(${target_name} PRIVATE
+        TX_R52_BOOT_AT_EL1
+        TX_R52_USE_THREADX_IRQ
+    )
 
     target_include_directories(${target_name} PRIVATE
         ${GUEST_DIR}

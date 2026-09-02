@@ -360,6 +360,56 @@ uint32_t zx_board_counter_hz(void)
 
 
 /**************************************************************************/
+/*  zx_board_counter_start                                                */
+/*                                                                        */
+/*  NOTHING TO DO, AND THE EMPTINESS IS THE FACT.                         */
+/*                                                                        */
+/*  This part's generic-timer counter is already running when ZoneX gets   */
+/*  the core.  It is clocked by CNTCLKEN, which the RTU derives from a     */
+/*  cluster clock through CFG_CNTDV -- a divider whose reset value is 4,   */
+/*  so the divider is 5 and the 40 MHz crystal gives 8 MHz.  There is no   */
+/*  counter control frame for a hypervisor to enable: the clock tree does  */
+/*  it, before any software runs.                                          */
+/*                                                                        */
+/*  The Armv8-R AEM FVP is the opposite -- its counter is stopped at reset */
+/*  and one register write starts it -- which is exactly why this is a     */
+/*  board hook rather than something the shared code decides.  It is also  */
+/*  why the CHECK is separate: zx_counter_is_running asks whether the      */
+/*  counter moved, which is answered the same way on both boards and is    */
+/*  the question a guest about to block on a timer actually cares about.   */
+/**************************************************************************/
+
+void zx_board_counter_start(void)
+{
+    /* Intentionally empty.  See above: this part has no counter control
+       frame, and its counter is running before ZoneX exists.  */
+}
+
+
+/**************************************************************************/
+/*  zx_board_gic_layout                                                   */
+/*                                                                        */
+/*  The three frames inside the 2 MB GIC window this board already maps    */
+/*  Device-nGnRnE for EL2 only.  Naming them here rather than in the       */
+/*  Cortex-R52 layer is what keeps that layer free of board addresses:     */
+/*  the offsets inside a GICv3 are architectural and live there, the base  */
+/*  is a board fact and lives here.                                        */
+/**************************************************************************/
+
+void zx_board_gic_layout(ZX_GIC_LAYOUT *layout_ptr)
+{
+    if (layout_ptr == (ZX_GIC_LAYOUT *)0)
+    {
+        return;
+    }
+
+    layout_ptr->zx_gic_dist_base = (zx_addr_t)ZX_S32Z_GICD_BASE;
+    layout_ptr->zx_gic_rd_base   = (zx_addr_t)ZX_S32Z_GICR_RD_BASE;
+    layout_ptr->zx_gic_sgi_base  = (zx_addr_t)ZX_S32Z_GICR_SGI_BASE;
+}
+
+
+/**************************************************************************/
 /*  zx_board_describe_mmio_regions                                        */
 /*                                                                        */
 /*  The same two regions zx_board_program_mmio_regions writes, described   */

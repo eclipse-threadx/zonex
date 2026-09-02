@@ -31,20 +31,28 @@
 /*    under a hypervisor's stage-2 MPU with its own stage-1 MPU live      */
 /*    underneath.                                                         */
 /*                                                                        */
-/*  WHY IT IS COOPERATIVE                                                 */
+/*  ONE IMAGE, TWO EXPERIMENTS, AND THE DIFFERENCE IS A WORD IN THE        */
+/*  MAILBOX                                                               */
 /*                                                                        */
-/*    There is no tick.  This guest takes no interrupts at all, so it     */
-/*    uses tx_thread_relinquish and tx_queue_send/receive with            */
-/*    TX_NO_WAIT; tx_thread_sleep would hang and time slicing would do    */
-/*    nothing.                                                            */
+/*    With ZX_GO_TICK clear this guest is COOPERATIVE: it takes no        */
+/*    interrupts at all, arms no timer, and touches no interrupt          */
+/*    controller, so it uses tx_thread_relinquish and TX_NO_WAIT          */
+/*    everywhere.  With ZX_GO_TICK set the hypervisor has granted it the  */
+/*    virtual timer, and it goes on to prove the things only a kernel     */
+/*    with a tick can prove.                                              */
 /*                                                                        */
-/*    That is a sub-milestone rather than a limitation of the design.  A   */
-/*    guest with no interrupts fails FAST and CHEAPLY when something is    */
-/*    wrong with the launch path -- and the launch path is what has never  */
-/*    been run before.  Adding a timer and an interrupt controller at the  */
-/*    same time would mean a silent guest with three plausible causes.     */
-/*    The preemptive guest is the next thing, and it needs the hypervisor  */
-/*    to take the GIC distributor and hand out a virtual timer.            */
+/*    THE TWO ARE THE SAME BYTES, deliberately.  A separate binary for    */
+/*    the preemptive case would be a binary that can drift from the one   */
+/*    demonstrating isolation, and the one still being quoted would then  */
+/*    no longer be the one that was tested.  Here the run that shows a    */
+/*    kernel confined by stage 2 and the run that shows it preempted      */
+/*    under stage 2 are the same image, loaded twice.                     */
+/*                                                                        */
+/*    The cooperative case came first for a reason worth keeping: a guest */
+/*    with no interrupts fails FAST and CHEAPLY when something is wrong   */
+/*    with the launch path, and bringing up a timer and an interrupt      */
+/*    controller at the same time as a loader would have meant a silent   */
+/*    guest with three plausible causes.                                  */
 /*                                                                        */
 /*  WHAT PROVES WHAT                                                      */
 /*                                                                        */
@@ -56,6 +64,20 @@
 /*      QUEUE_OK         every item sent was received, in order           */
 /*      SEMAPHORE_OK     a get/put pair handed off between threads        */
 /*      FINISHED         the guest reached a verdict of its own           */
+/*                                                                        */
+/*    and, when a tick was granted:                                       */
+/*                                                                        */
+/*      COUNTING         the partition's own virtual counter ADVANCES.    */
+/*                       Checked before anything blocks, because the      */
+/*                       alternative to checking is a hang: the Armv8-R   */
+/*                       AEM FVP leaves its system counter stopped, and a */
+/*                       guest that slept on a stopped counter would be   */
+/*                       killed by a harness timeout naming nothing.      */
+/*      TICKING          tx_time_get() advanced, so the virtual timer PPI */
+/*                       was delivered to EL1 and _tx_timer_interrupt ran */
+/*      PREEMPTED        a thread that never yields was DISPLACED         */
+/*      TIMESLICED       two equal-priority threads that never yield both */
+/*                       advanced                                         */
 /*                                                                        */
 /*    The hypervisor reads them out of the mailbox afterwards and does     */
 /*    not have to trust the guest's own printed claim -- which is the      */
@@ -78,13 +100,60 @@
 #define GUEST_ITERATIONS        4U
 #define GUEST_QUEUE_MESSAGES    4U
 
+/* THE PRIORITIES ARE THE EXPERIMENT, so they are named rather than pasted.
+ *
+ * The producer and the consumer share one priority: tx_thread_relinquish
+ * yields to the next ready thread OF THE SAME priority, so between threads of
+ * different priorities it does nothing observable and the higher one simply
+ * runs to completion.  That was found the hard way -- see the note in
+ * tx_application_define.
+ *
+ * The two spinners share a LOWER one, and both halves of that matter.  Lower
+ * than the consumer, so that they run only while the consumer is asleep and
+ * the cooperative phase is completely unaffected by their existence.  Equal
+ * to each other, so that the only thing that can make both of them advance is
+ * the kernel's TIME SLICE -- neither ever yields, and at different priorities
+ * the higher one would simply own the core.  */
+
+#define GUEST_WORKER_PRIORITY   16U
+#define GUEST_SPIN_PRIORITY     20U
+
+/* Two ticks, so that a slice boundary falls inside the window the consumer
+   sleeps for.  A slice equal to the sleep would leave whether the second
+   spinner ever ran to the order the two happened to start in.  */
+
+#define GUEST_SPIN_SLICE        2U
+
+/* Three ticks of sleep.  Long enough to contain at least one slice boundary
+   for each spinner, short enough that a functional model is not asked to
+   simulate more time than the claim needs.  */
+
+#define GUEST_SLEEP_TICKS       3U
+
+/* How long to wait for the FIRST tick, in iterations of a busy loop.  This is
+   a bound and not a duration: its only job is to be finite, so that a tick
+   that never arrives becomes a reported failure instead of a hang.  */
+
+#define GUEST_TICK_GUARD        2000000UL
+
+/* And the bound on a spinner, for the same reason one level down.  It is
+   never reached on a run where the tick works, which is the only run that
+   gets this far -- the counter and the first tick are both checked before
+   anything sleeps.  */
+
+#define GUEST_SPIN_GUARD        2000000UL
+
 static TX_THREAD    thread_producer;
 static TX_THREAD    thread_consumer;
+static TX_THREAD    thread_spin_a;
+static TX_THREAD    thread_spin_b;
 static TX_QUEUE     work_queue;
 static TX_SEMAPHORE handover;
 
 static ULONG        producer_stack[GUEST_STACK_SIZE / sizeof(ULONG)];
 static ULONG        consumer_stack[GUEST_STACK_SIZE / sizeof(ULONG)];
+static ULONG        spin_a_stack[GUEST_STACK_SIZE / sizeof(ULONG)];
+static ULONG        spin_b_stack[GUEST_STACK_SIZE / sizeof(ULONG)];
 
 /* One ULONG per message, so TX_1_ULONG.  */
 static ULONG        queue_storage[GUEST_QUEUE_MESSAGES];
@@ -94,6 +163,17 @@ static volatile ULONG   consumer_slices;
 static volatile ULONG   messages_carried;
 static volatile ULONG   queue_faults;
 static volatile ULONG   semaphore_faults;
+
+/* The preemptive phase's state.  volatile because it is written by one thread
+   and read by another with no synchronisation between them -- which is the
+   whole method here: the spinners never yield and never take a lock, so what
+   the consumer reads is whatever they had reached at the instant the tick
+   took the core away from them.  */
+
+static volatile ULONG   spin_a_loops;
+static volatile ULONG   spin_b_loops;
+static volatile ULONG   spin_stop;
+static volatile ULONG   guest_tick_granted;
 
 
 /**************************************************************************/
@@ -155,6 +235,220 @@ static void producer_entry(ULONG thread_input)
     }
 
     publish(ZX_GP_THREADS_RAN);
+}
+
+
+/**************************************************************************/
+/*  spin_entry -- a thread that never yields.                             */
+/*                                                                        */
+/*  THE POINT OF THIS THREAD IS EVERYTHING IT DOES NOT DO.  It makes no    */
+/*  kernel call in its loop: no relinquish, no sleep, no queue, no         */
+/*  semaphore.  There is therefore no point at which the kernel could      */
+/*  take the core away from it COOPERATIVELY.  If anything else ever runs  */
+/*  while this thread is between its own iterations, the only thing that   */
+/*  can have caused it is an interrupt.                                    */
+/*                                                                        */
+/*  Two of these exist and they share a priority, which turns the same     */
+/*  loop into a second and different claim: neither can yield to the       */
+/*  other, so the only way BOTH counters can advance is the kernel's time  */
+/*  slice -- _tx_timer_interrupt counting down tx_thread_time_slice and    */
+/*  rotating the ready list.                                               */
+/*                                                                        */
+/*  The counter is published into the mailbox on every iteration rather    */
+/*  than at the end, and that is not an accident of style.  A thread that  */
+/*  was DISPLACED and never resumed -- because the run ended, or because   */
+/*  the partition was taken by a fault -- has still reported how far it    */
+/*  got, and how far it got is the evidence.                               */
+/*                                                                        */
+/*  The bound exists so this cannot be the thing that hangs a run.  It is  */
+/*  unreachable on any run that gets here: the consumer has already        */
+/*  proved the counter moves and that a tick arrived.                      */
+/**************************************************************************/
+
+static void spin_entry(ULONG thread_input)
+{
+    volatile ULONG *loops = (thread_input == 0UL) ? &spin_a_loops
+                                                  : &spin_b_loops;
+    ULONG offset = (thread_input == 0UL) ? (ULONG) ZX_GD_SPIN_A
+                                         : (ULONG) ZX_GD_SPIN_B;
+    ULONG guard;
+
+    for (guard = 0UL; guard < (ULONG) GUEST_SPIN_GUARD; guard++)
+    {
+        if (spin_stop != 0UL)
+        {
+            break;
+        }
+
+        *loops = *loops + 1UL;
+        guest_mailbox_write(offset, *loops);
+    }
+}
+
+
+/**************************************************************************/
+/*  wait_for_first_tick                                                   */
+/*                                                                        */
+/*  BUSY, NOT BLOCKING, AND THAT IS THE WHOLE FUNCTION.                    */
+/*                                                                        */
+/*  tx_thread_sleep is the natural way to wait for a tick and it is the    */
+/*  one thing that must not be used to find out WHETHER there is one: a    */
+/*  sleep with no tick behind it never returns, and the run ends in a      */
+/*  harness timeout -- the single least informative outcome this suite     */
+/*  can produce, and one that looks identical to a broken loader, a        */
+/*  broken context switch and a broken interrupt controller.               */
+/*                                                                        */
+/*  So the first tick is waited for with interrupts ENABLED and the thread */
+/*  RUNNABLE, polling tx_time_get() a bounded number of times.  A tick     */
+/*  that arrives advances it; a tick that never arrives runs the loop out  */
+/*  and the guest reports that instead.                                    */
+/**************************************************************************/
+
+static UINT wait_for_first_tick(void)
+{
+    ULONG started = tx_time_get();
+    ULONG guard;
+
+    for (guard = 0UL; guard < (ULONG) GUEST_TICK_GUARD; guard++)
+    {
+        if (tx_time_get() != started)
+        {
+            return TX_TRUE;
+        }
+    }
+
+    return TX_FALSE;
+}
+
+
+/**************************************************************************/
+/*  preemptive_phase -- what only a kernel with a tick can demonstrate.   */
+/*                                                                        */
+/*  THREE CLAIMS, IN THE ORDER THAT MAKES EACH ONE SAFE TO MAKE.           */
+/*                                                                        */
+/*    1.  THE COUNTER MOVES.  Read twice, bounded, before anything blocks. */
+/*        Programming CNTFRQ does not start a system counter and on one of */
+/*        the two targets it is stopped at reset, so this is the check     */
+/*        that stands between a granted timer and a timeout.  It asks      */
+/*        about the VIRTUAL counter, which is the one this partition can   */
+/*        see -- the hypervisor's own check, of the physical counter, is a */
+/*        different register reached past CNTVOFF.                         */
+/*                                                                        */
+/*    2.  A TICK ARRIVES.  Busy-waited, so that a GIC that was configured  */
+/*        and delivers nothing is a report rather than a hang.  This is    */
+/*        the first thing in the whole run that proves the interrupt path  */
+/*        end to end: the hypervisor enabled the PPI in a redistributor    */
+/*        this guest cannot reach, the guest enabled its own CPU           */
+/*        interface, the GIC delivered to EL1 rather than to EL2, the      */
+/*        guest's own vector table sent it into the port's context save,   */
+/*        and _tx_timer_interrupt ran.                                     */
+/*                                                                        */
+/*    3.  PREEMPTION AND TIME SLICING, measured in one sleep.  The         */
+/*        consumer records both spinners' counters, sleeps, and looks      */
+/*        again:                                                           */
+/*                                                                        */
+/*          the consumer WOKE AT ALL          the timeout list ran, so the */
+/*                                            tick reaches the scheduler   */
+/*                                            and not merely a counter     */
+/*          a spinner ADVANCED                it was genuinely running --   */
+/*                                            and it never yields, so the  */
+/*                                            consumer running again now   */
+/*                                            means the tick DISPLACED it  */
+/*          BOTH spinners advanced            neither can yield to the     */
+/*                                            other, so the only thing     */
+/*                                            that can have interleaved    */
+/*                                            them is the time slice       */
+/*                                                                        */
+/*  WHY THE TWO ARE SEPARATE BITS.  Preemption and time slicing are        */
+/*  different parts of _tx_timer_interrupt -- the timeout list and the     */
+/*  slice countdown -- and they fail separately.  A kernel whose slice     */
+/*  counter was wrong would still wake a sleeper, and reporting one bit    */
+/*  for both would call that a pass.                                       */
+/**************************************************************************/
+
+static ULONG preemptive_phase(void)
+{
+    ULONG progress = 0UL;
+    ULONG before_a;
+    ULONG before_b;
+    ULONG after_a;
+    ULONG after_b;
+
+    if (guest_counter_is_moving() == 0U)
+    {
+        console_puts("this partition's virtual counter is NOT advancing, so\n"
+                     "the system counter was never started.  Refusing to\n"
+                     "block on a timer that cannot expire -- a guest that\n"
+                     "slept here would end this run in a timeout naming\n"
+                     "nothing at all\n");
+        return (ULONG) ZX_GP_NO_CLOCK;
+    }
+
+    progress |= (ULONG) ZX_GP_COUNTING;
+
+    console_puts("virtual counter is advancing; waiting for the first tick\n");
+
+    if (wait_for_first_tick() == TX_FALSE)
+    {
+        console_puts("no tick arrived.  The counter moves, so the timer was\n"
+                     "armed against a running counter and the interrupt did\n"
+                     "not reach this partition -- which is the GIC or the\n"
+                     "vector table, and not the clock\n");
+        return progress | (ULONG) ZX_GP_NO_CLOCK;
+    }
+
+    progress |= (ULONG) ZX_GP_TICKING;
+
+    console_puts("the tick arrived: INTID ");
+    console_putdec(guest_mailbox_read(ZX_GD_TIMER_INTID));
+    console_puts(", interrupts serviced so far = ");
+    console_putdec(guest_mailbox_read(ZX_GD_IRQ_COUNT));
+    console_puts("\n");
+
+    /* Both counters are read BEFORE the sleep and both after it.  Reading
+       one, sleeping, and reading the other would compare two different
+       instants and could report a slice that never happened.  */
+
+    before_a = spin_a_loops;
+    before_b = spin_b_loops;
+
+    tx_thread_sleep((ULONG) GUEST_SLEEP_TICKS);
+
+    after_a = spin_a_loops;
+    after_b = spin_b_loops;
+
+    if ((after_a > before_a) || (after_b > before_b))
+    {
+        /* A spinner was running, and it never yields.  This thread is
+           running again.  Something took the core from a thread that did not
+           give it up, and the only thing that can is an interrupt.  */
+
+        progress |= (ULONG) ZX_GP_PREEMPTED;
+    }
+
+    if ((after_a > before_a) && (after_b > before_b))
+    {
+        progress |= (ULONG) ZX_GP_TIMESLICED;
+    }
+
+    /* Let the spinners finish, so the kernel is not left with two runnable
+       threads when this one hands the machine back.  */
+
+    spin_stop = 1UL;
+
+    guest_mailbox_write(ZX_GD_WAKES, guest_mailbox_read(ZX_GD_WAKES) + 1UL);
+
+    console_puts("slept ");
+    console_putdec((ULONG) GUEST_SLEEP_TICKS);
+    console_puts(" ticks; spinner loops ");
+    console_putdec(after_a - before_a);
+    console_puts(" / ");
+    console_putdec(after_b - before_b);
+    console_puts(" -- neither of them yields, so both of those are the\n"
+                 "kernel's own time slice, and this thread running again is\n"
+                 "a lower-priority thread having been DISPLACED\n");
+
+    return progress;
 }
 
 
@@ -251,6 +545,16 @@ static void consumer_entry(ULONG thread_input)
         progress |= (ULONG) ZX_GP_SEMAPHORE_OK;
     }
 
+    /* THE PREEMPTIVE PHASE, if the hypervisor granted this partition a
+       clock.  It comes BEFORE the probe on purpose: the probe may end the
+       excursion at a stage-2 boundary, and a claim that was never reached
+       is indistinguishable from one that failed.  */
+
+    if (guest_tick_granted != 0UL)
+    {
+        progress |= preemptive_phase();
+    }
+
     console_puts("threads ran, producer/consumer slices = ");
     console_putdec(producer_slices);
     console_puts(" / ");
@@ -326,11 +630,31 @@ static void consumer_entry(ULONG thread_input)
 
     /* The verdict, written into the mailbox BEFORE it is printed.  A guest
        that printed a verdict it had not published would let a reader believe
-       something the hypervisor cannot confirm.  */
+       something the hypervisor cannot confirm.
+     *
+     * WHAT A PASS MEANS DEPENDS ON WHAT WAS GRANTED, and the guest is the
+     * only party that can apply that rule.  The hypervisor knows what it
+     * ASKED for; only the guest knows what it MANAGED.  A partition given a
+     * clock must have used it -- reporting PASSED on a run where the tick
+     * never arrived would be a guest quietly downgrading its own verdict to
+     * whatever it happened to achieve, and the hypervisor reading a sealed
+     * PASSED back has no way to know that is what it means.  */
 
-    if ((messages_carried == (ULONG) GUEST_ITERATIONS)
-        && (queue_faults == 0UL)
-        && (semaphore_faults == 0UL))
+    if ((guest_tick_granted != 0UL)
+        && ((progress & (ULONG) (ZX_GP_COUNTING | ZX_GP_TICKING
+                                 | ZX_GP_PREEMPTED | ZX_GP_TIMESLICED))
+            != (ULONG) (ZX_GP_COUNTING | ZX_GP_TICKING
+                        | ZX_GP_PREEMPTED | ZX_GP_TIMESLICED)))
+    {
+        guest_mailbox_write(ZX_GD_VERDICT, (unsigned long) ZX_GV_FAILED);
+        progress |= (ULONG) ZX_GP_FINISHED;
+        publish(progress);
+        console_puts("GUEST RESULT: FAILED -- a clock was granted and this\n"
+                     "partition did not get everything a clock is for\n");
+    }
+    else if ((messages_carried == (ULONG) GUEST_ITERATIONS)
+             && (queue_faults == 0UL)
+             && (semaphore_faults == 0UL))
     {
         guest_mailbox_write(ZX_GD_VERDICT, (unsigned long) ZX_GV_PASSED);
         progress |= (ULONG) ZX_GP_FINISHED;
@@ -382,11 +706,39 @@ void tx_application_define(void *first_unused_memory)
 
     (void) tx_thread_create(&thread_producer, "producer", producer_entry, 0UL,
                             producer_stack, sizeof(producer_stack),
-                            16U, 16U, TX_NO_TIME_SLICE, TX_AUTO_START);
+                            GUEST_WORKER_PRIORITY, GUEST_WORKER_PRIORITY,
+                            TX_NO_TIME_SLICE, TX_AUTO_START);
 
     (void) tx_thread_create(&thread_consumer, "consumer", consumer_entry, 0UL,
                             consumer_stack, sizeof(consumer_stack),
-                            16U, 16U, TX_NO_TIME_SLICE, TX_AUTO_START);
+                            GUEST_WORKER_PRIORITY, GUEST_WORKER_PRIORITY,
+                            TX_NO_TIME_SLICE, TX_AUTO_START);
+
+    /* THE TWO SPINNERS EXIST ONLY WHEN A CLOCK WAS GRANTED, and that is
+       what keeps a cooperative excursion of this image the same program it
+       was before a tick existed.  Created, they would never run -- they sit
+       below the worker priority and the workers only ever relinquish, which
+       yields within a priority -- but they would still cost two thread
+       control blocks, two stacks and two passes of the scheduler's ready
+       list, and the cooperative pass is one half of a measured pair.
+
+       TX_TIMESLICE and not TX_NO_TIME_SLICE, obviously, and the value is
+       what the second claim rests on: two threads at ONE priority, neither
+       of which ever yields, can only interleave because the kernel counts
+       their slice down on a tick.  */
+
+    if (guest_tick_granted != 0UL)
+    {
+        (void) tx_thread_create(&thread_spin_a, "spin A", spin_entry, 0UL,
+                                spin_a_stack, sizeof(spin_a_stack),
+                                GUEST_SPIN_PRIORITY, GUEST_SPIN_PRIORITY,
+                                GUEST_SPIN_SLICE, TX_AUTO_START);
+
+        (void) tx_thread_create(&thread_spin_b, "spin B", spin_entry, 1UL,
+                                spin_b_stack, sizeof(spin_b_stack),
+                                GUEST_SPIN_PRIORITY, GUEST_SPIN_PRIORITY,
+                                GUEST_SPIN_SLICE, TX_AUTO_START);
+    }
 }
 
 
@@ -427,6 +779,21 @@ void bsp_main(void)
     console_set_quiet(((guest_mailbox_read(ZX_GD_OPTIONS)
                         & (unsigned long) ZX_GO_QUIET) != 0UL) ? 1U : 0U);
 
+    /* WHETHER THIS PARTITION HAS A CLOCK, read ONCE and kept.  The mailbox
+       is the hypervisor's to write and a guest that re-read it per decision
+       could find it changed halfway through a run -- so the answer is taken
+       at the top, in the same breath as the console option, and everything
+       downstream asks this variable.
+
+       The port's board support has already read the same word, in board_init
+       during tx_kernel_enter, and decided whether to arm anything.  Reading
+       it twice is right rather than redundant: the two readers want the same
+       fact at two moments a partition switch could fall between, and neither
+       can ask the other.  */
+
+    guest_tick_granted = ((guest_mailbox_read(ZX_GD_OPTIONS)
+                           & (unsigned long) ZX_GO_TICK) != 0UL) ? 1UL : 0UL;
+
     guest_vectors_install();
 
     console_puts("ThreadX guest at EL1, inside a ZoneX partition\n");
@@ -455,6 +822,26 @@ void bsp_main(void)
     console_puts("every one of them lies inside this partition's stage-2\n"
                  "window, or the guest would fault on memory its own MPU\n"
                  "says it owns -- the stricter of the two stages wins\n");
+
+    if (guest_tick_granted != 0UL)
+    {
+        console_puts("this partition was granted a CLOCK: the virtual timer\n"
+                     "on PPI ");
+        console_putdec((ULONG) ZX_GUEST_TIMER_INTID);
+        console_puts(", enabled for me in a redistributor I cannot\n"
+                     "reach.  CNTFRQ reads ");
+        console_putdec(guest_counter_frequency());
+        console_puts(" Hz, programmed by the\n"
+                     "hypervisor because it is writable only above me.  I\n"
+                     "bring up my own CPU interface, which is system\n"
+                     "registers and touches no device at all.\n");
+    }
+    else
+    {
+        console_puts("no clock was granted, so this partition takes no\n"
+                     "interrupts: cooperative scheduling only, and\n"
+                     "tx_thread_sleep would never return.\n");
+    }
 
     tx_kernel_enter();
 }

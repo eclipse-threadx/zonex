@@ -137,8 +137,9 @@
  *
  * Two names for one offset is worth one sentence of explanation and no more:
  * each has exactly one reader, and both are in this file where a reader of
- * either can see the other.  Adding a seventeenth word to a sixteen-word
- * granule would have cost a second granule and a second stage-2 region.  */
+ * either can see the other.  It is also the LAST alias in this layout: the
+ * kernel guest's later fields went into a second granule instead, and the
+ * note there says why one alias is explicable and six would not be.  */
 
 #define ZX_GD_OPTIONS               0x14U   /* EL2 writes: ZX_GO_*          */
 
@@ -157,6 +158,25 @@
  * demonstrated.  */
 
 #define ZX_GO_QUIET                 0x00000001U
+
+/* ZX_GO_TICK asks the guest to run PREEMPTIVELY: to bring up its own GICv3
+ * CPU interface, arm the virtual timer the hypervisor granted it, and run the
+ * checks that only a kernel with a tick can pass.
+ *
+ * IT IS A MAILBOX WORD AND NOT A BUILD OPTION, and that is the whole point.
+ * The image is built once, with the port's own IRQ path linked in, and the
+ * hypervisor decides per excursion whether a partition gets a clock.  So the
+ * cooperative run and the preemptive run are literally the same bytes, and
+ * "the kernel that boots under stage 2" and "the kernel that is preempted
+ * under stage 2" cannot drift apart into two binaries where only one of them
+ * is the one being demonstrated.
+ *
+ * With the bit CLEAR the guest touches no interrupt controller and arms no
+ * timer at all -- its IRQ vector is installed and simply never taken -- which
+ * is what keeps a cooperative excursion exactly as cheap, and exactly as
+ * measurable, as it was before a tick existed.  */
+
+#define ZX_GO_TICK                  0x00000002U
 
 /* THE READBACK CONVENTION, and why it is a structure rather than one word.
  *
@@ -222,7 +242,78 @@
    fired, so a torn write of the three leaves it zero and the hypervisor
    reads "no stage-1 fault" rather than a half-described one.  */
 
-#define ZX_GD_WINDOW_SIZE           0x40U
+/**************************************************************************/
+/*             THE SECOND GRANULE: what a PREEMPTIVE guest reports         */
+/**************************************************************************/
+
+/* WHY THE MAILBOX IS TWO GRANULES AND NOT ONE.
+ *
+ * The words above fill sixteen exactly, and a guest with a timer of its own
+ * has six more things to say.  Widening the mailbox costs one thing and not
+ * the thing it looks like it should cost: the guest's stage-1 MPU region for
+ * the mailbox goes from 64 bytes to 128, and NOTHING at stage 2 changes,
+ * because the partition window is one region covering the whole of it.  It
+ * does move the entry branch, which is why ZX_GUEST_IMAGE_OFF_ENTRY below is
+ * 0x80 and the guest's linker script asserts it.
+ *
+ * The alternative -- overloading words that a kernel guest happens not to use
+ * -- was rejected after ZX_GD_OPTIONS.  One alias, with one reader at each
+ * end and both spellings in this file, is explicable.  Six would be a layout
+ * that only makes sense to whoever wrote it.
+ *
+ * THESE SIX ARE OUTSIDE THE SEALED SNAPSHOT, and for the same reason the
+ * stage-1 words are: four of them are written by the guest's TIMER INTERRUPT
+ * HANDLER, which runs on every tick and must not compute a checksum, and the
+ * other two are written by threads that never yield and so could not order
+ * their writes against a seal either.
+ *
+ * That is not a hole in the evidence, because the claims do not rest on
+ * them.  "The tick advanced" is ZX_GD_TICKS, which is tx_time_get() and is
+ * INSIDE the seal; "a thread was preempted" and "two threads were time
+ * sliced" are progress BITS, and progress is inside the seal too.  The six
+ * words below are the detail that makes a FAILING run diagnosable -- which
+ * INTID actually arrived, how many times, and how far each spinner got --
+ * and a run that fails is exactly the run where a checksum would be
+ * least informative anyway.  */
+
+#define ZX_GD_IRQ_COUNT             0x40U   /* handler: interrupts serviced */
+#define ZX_GD_TIMER_INTID           0x44U   /* handler: the INTID it saw    */
+#define ZX_GD_ODD_INTID             0x48U   /* handler: any OTHER INTID     */
+#define ZX_GD_SPIN_A                0x4CU   /* spinner A's loop count       */
+#define ZX_GD_SPIN_B                0x50U   /* spinner B's loop count       */
+#define ZX_GD_WAKES                 0x54U   /* times the sleeper woke       */
+
+/* 0x5C to 0x7C are spare, and are zeroed by the handover like everything
+   else.  A word nobody wrote reads as whatever the image was built with,
+   which for a loaded, zero-filled section is zero -- but only until somebody
+   changes the section, so the handover writes them rather than relying on
+   it.  */
+
+/* A WORD THAT MEANS NOTHING, ON PURPOSE.
+ *
+ * One build asks the guest to probe an address it genuinely IS granted, so
+ * that a check whose pass condition is the absence of something can be seen
+ * to fail.  Somewhere inside the partition is the obvious target and the
+ * mailbox is the obvious part of it -- but the probe WRITES a sentinel to
+ * whatever it is aimed at, so aiming it at a word the guest reports through
+ * corrupts the report.
+ *
+ * That was not hypothetical and it was not harmless.  The target was mailbox
+ * offset zero, which is ZX_GD_PROGRESS, so the sentinel 0xA5A50001 was ORed
+ * into the progress word and the seal then certified it -- and once the
+ * preemptive bits were added, two of them (ZX_GP_PREEMPTED at 0x010000 and
+ * ZX_GP_NO_CLOCK at 0x040000) fall on bits the sentinel sets.  A cooperative
+ * build with no clock at all reported both.  The corruption had been there
+ * all along and was invisible until new bits gave those positions meaning,
+ * which is the worst way for a defect to become visible.
+ *
+ * So the probe gets a word of its own, which nothing reads and nothing folds
+ * into a checksum.  */
+
+#define ZX_GD_PROBE_SCRATCH         0x58U   /* written by the probe, read by
+                                               nobody                       */
+
+#define ZX_GD_WINDOW_SIZE           0x80U
 
 /**************************************************************************/
 /*                            Progress bits                              */
@@ -256,6 +347,33 @@
 #define ZX_GP_SEMAPHORE_OK          0x1000U /* the semaphore handed off     */
 #define ZX_GP_TICKING               0x2000U /* the guest's own tick advanced */
 #define ZX_GP_FINISHED              0x4000U /* the guest reached its verdict */
+
+/* The bits a PREEMPTIVE kernel guest sets, and each of them is a thing a
+   cooperative guest cannot fake:
+
+     COUNTING     the guest's own virtual counter was seen to ADVANCE before
+                  it blocked on anything.  This is the pre-flight, and it
+                  exists because the alternative to it is a hang: on a target
+                  whose system counter was never started, a guest that goes
+                  straight to tx_thread_sleep waits for ever and the run ends
+                  in a harness timeout that names nothing.
+     TICKING      tx_time_get() advanced, so _tx_timer_interrupt ran, so the
+                  virtual timer PPI was delivered to EL1 and serviced.
+     PREEMPTED    a thread that never yielded was DISPLACED by a
+                  higher-priority thread waking from a timed sleep.  Only an
+                  interrupt can do that.
+     TIMESLICED   two equal-priority threads that never yielded BOTH
+                  advanced, which is the kernel's time slice and not merely
+                  its scheduler.
+
+   TICKING is deliberately kept at the value the cooperative build already
+   defined for it -- it was declared with the rest of the milestones before
+   there was a tick to set it.  */
+
+#define ZX_GP_COUNTING              0x8000U  /* the virtual counter moves   */
+#define ZX_GP_PREEMPTED           0x010000U  /* a spinner was displaced     */
+#define ZX_GP_TIMESLICED          0x020000U  /* two spinners both advanced  */
+#define ZX_GP_NO_CLOCK            0x040000U  /* refused to block: no counter */
 
 /* WHAT THE GUEST'S OWN VECTORS SAW, in ZX_GD_STAGE1.
  *
@@ -349,8 +467,8 @@
  * defined starting state rather than whatever the window held before.  The
  * hypervisor writes its handover fields after the copy, never before.  */
 
-#define ZX_GUEST_IMAGE_OFF_MAILBOX  0x00U   /* one granule, ZX_GD_* inside  */
-#define ZX_GUEST_IMAGE_OFF_ENTRY    0x40U   /* the branch the ERET lands on */
+#define ZX_GUEST_IMAGE_OFF_MAILBOX  0x00U   /* TWO granules, ZX_GD_* inside */
+#define ZX_GUEST_IMAGE_OFF_ENTRY    0x80U   /* the branch the ERET lands on */
 
 /* THE IMAGE HEADER, three words after the entry branch.
  *
@@ -367,9 +485,9 @@
  * an EMPTY section rather than an error, so "the header does not carry the
  * magic" catches both a missing guest and a wrong one.  */
 
-#define ZX_GUEST_IMAGE_OFF_LINK_BASE 0x44U  /* the window it was linked for */
-#define ZX_GUEST_IMAGE_OFF_LINK_SIZE 0x48U  /* the size it was linked to fit */
-#define ZX_GUEST_IMAGE_OFF_MAGIC     0x4CU  /* ZX_GUEST_IMAGE_MAGIC          */
+#define ZX_GUEST_IMAGE_OFF_LINK_BASE 0x84U  /* the window it was linked for */
+#define ZX_GUEST_IMAGE_OFF_LINK_SIZE 0x88U  /* the size it was linked to fit */
+#define ZX_GUEST_IMAGE_OFF_MAGIC     0x8CU  /* ZX_GUEST_IMAGE_MAGIC          */
 
 /* "ZXG" and a version.  The version is here so that a later ABI change is a
    REFUSAL rather than a guest that starts and misbehaves: the loader can say
@@ -408,6 +526,36 @@
 #define ZX_HVC_GUEST_NOP            0x0000
 #define ZX_HVC_GUEST_YIELD          0x0001
 #define ZX_HVC_GUEST_PUTC           0x0002
+
+/**************************************************************************/
+/*                    The interrupt a partition is granted                */
+/**************************************************************************/
+
+/* THE VIRTUAL TIMER'S PPI, and the two sides have to agree about it for
+ * different reasons.  The hypervisor ENABLES this INTID in the
+ * redistributor -- which the guest cannot reach -- and the guest
+ * ACKNOWLEDGES it through its own CPU interface, which is system registers
+ * and needs no device at all.  A disagreement would present as a guest that
+ * takes an interrupt it does not recognise, records an unexpected INTID and
+ * never ticks, which is a good failure and still a failure.
+ *
+ * Three timer interrupts arrive as PPIs on this core: physical 30, virtual
+ * 27, hypervisor 26.  A partition gets the VIRTUAL one, because its counter
+ * can be frozen with CNTVOFF while the partition is descheduled and the
+ * physical one cannot.  See docs/decisions.md D7.
+ *
+ * Spelled without a suffix so the guest's assembly could use it directly if
+ * it ever needed to, like the HVC immediates above.  The ZoneX side spells
+ * it ZX_PPI_VIRTUAL_TIMER, and the example that includes both headers
+ * asserts they agree at compile time.  */
+
+#define ZX_GUEST_TIMER_INTID        27
+
+/* The GIC's spurious INTID: what ICC_IAR1 returns when nothing was actually
+   pending.  It must NOT be given an end-of-interrupt, which is why the guest
+   checks for it rather than treating every read as an interrupt.  */
+
+#define ZX_GUEST_SPURIOUS_INTID     1023
 
 /**************************************************************************/
 /*                     The readback checksum                              */

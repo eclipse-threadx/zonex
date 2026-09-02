@@ -302,6 +302,105 @@ itself — a ZoneX bug — and must be reported as one rather than folded in wit
   handling simple — but that is now a scope decision taken knowingly rather
   than a limitation inherited by assumption.
 
+### A partition's timer PPI is delivered to EL1 directly — measured on both targets
+
+With `HCR.IMO` **clear**, a physical interrupt taken while EL1 is running goes
+straight to EL1. No injection, no List Register, no EL2 work per tick. A guest
+enables only its own CPU interface and acknowledges through `ICC_IAR1`. Verified
+end to end on the Armv8-R AEM FVP and on the S32Z280-594EVB: `ICC_IAR1` returns
+INTID **27**, and no other INTID reaches the partition.
+
+The corollary is the one worth writing down, because it is the next phase's
+whole problem: with `IMO` clear the hypervisor cannot take an interrupt of its
+own while a partition runs **either**, including its own timer on PPI 26. See
+`docs/decisions.md` D24.
+
+### The GIC registers ZoneX writes, and where they are
+
+Offsets are architectural; only the bases differ between the two targets.
+
+| Frame | Register | Offset | What it is for |
+|---|---|---|---|
+| GICD | `GICD_CTLR` | `0x0000` | `ARE` = bit 4, `EnableGrp1` = bit 1, `EnableGrp0` = bit 0. With a single security state `DS` reads 1 and Group 1 **is** bit 1. |
+| GICR, RD frame | `GICR_WAKER` | `0x0014` | `ProcessorSleep` = bit 1, `ChildrenAsleep` = bit 2. Clear the first, then **poll** the second; nothing is delivered to the core until it clears. |
+| GICR, SGI frame | `GICR_IGROUPR0` | `0x0080` | one bit per INTID 0–31; set = Group 1 (IRQ), clear = Group 0 (FIQ) |
+| GICR, SGI frame | `GICR_ISENABLER0` | `0x0100` | write-one-to-**set** |
+| GICR, SGI frame | `GICR_ICENABLER0` | `0x0180` | write-one-to-**clear**; all ones disables this core's thirty-two in one write |
+| GICR, SGI frame | `GICR_IPRIORITYR` | `0x0400` | one **byte** per INTID, four to a word |
+| GICR, SGI frame | `GICR_ICFGR1` | `0x0C04` | two bits per INTID, `00` = **level**. The generic timer asserts a level; configured as edge it is taken once and never again. |
+
+The redistributor is **two consecutive 64 KB frames per core** — RD then SGI.
+Swapping them writes plausible values into the wrong registers and reads back
+zero: a GIC that was configured and does nothing, with no fault to point at it.
+
+| Target | GICD | GICR RD | GICR SGI |
+|---|---|---|---|
+| Armv8-R AEM FVP | `0xAF000000` | `0xAF100000` | `0xAF110000` |
+| S32Z280-594EVB | `0x47800000` | `0x47900000` | `0x47910000` |
+
+**Both targets implement FIVE priority bits.** Only the top five of a priority
+byte survive; the rest read back as zero, so two priorities differing only there
+are the *same* priority — and equal priorities do not preempt. Discovered by
+writing all ones to one INTID's byte and reading back what stuck, then putting
+the byte back.
+
+### The CPU interface a guest uses, in AArch32
+
+Every one of these is a system register, which is why a partition needs no GIC
+mapping at all. All are UNDEFINED until `ICC_HSRE.SRE` is set — see below.
+
+| Register | Encoding | Note |
+|---|---|---|
+| `ICC_SRE` | `p15, 0, c12, c12, 5` | EL1 access to it is gated by `ICC_HSRE.Enable` |
+| `ICC_PMR` | `p15, 0, c4, c6, 0` | **`c4`, not `c12`** — the one encoding in this group that is not where you would look for it |
+| `ICC_BPR1` | `p15, 0, c12, c12, 3` | |
+| `ICC_IGRPEN1` | `p15, 0, c12, c12, 7` | `ICC_IGRPEN0` is opc2 6, beside it |
+| `ICC_IAR1` | `p15, 0, c12, c12, 0` | read; mask to bits [23:0] |
+| `ICC_EOIR1` | `p15, 0, c12, c12, 1` | write |
+
+`ICC_IAR1` returning **1023** means nothing was pending. It must **not** be
+given an end-of-interrupt: the running priority was never raised, so dropping it
+corrupts the GIC's priority stack rather than merely being redundant.
+
+### The generic-timer registers, AArch32
+
+| Register | Encoding | Level |
+|---|---|---|
+| `CNTFRQ` | `p15, 0, c14, c0, 0` | readable anywhere, writable only at the highest implemented level |
+| `CNTPCT` | `MRRC p15, 0, …, c14` | 64-bit |
+| `CNTVCT` | `MRRC p15, 1, …, c14` | 64-bit; `CNTPCT − CNTVOFF` |
+| `CNTP_TVAL` / `CNTP_CTL` | `p15, 0, c14, c2, 0` / `…, 1` | physical; **a partition cannot reach these**, `CNTHCTL.PL1PCTEN`/`PL1PCEN` stay clear |
+| `CNTV_TVAL` / `CNTV_CTL` | `p15, 0, c14, c3, 0` / `…, 1` | virtual; EL1 access is **not** gated by anything |
+| `CNTVOFF` | `MRRC`/`MCRR p15, 4, …, c14` | 64-bit, **EL2 only** |
+
+`CNTV_CTL`: `ENABLE` = bit 0, `IMASK` = bit 1, `ISTATUS` = bit 2. Stopping a
+partition's timer clears **both** ENABLE and IMASK — masking alone leaves the
+comparator running with `ISTATUS` set, so a guest re-entered later finds a timer
+it never armed already expired.
+
+`TVAL` rather than `CVAL` for the re-arm: it is a 32-bit down-count loaded
+relative to now, so re-arming inside the interrupt handler is one register write
+with no 64-bit arithmetic and no counter read. Writing it is also what deasserts
+the level.
+
+### ⚠ Reading `CNTPCT` costs real time on the S32Z280
+
+**93 counts — about 11.6 µs — for the handful of counter reads between a
+`CNTVOFF` write and a check of it.** Measured on the S32Z280-594EVB; zero on the
+Armv8-R AEM FVP.
+
+The counter runs at 8 MHz, derived from a 40 MHz crystal through a divider of
+five, so a `CNTPCT` read crosses into an 8 MHz clock domain and costs a few
+counter periods to synchronise. That is not noise to round away: a check of the
+`CNTVOFF` freeze that re-read the counter from outside was measuring **the cost
+of measuring the freeze**, and reported the partition's clock advancing by 64
+counts on a run where the mechanism was exactly right.
+
+The fix is to compare only numbers the mechanism itself took — the counter at
+suspend and at resume — against the offset read back out of the register. Every
+term is then a hardware read, the equality is exact, and a `CNTVOFF` write that
+had not landed still fails it.
+
 ---
 
 ## The two open questions, both now CLOSED on both targets
@@ -746,12 +845,76 @@ either part reports the frequency:
 | Armv8-R AEM FVP | `0x00000000` | `0x05F5E100` (100 MHz) | `CNTFID0` read back from the counter control frame |
 | S32Z280-594EVB | `0x00000000` | `0x007A1200` (8 MHz) | measured at 8.0227 MHz against host wall-clock over 32 s; `CFG_CNTDV` = 4 so the divider is 5; FXOSC 40 MHz, itself confirmed from the boot ROM's LINFlexD baud divisors. 40 / 5 = 8 |
 
-⚠ **Programming `CNTFRQ` does not start the counter.** On the FVP the system
-counter is left stopped (`bp.refcounter.non_arch_start_at_default=0`,
-documented as "firmware is expected to enable the timer at boot time"), so a
-guest that *waited* on this timer would still wait forever. The cooperative
-guest deliberately does not. Starting the counter belongs with interrupt
-delivery.
+⚠ **Programming `CNTFRQ` does not start the counter**, and the two are so easily
+confused that they are separate hooks in the code.
+
+| Target | Counter at reset | How it is started |
+|---|---|---|
+| Armv8-R AEM FVP | **stopped** (`bp.refcounter.non_arch_start_at_default=0`, documented as "firmware is expected to enable the timer at boot time") | `CNTCR.EN` at `0xAA430000`, the counter control frame. In the Device-nGnRE band of the background map, so it needs no EL2 region on this model. |
+| S32Z280-594EVB | **running** | nothing to do. `CNTCLKEN` comes from a cluster clock through `RTU.GPR CFG_CNTDV`, whose reset divider is five. There is no control frame for a hypervisor to write. |
+
+It is EL2's job on both, for the same reason the GIC is: the system counter is
+one per system, and a partition able to start or stop it would decide how fast
+time ran for every other partition.
+
+**Whether it worked is a third question**, asked separately and answered the
+same way on both boards: read `CNTPCT` twice, bounded, and see whether it moved.
+Without it, a guest that arms a timer against a stopped counter blocks for ever
+and the run ends in a harness timeout — a failure that names nothing and looks
+identical to a broken loader, a broken context switch and a broken GIC.
+
+### `CNTVOFF` freezes a descheduled partition's clock — measured on silicon
+
+`CNTVOFF` is a **static** offset written only at EL2, so while a partition is
+suspended the physical counter moves and the offset does not: the subtraction
+drifts for exactly as long as the partition is away, and what closes the gap is
+the write on **resume**, which advances `CNTVOFF` by everything that elapsed.
+Measuring the virtual counter anywhere in between measures the drift and not the
+correction, which looks exactly like a broken freeze.
+
+Measured on the S32Z280-594EVB, one partition, a deliberate 20 ms hypervisor
+dwell between two excursions:
+
+| | counts |
+|---|---|
+| interval the partition was excluded from | 1,969,637 |
+| credited to `CNTVOFF` | 1,969,637 — **exact** |
+| the partition's virtual clock moved by | 93, and that is the counter-read cost above |
+
+The same pair of excursions, quiet and identical, differed by **90 cycles out of
+1,952,856** — 0.005%. That is the determinism figure one partition on one core
+can support; it is repeatability, not the cost of anything.
+
+---
+
+## The state a partition switch must save and restore
+
+Not a decision — a **list of registers**, kept here because that is what it is,
+and because every entry on it was found by needing it rather than by reading a
+manual. Nothing switches partitions yet; this is what will have to.
+
+`—` in the last column means nothing in ZoneX touches it today, which with one
+partition is exactly correct and with two is a defect.
+
+| State | Encoding (AArch32) | Whose | Handled? |
+|---|---|---|---|
+| **EL1 banked registers** — `SP`, `LR` per mode, `SPSR` per mode | mode-banked | guest | — |
+| `VBAR` | `p15, 0, c12, c0, 0` | guest | — · the guest writes it in its own board support, and a switch that did not restore it would send the next partition's faults to the previous one's vector table |
+| `SCTLR`, `CONTEXTIDR`, `TPIDRURW`/`TPIDRURO`/`TPIDRPRW` | `p15, 0, c1, c0, 0` / `c13, c0, 1` / `c13, c0, {2,3,4}` | guest | — |
+| **The whole EL1 MPU region set** — `PRBAR`/`PRLAR` per region, selected through `PRSELR` | `p15, 0, c6, c3, {0,1}` with `p15, 0, c6, c2, 1` | guest | — · **20 regions × 2 registers on the S32Z280.** This is likely to dominate the switch cost and it is the number the next step has to measure. |
+| **FPU** — `FPEXC`, `FPSCR`, `D0`–`D15` | `VMRS`/`VMSR` | guest | — · `HCPTR.TCP10/TCP11` are cleared for a guest (D23), so a guest *may* use the FPU and nothing saves it |
+| `CNTV_CTL`, `CNTV_TVAL`/`CNTV_CVAL` | `p15, 0, c14, c3, {1,0}` / `MRRC p15, 3, …, c14` | guest | **stop only.** `zx_el2_guest_timer_stop` disarms the timer when a partition yields, which makes an armed comparator harmless for one partition and does not make it correct for two: a switch that saved neither would hand the next partition the previous one's deadline. |
+| `CNTVOFF` | `MRRC`/`MCRR p15, 4, …, c14` | **hypervisor, per partition** | **yes**, for one partition. Becomes an array indexed by partition, along with the suspend/resume instants recorded beside it. |
+| **CPU interface** — `ICC_PMR`, `ICC_BPR1`, `ICC_IGRPEN1` | see the table above | guest | — · a partition brings these up itself in `board_init`, so a switch that did not restore them would leave the next partition running with the previous one's priority mask |
+| **Which PPIs are enabled** — `GICR_ISENABLER0` | memory-mapped, SGI frame | **hypervisor** | **yes** — every one is disabled at bring-up and only the granted INTID enabled. A switch changes which INTID that is, and it is one register write. |
+| The stage-2 region set | `HPRENR` | hypervisor | **yes** — one write, measured; see D4 |
+
+The two ends of that table are worth contrasting, because they are the whole
+shape of the problem. The hypervisor's own per-partition state is *small and
+cheap* — one `HPRENR` write, one `CNTVOFF` write, one `GICR_ISENABLER0` write.
+The **guest's** state is large, and the EL1 MPU dominates it. A partition switch
+is therefore not expensive because the hypervisor does much; it is expensive
+because a guest has a lot of registers.
 
 ---
 

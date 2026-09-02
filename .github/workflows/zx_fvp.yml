@@ -43,6 +43,12 @@ name: zx_fvp
 # it genuinely owns -- which must FAIL, and whose failing is what makes the
 # other two evidence.
 #
+# The preemptive images: the SAME guest, granted the virtual timer's PPI by a
+# hypervisor that owns every byte of the GIC, being preempted by its own kernel
+# under stage 2 -- plus two builds that must FAIL, one with the partition's
+# interrupt left disabled in a frame the guest cannot reach, and one where the
+# hypervisor does not give the partition back the time it spent descheduled.
+#
 # The builds that must fail are registered with the runner's "--expect fail",
 # because a check that has never been seen to fail is not evidence that it can.
 # (CTest's WILL_FAIL is deliberately NOT used: it inverts the exit status and
@@ -311,17 +317,36 @@ jobs:
         # it would mean half this suite quietly stopped running.  The stage-2
         # probes would still be green, and nothing would say that a real
         # kernel had not been booted at all.
-        if ! echo "$images" | grep -q '^zx_one_partition\.elf$'; then
+        if ! echo "$images" | grep -qE '^zx_(one_partition|preemptive)\.elf$'; then
           echo "::error::The ThreadX guest images were not built. ZX_THREADX_SOURCE_DIR did not reach CMake, so no real kernel was booted and half this suite did not run."
           {
             echo "### ZoneX FVP execution: NO GUEST IMAGES"
             echo ""
-            echo "The stage-2 probe images built, but the one-partition images -- the ones that"
-            echo "boot a real ThreadX kernel inside a partition -- were skipped, which happens"
-            echo "when \`ZX_THREADX_SOURCE_DIR\` is empty. Check the ThreadX checkout step."
+            echo "The stage-2 probe images built, but every image that boots a REAL ThreadX"
+            echo "kernel inside a partition was skipped -- which happens when"
+            echo "\`ZX_THREADX_SOURCE_DIR\` is empty. Check the ThreadX checkout step."
           } >>"$GITHUB_STEP_SUMMARY"
           exit 1
         fi
+
+        # BOTH guest families, named separately.  The check above catches a
+        # missing ThreadX checkout, which removes them together; this one
+        # catches an image being dropped from the CMake graph on its own,
+        # which would leave the suite green while a whole claim stopped being
+        # tested.
+        for required in zx_one_partition.elf zx_preemptive.elf; do
+          if ! echo "$images" | grep -qx "$required"; then
+            echo "::error::$required is not in the CMake graph, so the claim it carries is no longer being tested."
+            {
+              echo "### ZoneX FVP execution: A GUEST IMAGE IS MISSING"
+              echo ""
+              echo "\`$required\` was not found among the targets. The rest of the suite would"
+              echo "still be green, and nothing in it would say that the claim this image"
+              echo "carries had stopped being tested."
+            } >>"$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+        done
 
         echo "Building $(echo "$images" | wc -l) images"
         # shellcheck disable=SC2086

@@ -72,6 +72,29 @@
 
 #define ZX_FVP_SYSTEM_COUNTER_HZ    100000000UL
 
+/* The counter control frame (CNTControlBase).  THIS MODEL LEAVES ITS SYSTEM
+   COUNTER STOPPED at reset -- bp.refcounter.non_arch_start_at_default=0,
+   which the model documents as "firmware is expected to enable the timer at
+   boot time" -- so CNTCR.EN has to be written before anything can wait on a
+   timer.  ZoneX writes it, because the system counter is one per system and
+   is not a partition's to start.
+
+   The frame is at 0xAA430000, in the upper half of the BaseR map, where the
+   background map's Device-nGnRE band gives it the right attributes without
+   an EL2 region.  That is a property of this model and not of the
+   architecture; the S32Z280 needs no frame at all, and its console and GIC
+   need regions this one does not.  */
+
+#define ZX_FVP_CNT_CONTROL_BASE     0xAA430000UL
+#define ZX_FVP_CNTCR                0x0000U
+#define ZX_FVP_CNTCR_EN             0x00000001UL
+
+/* A board register accessor, for the one register this board's hypervisor
+   writes.  The S32Z280's zx_platform.h has the same macro for its console
+   and its GIC; this model needed none until the counter.  */
+
+#define ZX_REG32(address)   (*(volatile uint32_t *)(uintptr_t)(address))
+
 /* Low DRAM, where the image is linked.  The 0x80000000-0xFFFFFFFF half holds
    peripherals and is execute-never in the background map, so linking code
    there produces a silent fault loop with no output.  */

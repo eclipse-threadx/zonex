@@ -21,19 +21,521 @@
 /*                                                                        */
 /*  DESCRIPTION                                                           */
 /*                                                                        */
-/*    GICv3 bring-up for EL2, and the routing of guest interrupts.        */
+/*    GICv3 bring-up for EL2, and the one interrupt a partition is given.  */
 /*                                                                        */
-/*    The Cortex-R52 does implement the GICv3 virtual CPU interface --    */
-/*    ICH_HCR, ICH_VTR and four List Registers, ICH_LR0 to ICH_LR3 -- so  */
-/*    interrupt injection is available.  Phase 0 still keeps interrupt    */
-/*    handling deliberately simple; that is a scope decision rather than  */
-/*    a hardware limitation, and it is recorded as one so a later phase   */
-/*    does not rediscover the List Registers from scratch.                */
+/*  EVERY REGISTER IN THIS FILE IS MEMORY-MAPPED, AND THAT IS THE POINT.   */
 /*                                                                        */
-/*    This translation unit is deliberately empty of implementation.      */
-/*    See docs/armv8r-el2-reference.md for the verified register sheet    */
-/*    the code that lands here must be written against.                   */
+/*    A GICv3 interrupt reaches a thread through three pieces of state:    */
+/*                                                                        */
+/*      the DISTRIBUTOR    one per system                                  */
+/*      the REDISTRIBUTOR  one per CORE -- two 64 KB frames, of which the  */
+/*                         second holds the enable, group, priority and    */
+/*                         edge/level bits for INTIDs 0 to 31             */
+/*      the CPU INTERFACE  per exception level, and on this part entirely  */
+/*                         SYSTEM REGISTERS                               */
+/*                                                                        */
+/*    ZoneX keeps the first two and gives a partition the third.  The      */
+/*    division is not "shared things belong to the hypervisor", which is   */
+/*    true but weak; it is that the redistributor frame holding a          */
+/*    partition's timer enable is the SAME FRAME that holds the enable for */
+/*    PPI 26, the hypervisor's own timer -- the interrupt that ends a      */
+/*    partition's window.  A partition able to write that frame could      */
+/*    disable it and never be descheduled again.  No amount of stage-2     */
+/*    region programming would show that, because nothing about it is a    */
+/*    memory-isolation failure: it is the temporal-determinism claim,      */
+/*    lost.  See docs/decisions.md D24.                                    */
+/*                                                                        */
+/*    The consequence for the guest is small and worth stating: it needs   */
+/*    NO device mapping at all.  Its four writes -- priority mask, binary  */
+/*    point, group enable, and end-of-interrupt -- are system registers,   */
+/*    and so is the acknowledge that pairs with them.                      */
+/*                                                                        */
+/*  WHAT THIS FILE DELIBERATELY DOES NOT DO                                */
+/*                                                                        */
+/*    It does not INJECT.  The Cortex-R52 implements the GICv3 virtual CPU */
+/*    interface -- ICH_HCR, ICH_VTR and four List Registers, ICH_LR0 to    */
+/*    ICH_LR3, confirmed on both targets -- so injection is available.     */
+/*    ZoneX does not use it, because HCR.IMO is CLEAR: a physical          */
+/*    interrupt taken while EL1 is running is delivered STRAIGHT to EL1,   */
+/*    and the hypervisor is not involved in a tick at all.                 */
+/*                                                                        */
+/*    That is the cheapest possible mechanism and it costs exactly one     */
+/*    thing, which is written down here rather than discovered later: with */
+/*    IMO clear, the hypervisor cannot take an interrupt of its own while  */
+/*    a partition is running either.  A hypervisor tick that ENDS a        */
+/*    partition's window therefore needs IMO SET, and with IMO set every   */
+/*    guest interrupt has to be injected through a List Register.  That is */
+/*    the change time partitioning brings, and it is a change to this      */
+/*    file and to zx_trap_handler.S rather than to any guest.              */
+/*                                                                        */
+/*  MISRA C:2012 deviations (justified)                                   */
+/*                                                                        */
+/*    Rule 11.4/11.6 -- casting an integer address to a volatile pointer   */
+/*      is inherent to memory-mapped device access; confined to ZX_GIC_REG */
+/*      below and appearing nowhere else in this file.                     */
+/*    Directive 4.3 -- the barriers below are single instructions with no  */
+/*      C equivalent.                                                      */
 /*                                                                        */
 /**************************************************************************/
 
 #include "zx_port.h"
+
+/**************************************************************************/
+/*  Register offsets.  ARCHITECTURAL, which is why they are here and the  */
+/*  frame addresses are not: a GICv3 has these offsets wherever it sits.   */
+/**************************************************************************/
+
+/* Distributor.  */
+
+#define ZX_GICD_CTLR                0x0000U
+#define ZX_GICD_CTLR_ENABLE_GRP0    ZX_BIT(0)
+#define ZX_GICD_CTLR_ENABLE_GRP1    ZX_BIT(1)
+#define ZX_GICD_CTLR_ARE            ZX_BIT(4)
+#define ZX_GICD_CTLR_RWP            ZX_BIT(31)
+
+/* Redistributor, RD frame.  */
+
+#define ZX_GICR_CTLR                0x0000U
+#define ZX_GICR_CTLR_RWP            ZX_BIT(3)
+#define ZX_GICR_WAKER               0x0014U
+#define ZX_GICR_WAKER_PROC_SLEEP    ZX_BIT(1)
+#define ZX_GICR_WAKER_CHILD_ASLEEP  ZX_BIT(2)
+
+/* Redistributor, SGI frame: SGIs and PPIs, INTID 0 to 31.  */
+
+#define ZX_GICR_IGROUPR0            0x0080U
+#define ZX_GICR_ISENABLER0          0x0100U
+#define ZX_GICR_ICENABLER0          0x0180U
+#define ZX_GICR_IPRIORITYR          0x0400U
+#define ZX_GICR_ICFGR1              0x0C04U
+
+/* The lowest INTID that is a PPI.  Below it are the sixteen SGIs, which
+   have no configurable edge or level -- which is why the ICFGR arithmetic
+   below subtracts this and why an INTID under it is refused.  */
+
+#define ZX_PPI_FIRST_INTID          16U
+
+/* How long to wait for the redistributor to report its children awake.
+   BOUNDED, because a GIC that never wakes must produce a reported failure
+   and not a boot that stops with nothing printed.  */
+
+#define ZX_GIC_WAKE_GUARD           100000U
+
+#define ZX_GIC_REG(address)         (*(volatile uint32_t *)(uintptr_t)(address))
+
+
+static void zx_gic_barrier(void)
+{
+    __asm__ volatile("dsb" ::: "memory");
+    __asm__ volatile("isb" ::: "memory");
+}
+
+
+/**************************************************************************/
+/*  Register-write-pending, and why a DSB is not a substitute for it.      */
+/*                                                                        */
+/*  SOME GIC WRITES ARE NOT FINISHED WHEN THE INSTRUCTION THAT MADE THEM   */
+/*  RETIRES.  A DSB orders the bus access -- it says the write has left    */
+/*  this core -- and says nothing about whether the distributor or the     */
+/*  redistributor has finished acting on it.  The two registers below are  */
+/*  how the GIC reports that, and the writes they track are exactly the    */
+/*  ones this file makes:                                                  */
+/*                                                                        */
+/*    GICD_CTLR.RWP    tracks writes to GICD_CTLR, which is where ARE and  */
+/*                     the group enables live                              */
+/*    GICR_CTLR.RWP    tracks writes to GICR_ICENABLER0 -- DISABLES        */
+/*                     specifically; an enable through ISENABLER takes     */
+/*                     effect immediately and is not tracked               */
+/*                                                                        */
+/*  THE FAILURE THIS PREVENTS IS SPECIFIC AND IT IS INTERMITTENT.  Bring-  */
+/*  up disables all thirty-two of this core's SGIs and PPIs and then       */
+/*  enables one of them, in the same frame, a few instructions later.      */
+/*  Without the wait the in-flight disable may retire AFTER the enable and */
+/*  undo it, which leaves the partition arming a virtual timer whose       */
+/*  interrupt is disabled -- a guest that never ticks, on some boots.      */
+/*                                                                        */
+/*  Bounded, like every other wait in this file: a GIC that never retires  */
+/*  a write has to become a reported failure rather than a boot that stops */
+/*  with nothing printed.                                                  */
+/**************************************************************************/
+
+static uint32_t zx_gic_wait_dist_rwp(const ZX_GIC_LAYOUT *gic_ptr)
+{
+    uint32_t guard;
+
+    for (guard = 0U; guard < ZX_GIC_WAKE_GUARD; guard++)
+    {
+        if ((ZX_GIC_REG(gic_ptr->zx_gic_dist_base + ZX_GICD_CTLR)
+             & (uint32_t)ZX_GICD_CTLR_RWP) == 0U)
+        {
+            return 1U;
+        }
+    }
+
+    return 0U;
+}
+
+
+static uint32_t zx_gic_wait_redist_rwp(const ZX_GIC_LAYOUT *gic_ptr)
+{
+    uint32_t guard;
+
+    for (guard = 0U; guard < ZX_GIC_WAKE_GUARD; guard++)
+    {
+        if ((ZX_GIC_REG(gic_ptr->zx_gic_rd_base + ZX_GICR_CTLR)
+             & (uint32_t)ZX_GICR_CTLR_RWP) == 0U)
+        {
+            return 1U;
+        }
+    }
+
+    return 0U;
+}
+
+
+/**************************************************************************/
+/*  zx_gic_ppi_is_valid -- one guard, used by everything below.           */
+/*                                                                        */
+/*  An INTID outside 16 to 31 does not belong in the redistributor's SGI  */
+/*  frame at all, and the arithmetic that would place it there produces a */
+/*  perfectly plausible offset into a neighbouring register.  Refusing is  */
+/*  what turns "the timer never fired" into "the timer was never          */
+/*  enabled", which are different bugs in different files.                 */
+/**************************************************************************/
+
+static uint32_t zx_gic_ppi_is_valid(uint32_t intid)
+{
+    return ((intid >= ZX_PPI_FIRST_INTID) && (intid <= 31U)) ? 1U : 0U;
+}
+
+
+/**************************************************************************/
+/*  zx_gic_el2_init                                                       */
+/*                                                                        */
+/*  THE ORDER IS FORCED AND EACH STEP FAILS DIFFERENTLY IF IT IS SKIPPED.  */
+/*                                                                        */
+/*    THE GROUP ENABLES ARE CLEARED FIRST, and this is the step that looks */
+/*    unnecessary and is not.  Changing ARE while the GIC is enabled is    */
+/*    UNPREDICTABLE, so a sequence that sets ARE and then the enables is   */
+/*    correct only if the enables were already clear -- which is a claim   */
+/*    about reset state, and on silicon ZoneX is not the first thing to    */
+/*    run.  This file argues that elsewhere, about the PPI enables, and    */
+/*    then made the same assumption here until it was pointed out.  So the */
+/*    GIC is turned OFF, ARE is set, and it is turned back on.             */
+/*                                                                        */
+/*    ARE BEFORE THE ENABLES.  Affinity routing changes how the            */
+/*    distributor's own registers behave; configuring under one            */
+/*    interpretation and reading under another is the failure that         */
+/*    ordering avoids.  This part fixes ARE to one, so the write is a      */
+/*    formality -- and it is done anyway, because "it resets to what we    */
+/*    want" is a claim about a part and ZoneX runs on more than one.       */
+/*                                                                        */
+/*    THE GROUP ENABLES.  With a single security state GICD_CTLR.DS reads  */
+/*    one and Group 1 is bit 1.  Group 0 is enabled too and costs nothing  */
+/*    while no interrupt is assigned to it: assignment is per interrupt,   */
+/*    in GICR_IGROUPR0, and every interrupt ZoneX hands a partition is     */
+/*    Group 1.                                                             */
+/*                                                                        */
+/*    EVERY GICD_CTLR WRITE IS FOLLOWED BY A WAIT, because they are not    */
+/*    finished when the instruction retires.  See the note on RWP above.   */
+/*                                                                        */
+/*    THE REDISTRIBUTOR WAKES LAST, and nothing can be delivered to this   */
+/*    core until it has.  ProcessorSleep is cleared and then                */
+/*    ChildrenAsleep is POLLED: the two are separate bits because waking   */
+/*    is not instantaneous, and a configuration written into a sleeping    */
+/*    redistributor is written into a frame that is not listening.         */
+/*                                                                        */
+/*  Returns zero if the wait ran out, and the caller reports that as a    */
+/*  failed check rather than continuing into a partition that can never   */
+/*  receive its timer.                                                     */
+/**************************************************************************/
+
+uint32_t zx_gic_el2_init(const ZX_GIC_LAYOUT *gic_ptr)
+{
+    uint32_t control;
+    uint32_t waker;
+    uint32_t guard;
+
+    if (gic_ptr == (const ZX_GIC_LAYOUT *)0)
+    {
+        return 0U;
+    }
+
+    control  = ZX_GIC_REG(gic_ptr->zx_gic_dist_base + ZX_GICD_CTLR);
+    control &= ~(uint32_t)(ZX_GICD_CTLR_ENABLE_GRP0 | ZX_GICD_CTLR_ENABLE_GRP1);
+    ZX_GIC_REG(gic_ptr->zx_gic_dist_base + ZX_GICD_CTLR) = control;
+
+    if (zx_gic_wait_dist_rwp(gic_ptr) == 0U)
+    {
+        return 0U;
+    }
+
+    control |= (uint32_t)ZX_GICD_CTLR_ARE;
+    ZX_GIC_REG(gic_ptr->zx_gic_dist_base + ZX_GICD_CTLR) = control;
+
+    if (zx_gic_wait_dist_rwp(gic_ptr) == 0U)
+    {
+        return 0U;
+    }
+
+    control |= (uint32_t)(ZX_GICD_CTLR_ENABLE_GRP0 | ZX_GICD_CTLR_ENABLE_GRP1);
+    ZX_GIC_REG(gic_ptr->zx_gic_dist_base + ZX_GICD_CTLR) = control;
+
+    if (zx_gic_wait_dist_rwp(gic_ptr) == 0U)
+    {
+        return 0U;
+    }
+
+    waker  = ZX_GIC_REG(gic_ptr->zx_gic_rd_base + ZX_GICR_WAKER);
+    waker &= ~(uint32_t)ZX_GICR_WAKER_PROC_SLEEP;
+    ZX_GIC_REG(gic_ptr->zx_gic_rd_base + ZX_GICR_WAKER) = waker;
+
+    for (guard = 0U; guard < ZX_GIC_WAKE_GUARD; guard++)
+    {
+        if ((ZX_GIC_REG(gic_ptr->zx_gic_rd_base + ZX_GICR_WAKER)
+             & (uint32_t)ZX_GICR_WAKER_CHILD_ASLEEP) == 0U)
+        {
+            /* EVERY SGI AND PPI IS DISABLED BEFORE ANY IS GRANTED.
+             *
+             * "A partition receives only the interrupt the hypervisor gave
+             * it" is a claim about what is ENABLED, and enable bits are not
+             * reset state a hypervisor may assume: on real silicon ZoneX is
+             * not the first thing to run, and a boot ROM or a previous stage
+             * may have left any of these thirty-two on.  Asserting that they
+             * are off would then be a check about the last boot rather than
+             * about this hypervisor.
+             *
+             * ICENABLER is write-one-to-CLEAR, so all ones disables all
+             * thirty-two in one write and touches nothing outside them --
+             * SPIs, which live in the distributor, are a different register
+             * and a different question.
+             *
+             * The write is here rather than in the caller because it is part
+             * of bringing this core's interrupt state to a KNOWN state, which
+             * is what the rest of this function is doing.  A caller that
+             * forgot it would still get a working timer and would lose the
+             * claim.  */
+
+            ZX_GIC_REG(gic_ptr->zx_gic_sgi_base + ZX_GICR_ICENABLER0) =
+                0xFFFFFFFFU;
+
+            /* AND WAITED FOR.  A disable is not finished when the store
+               retires, and the very next thing this hypervisor does is
+               ENABLE one of these thirty-two in the same frame.  An
+               in-flight disable that landed after that enable would undo
+               it, and the partition would arm a virtual timer whose
+               interrupt was disabled -- a guest that never ticks, on some
+               boots and not others.  */
+
+            zx_gic_barrier();
+
+            return zx_gic_wait_redist_rwp(gic_ptr);
+        }
+    }
+
+    return 0U;
+}
+
+
+/**************************************************************************/
+/*  zx_gic_enable_guest_ppi                                               */
+/*                                                                        */
+/*  Group, priority, configuration, THEN enable -- and the order is the    */
+/*  same one an interrupt controller always wants: everything that         */
+/*  describes an interrupt before the bit that lets it be delivered.       */
+/*  Enabling first leaves a window in which the interrupt can arrive with  */
+/*  whatever group and priority the register happened to hold, and on a    */
+/*  level-triggered timer that window is however long the rest of this     */
+/*  function takes.                                                        */
+/*                                                                        */
+/*  LEVEL, NOT EDGE.  The generic timer asserts a LEVEL: its output stays  */
+/*  asserted until the comparator is re-armed.  Configured as edge it      */
+/*  would be taken once and then never again, which presents as a kernel   */
+/*  that ticks exactly one time -- and one tick is enough for a naive      */
+/*  check to pass.                                                         */
+/**************************************************************************/
+
+void zx_gic_enable_guest_ppi(const ZX_GIC_LAYOUT *gic_ptr, uint32_t intid,
+                             uint32_t priority)
+{
+    zx_addr_t priority_word;
+    uint32_t  shift;
+
+    if ((gic_ptr == (const ZX_GIC_LAYOUT *)0)
+        || (zx_gic_ppi_is_valid(intid) == 0U))
+    {
+        return;
+    }
+
+    /* Group 1, which is what the GIC delivers as an IRQ.  Group 0 arrives as
+       an FIQ, and a partition is granted none.  */
+
+    ZX_GIC_REG(gic_ptr->zx_gic_sgi_base + ZX_GICR_IGROUPR0) |=
+        (uint32_t)ZX_BIT(intid);
+
+    /* Priority is a BYTE per INTID inside a word per four INTIDs.  The byte
+       is cleared before it is set, because a read-modify-write that only
+       ORed would leave whatever the reset value held in the bits the new
+       priority does not set -- a priority that is numerically lower than
+       intended, which in a GIC means HIGHER.  */
+
+    priority_word = gic_ptr->zx_gic_sgi_base + ZX_GICR_IPRIORITYR
+                    + (zx_addr_t)(intid & ~3U);
+    shift = (intid & 3U) * 8U;
+
+    ZX_GIC_REG(priority_word) &= ~(uint32_t)(0xFFU << shift);
+    ZX_GIC_REG(priority_word) |= (uint32_t)((priority & 0xFFU) << shift);
+
+    /* Two configuration bits per INTID, 00 = level-sensitive.  */
+
+    shift = (intid - ZX_PPI_FIRST_INTID) * 2U;
+    ZX_GIC_REG(gic_ptr->zx_gic_sgi_base + ZX_GICR_ICFGR1) &=
+        ~(uint32_t)(0x3U << shift);
+
+    /* ISENABLER is write-one-to-SET: the bits written as zero are left
+       alone, so this enables one interrupt and does not disturb the rest --
+       including the hypervisor's own.  A read-modify-write here would be
+       both unnecessary and wrong.  */
+
+    ZX_GIC_REG(gic_ptr->zx_gic_sgi_base + ZX_GICR_ISENABLER0) =
+        (uint32_t)ZX_BIT(intid);
+
+    zx_gic_barrier();
+}
+
+
+/**************************************************************************/
+/*  zx_gic_disable_guest_ppi                                              */
+/*                                                                        */
+/*  ICENABLER, the write-one-to-CLEAR half of the pair.  Same property:    */
+/*  one interrupt, nothing else touched.                                   */
+/**************************************************************************/
+
+void zx_gic_disable_guest_ppi(const ZX_GIC_LAYOUT *gic_ptr, uint32_t intid)
+{
+    if ((gic_ptr == (const ZX_GIC_LAYOUT *)0)
+        || (zx_gic_ppi_is_valid(intid) == 0U))
+    {
+        return;
+    }
+
+    ZX_GIC_REG(gic_ptr->zx_gic_sgi_base + ZX_GICR_ICENABLER0) =
+        (uint32_t)ZX_BIT(intid);
+
+    /* Waited for, so that a caller can KNOW when the interrupt has stopped
+       being deliverable.  "Disabled shortly" is not a property a partition
+       switch can be built on: the next thing after a disable is another
+       partition running.  */
+
+    zx_gic_barrier();
+    (void) zx_gic_wait_redist_rwp(gic_ptr);
+}
+
+
+/**************************************************************************/
+/*  The read-backs                                                        */
+/*                                                                        */
+/*  Here for the same reason the stage-2 region set is read back: a write  */
+/*  that landed at the wrong offset does not fault, it does nothing, and a */
+/*  partition that silently never receives its timer looks exactly like a  */
+/*  kernel whose scheduler does not work.  Three reads at boot are cheap   */
+/*  next to that.                                                          */
+/**************************************************************************/
+
+uint32_t zx_gic_ppi_is_enabled(const ZX_GIC_LAYOUT *gic_ptr, uint32_t intid)
+{
+    if ((gic_ptr == (const ZX_GIC_LAYOUT *)0)
+        || (zx_gic_ppi_is_valid(intid) == 0U))
+    {
+        return 0U;
+    }
+
+    return ((ZX_GIC_REG(gic_ptr->zx_gic_sgi_base + ZX_GICR_ISENABLER0)
+             & (uint32_t)ZX_BIT(intid)) != 0U) ? 1U : 0U;
+}
+
+
+uint32_t zx_gic_ppi_is_group1(const ZX_GIC_LAYOUT *gic_ptr, uint32_t intid)
+{
+    if ((gic_ptr == (const ZX_GIC_LAYOUT *)0)
+        || (zx_gic_ppi_is_valid(intid) == 0U))
+    {
+        return 0U;
+    }
+
+    return ((ZX_GIC_REG(gic_ptr->zx_gic_sgi_base + ZX_GICR_IGROUPR0)
+             & (uint32_t)ZX_BIT(intid)) != 0U) ? 1U : 0U;
+}
+
+
+uint32_t zx_gic_ppi_priority(const ZX_GIC_LAYOUT *gic_ptr, uint32_t intid)
+{
+    zx_addr_t priority_word;
+
+    if ((gic_ptr == (const ZX_GIC_LAYOUT *)0)
+        || (zx_gic_ppi_is_valid(intid) == 0U))
+    {
+        return 0U;
+    }
+
+    priority_word = gic_ptr->zx_gic_sgi_base + ZX_GICR_IPRIORITYR
+                    + (zx_addr_t)(intid & ~3U);
+
+    return (ZX_GIC_REG(priority_word) >> ((intid & 3U) * 8U)) & 0xFFU;
+}
+
+
+/**************************************************************************/
+/*  zx_gic_priority_bits                                                  */
+/*                                                                        */
+/*  WHY A HYPERVISOR CARES HOW MANY PRIORITY BITS A GIC HAS.               */
+/*                                                                        */
+/*    Only the top bits of a priority byte are implemented; the rest read  */
+/*    back as zero.  Two priorities that differ only in the vanished bits  */
+/*    are therefore the SAME priority to the hardware -- and in a GIC,     */
+/*    equal priorities do not preempt each other.  So a hypervisor that    */
+/*    intends its own tick to outrank a partition's has to know how much   */
+/*    of the number it wrote survives.                                     */
+/*                                                                        */
+/*    It is discovered rather than assumed, because it is a property of an */
+/*    implementation: the Armv8-R AEM FVP keeps five, and no real part is  */
+/*    obliged to agree.                                                    */
+/*                                                                        */
+/*    The byte is BORROWED and PUT BACK.  Leaving all ones in it would set */
+/*    that INTID to the lowest possible priority, which is a legal value   */
+/*    and precisely the wrong one for a timer.                             */
+/**************************************************************************/
+
+uint32_t zx_gic_priority_bits(const ZX_GIC_LAYOUT *gic_ptr, uint32_t intid)
+{
+    zx_addr_t priority_word;
+    uint32_t  shift;
+    uint32_t  saved;
+    uint32_t  stuck;
+    uint32_t  bits = 0U;
+
+    if ((gic_ptr == (const ZX_GIC_LAYOUT *)0)
+        || (zx_gic_ppi_is_valid(intid) == 0U))
+    {
+        return 0U;
+    }
+
+    priority_word = gic_ptr->zx_gic_sgi_base + ZX_GICR_IPRIORITYR
+                    + (zx_addr_t)(intid & ~3U);
+    shift = (intid & 3U) * 8U;
+    saved = ZX_GIC_REG(priority_word);
+
+    ZX_GIC_REG(priority_word) = saved | (uint32_t)(0xFFU << shift);
+    stuck = (ZX_GIC_REG(priority_word) >> shift) & 0xFFU;
+    ZX_GIC_REG(priority_word) = saved;
+
+    zx_gic_barrier();
+
+    while ((stuck & 0x80U) != 0U)
+    {
+        bits++;
+        stuck = (stuck << 1) & 0xFFU;
+    }
+
+    return bits;
+}

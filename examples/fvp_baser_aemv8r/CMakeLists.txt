@@ -221,6 +221,7 @@ if(ZX_THREADX_SOURCE_DIR)
     function(zx_add_one_partition target_name)
         add_executable(${target_name} EXCLUDE_FROM_ALL
             ${ZX_COMMON_DIR}/zx_one_partition.c
+            ${ZX_COMMON_DIR}/zx_guest_launch.c
             ${ZX_COMMON_DIR}/zx_report.c
             ${ZX_COMMON_DIR}/zx_guest_image.S
             ${ZX_FVP_DIR}/zx_board.c
@@ -297,6 +298,83 @@ if(ZX_THREADX_SOURCE_DIR)
     zx_add_one_partition(zx_one_partition_granted.elf)
     target_compile_definitions(zx_one_partition_granted.elf PRIVATE
                                ZX_ONE_PROBE_GRANTED)
+
+    ###########################################################################
+    # The PREEMPTIVE partition: the same guest, granted a clock
+    ###########################################################################
+    #
+    # A separate image rather than another build of zx_one_partition.c, and
+    # the reason is what each of them MEASURES.  The cooperative image runs a
+    # pair of passes that differ in HCR.VM and nothing else, so its number is
+    # the cost of stage 2; adding a tick to it would have put a third variable
+    # into that pair.  This one keeps stage 2 on for every pass and measures
+    # two identical excursions instead, which is a repeatability number.
+    #
+    # They share the loader -- zx_guest_launch.c -- and they share the GUEST,
+    # byte for byte: whether a partition has a clock is a word in the mailbox,
+    # not a build option, so the image that demonstrates isolation and the
+    # image that demonstrates preemption load the same blob.
+    function(zx_add_preemptive target_name)
+        add_executable(${target_name} EXCLUDE_FROM_ALL
+            ${ZX_COMMON_DIR}/zx_preemptive_partition.c
+            ${ZX_COMMON_DIR}/zx_guest_launch.c
+            ${ZX_COMMON_DIR}/zx_report.c
+            ${ZX_COMMON_DIR}/zx_guest_image.S
+            ${ZX_FVP_DIR}/zx_board.c
+        )
+
+        add_dependencies(${target_name} zx_guest_a)
+
+        target_include_directories(${target_name} PRIVATE
+            ${ZX_FVP_DIR}
+            ${ZX_COMMON_DIR}
+        )
+
+        set_source_files_properties(${ZX_COMMON_DIR}/zx_guest_image.S
+            PROPERTIES
+                COMPILE_OPTIONS "-Wa,-I${ZX_GUEST_A_BUILD}"
+                OBJECT_DEPENDS  "${ZX_GUEST_A_BLOB}"
+        )
+
+        target_link_libraries(${target_name} PRIVATE
+            eclipse-threadx::zonex
+            zonex::warnings
+        )
+
+        target_link_options(${target_name} PRIVATE
+            -T${ZX_FVP_DIR}/zx_one_partition.lds
+            -nostartfiles
+            -Wl,-Map=${target_name}.map
+            ${ZX_LINK_QUIET_RWX}
+        )
+
+        set_target_properties(${target_name} PROPERTIES
+            LINK_DEPENDS ${ZX_FVP_DIR}/zx_one_partition.lds
+        )
+    endfunction()
+
+    # The image the suite runs: a real ThreadX kernel preempted by a timer
+    # interrupt inside one stage-2 confined partition.
+    zx_add_preemptive(zx_preemptive.elf)
+
+    # THE TWO NEGATIVE VERIFICATIONS, and they break different halves.
+    #
+    # Without the PPI enabled, the guest arms a timer whose interrupt can
+    # never be delivered -- and cannot enable it itself, which is the isolation
+    # claim showing up as a test result rather than as a sentence.  It must
+    # report that it never ticked.
+    zx_add_preemptive(zx_preemptive_no_ppi.elf)
+    target_compile_definitions(zx_preemptive_no_ppi.elf PRIVATE
+                               ZX_PREEMPT_NO_PPI)
+
+    # Without the CNTVOFF bookkeeping, the partition's clock counts every
+    # cycle the hypervisor spent between two excursions.  A claim whose pass
+    # condition is "the guest could not tell it was descheduled" has to be
+    # seen to fail, or a green run shows only that the arithmetic did not
+    # crash.
+    zx_add_preemptive(zx_preemptive_no_freeze.elf)
+    target_compile_definitions(zx_preemptive_no_freeze.elf PRIVATE
+                               ZX_PREEMPT_NO_FREEZE)
 else()
     message(STATUS
         "ZoneX: ZX_THREADX_SOURCE_DIR is empty, so the ThreadX guest images "
@@ -380,6 +458,35 @@ if(ZX_FVP_BASER_AEMV8R)
                              --elf $<TARGET_FILE:zx_one_partition_granted.elf>
                              --fvp ${ZX_FVP_BASER_AEMV8R}
                              --expect fail)
+
+            add_test(NAME zx-fvp-preemptive
+                     COMMAND ${Python3_EXECUTABLE} ${ZX_FVP_RUNNER}
+                             --elf $<TARGET_FILE:zx_preemptive.elf>
+                             --fvp ${ZX_FVP_BASER_AEMV8R})
+
+            # Both must report FAILED.  Same rule as every other negative
+            # build here: one that starts PASSING means the check it was
+            # built to violate has stopped detecting the violation.
+            foreach(zx_negative no_ppi no_freeze)
+                add_test(NAME zx-fvp-preemptive-${zx_negative}
+                         COMMAND ${Python3_EXECUTABLE} ${ZX_FVP_RUNNER}
+                                 --elf $<TARGET_FILE:zx_preemptive_${zx_negative}.elf>
+                                 --fvp ${ZX_FVP_BASER_AEMV8R}
+                                 --expect fail)
+            endforeach()
+
+            add_custom_target(zx-run-preemptive
+                COMMAND ${ZX_FVP_BASER_AEMV8R}
+                        -C cluster0.NUM_CORES=1
+                        -C bp.vis.disable_visualisation=1
+                        -C bp.terminal_0.start_telnet=0
+                        -C bp.pl011_uart0.out_file=-
+                        -C bp.pl011_uart0.unbuffered_output=1
+                        -a $<TARGET_FILE:zx_preemptive.elf>
+                DEPENDS zx_preemptive.elf
+                USES_TERMINAL
+                COMMENT "Running the ZoneX preemptive-partition image on FVP_BaseR_AEMv8R..."
+            )
 
             add_custom_target(zx-run-one-partition
                 COMMAND ${ZX_FVP_BASER_AEMV8R}

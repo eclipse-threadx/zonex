@@ -48,8 +48,8 @@
  * from examples/common/zx_guest_abi.h, because it has a raw blob and no
  * symbol table to look anything up in:
  *
- *     +0x00   the readback mailbox, one granule
- *     +0x40   one branch to the kernel's reset symbol -- the ERET target
+ *     +0x00   the readback mailbox, TWO granules
+ *     +0x80   one branch to the kernel's reset symbol -- the ERET target
  *
  * The ASSERTs at the end are what make those constants true rather than
  * hoped for.
@@ -99,7 +99,7 @@ MEMORY
 SECTIONS
 {
     /* ---------------------------------------------------------------- */
-    /*  +0x00  the mailbox.                                            */
+    /*  +0x00  the mailbox, two granules.                              */
     /*                                                                  */
     /*  LOADED, not NOLOAD, and that is what fixes the whole layout.    */
     /*  objcopy -O binary emits only sections with contents, so a       */
@@ -120,7 +120,7 @@ SECTIONS
     } > WINDOW
 
     /* ---------------------------------------------------------------- */
-    /*  +0x40  the entry branch, then everything executable.           */
+    /*  +0x80  the entry branch, then everything executable.           */
     /*                                                                  */
     /*  One stage-1 region covers all of it, read-only and executable.  */
     /*  Read-only at EL1 while stage 2 permits the write is the case    */
@@ -247,9 +247,15 @@ SECTIONS
 
     ASSERT(__zx_guest_mailbox_start == __zx_guest_window_base,
            "the mailbox is not at the base of the partition window")
-    ASSERT((__zx_guest_mailbox_end - __zx_guest_mailbox_start) == 64,
-           "the mailbox is not exactly one granule")
-    ASSERT(__zx_guest_code_start == (__zx_guest_window_base + 0x40),
+    /* TWO granules, and the number is ZX_GD_WINDOW_SIZE in
+       examples/common/zx_guest_abi.h.  A linker script cannot include a
+       C header, so the constant is restated here and asserted -- which
+       is the point: a mailbox that grew past its slot fails the LINK
+       rather than moving an entry point the hypervisor computes as a
+       compile-time constant.  */
+    ASSERT((__zx_guest_mailbox_end - __zx_guest_mailbox_start) == 128,
+           "the mailbox is not exactly two granules")
+    ASSERT(__zx_guest_code_start == (__zx_guest_window_base + 0x80),
            "the entry branch is not at the offset the hypervisor ERETs to")
     ASSERT(_start >= __zx_guest_code_start,
            "the kernel's reset symbol is outside the guest's code region")

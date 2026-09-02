@@ -29,11 +29,19 @@
 /*    partition its own CNTVOFF so that guest time freezes while the      */
 /*    partition is descheduled.  See docs/decisions.md D7.                */
 /*                                                                        */
-/*    Only ONE thing is implemented here so far, and it is the thing a    */
-/*    guest cannot do for itself.  Interrupt delivery, the partition tick */
-/*    and CNTVOFF arrive with time partitioning; see                      */
-/*    docs/armv8r-el2-reference.md for the verified register sheet the    */
-/*    code that lands here must be written against.                       */
+/*    Two jobs, and they are not the same kind of thing.                  */
+/*                                                                        */
+/*      zx_el2_prepare_guest_el1  the EL2-only configuration a guest       */
+/*                                needs and cannot perform itself.        */
+/*      the CNTVOFF bookkeeping   the mechanism that makes a descheduled   */
+/*                                partition's clock FROZEN rather than     */
+/*                                merely unread.                          */
+/*                                                                        */
+/*    The partition tick -- the hypervisor's OWN timer, on PPI 26, which  */
+/*    ends a window -- is not here yet, and cannot be until HCR.IMO is    */
+/*    set: with IMO clear a physical interrupt taken while a partition    */
+/*    runs is delivered straight to EL1, and the hypervisor would never   */
+/*    see its own timer.  See docs/decisions.md D24.                      */
 /*                                                                        */
 /*  MISRA C:2012 deviations (justified)                                   */
 /*                                                                        */
@@ -48,6 +56,66 @@
    floating-point unit -- to EL2.  Both reset SET.  */
 
 #define ZX_HCPTR_TCP        (ZX_C32(0x3) << 10)
+
+/* CNTV_CTL, which is EL1's register and is written from here only to STOP a
+   partition's timer.  ENABLE and IMASK are both cleared: masking alone would
+   leave the comparator running and its ISTATUS set, so a guest re-entered
+   later would find a timer it had not armed already expired.  */
+
+#define ZX_CNTV_CTL_ENABLE  ZX_BIT(0)
+#define ZX_CNTV_CTL_IMASK   ZX_BIT(1)
+
+/* How long to spin looking for the physical counter to move.  The counter
+   runs at 8 MHz on one target and 100 MHz on the other, so a counter that is
+   running advances within a handful of iterations at either; the bound is
+   generous because its only job is to be FINITE.  */
+
+#define ZX_COUNTER_MOVE_GUARD   100000U
+
+/* And the bound on a deliberate dwell.  Generous, because its only job is
+   to be finite: the caller has already been told whether the counter runs,
+   and a dwell that fell out here would mean it stopped in between.  */
+
+#define ZX_DWELL_GUARD          100000000U
+
+/* Where the partition's virtual time was when it was last frozen.  One
+   partition's worth, because ZoneX runs one at a time and
+   zx_el2_run_payload cannot nest -- the same constraint, in the same place,
+   and when it becomes an array indexed by partition this does too.  */
+
+static uint64_t zx_guest_time_frozen_at;
+
+/* And what the partition's OWN clock read at that instant.
+ *
+ * The pair is what makes the freeze checkable rather than merely done.
+ * CNTVOFF is a STATIC offset, so while a partition is suspended the physical
+ * counter moves and the offset does not: the subtraction drifts for exactly
+ * as long as the partition is away, and only the write on RESUME closes it.
+ * Sampling the virtual counter anywhere in between therefore measures the
+ * drift and not the correction -- which is how the first version of the
+ * preemptive image reported a partition's clock advancing by the whole gap
+ * on a run where the freeze was working perfectly.
+ *
+ * So the instant a partition STOPPED is recorded here, in the same breath as
+ * the physical count, and the invariant a caller can check is exact: the
+ * partition's virtual count after a resume equals this.  */
+
+static uint64_t zx_guest_virtual_at_freeze;
+
+/* And where the physical counter was when the partition was given the core
+   back.  The pair (suspended_at, resumed_at) is the interval the partition
+   was excluded from, as the MECHANISM measured it -- which is what CNTVOFF
+   is credited with, and therefore what a check of the freeze has to compare
+   the offset's movement against.
+
+   Reading the counter again from outside instead does NOT give the same
+   number, and the difference is not noise to be ignored: on the S32Z280 a
+   CNTPCT read crosses into an 8 MHz clock domain, so the handful of reads
+   between the resume and the check cost 64 counts of real time.  A check
+   built on that would be comparing the freeze against the cost of measuring
+   the freeze.  */
+
+static uint64_t zx_guest_time_resumed_at;
 
 
 /**************************************************************************/
@@ -106,4 +174,393 @@ void zx_el2_prepare_guest_el1(uint32_t counter_hz)
     __asm__ volatile("mcr p15, 0, %0, c14, c0, 0"
                      : : "r"(counter_hz) : "memory");
     __asm__ volatile("isb");
+}
+
+
+/**************************************************************************/
+/*                                                                        */
+/*  FUNCTION                                               RELEASE        */
+/*                                                                        */
+/*    zx_read_cntpct                                       Cortex-R52     */
+/*                                                                        */
+/*  DESCRIPTION                                                           */
+/*                                                                        */
+/*    The PHYSICAL counter, which no partition can reach.                 */
+/*                                                                        */
+/*    64-bit, so in AArch32 it is an MRRC into a register pair rather      */
+/*    than an MRC.  The pair is not atomic across the halves on every      */
+/*    implementation, which is why the low half is read first and the      */
+/*    high half checked for a carry -- a naive read that caught the low    */
+/*    half wrapping would produce a value roughly four billion counts in   */
+/*    the past, and every interval computed from it would be nonsense.     */
+/*                                                                        */
+/**************************************************************************/
+
+uint64_t zx_read_cntpct(void)
+{
+    uint32_t low;
+    uint32_t high;
+    uint32_t settled;
+
+    /* Read until two consecutive reads agree about the HIGH half.  When they
+       do, the low half that came with the second one belongs to it.  */
+
+    __asm__ volatile("mrrc p15, 0, %0, %1, c14" : "=r"(low), "=r"(high));
+
+    for (;;)
+    {
+        settled = high;
+
+        __asm__ volatile("mrrc p15, 0, %0, %1, c14" : "=r"(low), "=r"(high));
+
+        if (high == settled)
+        {
+            break;
+        }
+    }
+
+    return ((uint64_t)high << 32) | (uint64_t)low;
+}
+
+
+/**************************************************************************/
+/*                                                                        */
+/*  FUNCTION                                               RELEASE        */
+/*                                                                        */
+/*    zx_counter_is_running                                Cortex-R52     */
+/*                                                                        */
+/*  DESCRIPTION                                                           */
+/*                                                                        */
+/*    Whether the system counter is actually COUNTING.                    */
+/*                                                                        */
+/*    PROGRAMMING CNTFRQ DOES NOT START THE COUNTER, and the two are so    */
+/*    easily confused that this function exists mostly to keep them apart. */
+/*    CNTFRQ is a software-declared constant: nothing in either ZoneX      */
+/*    target reports its own counter frequency, so CNTFRQ says only what   */
+/*    somebody wrote there.  Whether the counter moves is a different      */
+/*    question with a different answer, and on the Armv8-R AEM FVP the     */
+/*    answer out of reset is NO -- the model leaves its counter stopped    */
+/*    and documents that firmware is expected to start it.                 */
+/*                                                                        */
+/*    The consequence of not checking is the worst kind of failure this    */
+/*    suite can produce: a guest that arms a timer, blocks waiting for it, */
+/*    and is killed by a harness timeout that names nothing.  So the       */
+/*    counter is read twice, with a BOUND, and a target whose counter is   */
+/*    stopped produces a reported check failure instead.                   */
+/*                                                                        */
+/**************************************************************************/
+
+uint32_t zx_counter_is_running(void)
+{
+    uint64_t first = zx_read_cntpct();
+    uint32_t guard;
+
+    for (guard = 0U; guard < ZX_COUNTER_MOVE_GUARD; guard++)
+    {
+        if (zx_read_cntpct() != first)
+        {
+            return 1U;
+        }
+    }
+
+    return 0U;
+}
+
+
+/**************************************************************************/
+/*                                                                        */
+/*  FUNCTION                                               RELEASE        */
+/*                                                                        */
+/*    zx_el2_dwell                                         Cortex-R52     */
+/*                                                                        */
+/*  DESCRIPTION                                                           */
+/*                                                                        */
+/*    Spend a known interval at EL2, measured on the physical counter.    */
+/*                                                                        */
+/*    WHY A HYPERVISOR WOULD EVER DELIBERATELY WAIT.  It would not.  This */
+/*    exists to make one claim MEASURABLE, and the claim is that a        */
+/*    partition's clock does not advance while the partition is not       */
+/*    running.  Checking that needs an interval in which the partition is */
+/*    not running -- and the interval has to be REAL, or the check passes */
+/*    for the wrong reason.                                               */
+/*                                                                        */
+/*    That is not hypothetical.  The first version of the preemptive      */
+/*    image measured the gap across a block of console output, on the     */
+/*    grounds that a polled UART is millions of cycles.  It is -- on      */
+/*    SILICON.  On the Armv8-R AEM FVP the console is semihosting, which  */
+/*    costs the model no simulated time at all, so the physical counter   */
+/*    advanced by ZERO across the gap and the virtual counter advanced by */
+/*    zero for that reason rather than because anything was frozen.  The  */
+/*    check was green and the build that DELIBERATELY BREAKS the freeze   */
+/*    was green with it.                                                  */
+/*                                                                        */
+/*    So the gap is made explicitly, in counter counts, and the image     */
+/*    also asserts that the physical counter DID advance -- because a     */
+/*    check whose subject did not happen is not a check.                  */
+/*                                                                        */
+/*    Bounded twice over: by the counter reaching its target, and by an   */
+/*    iteration count, so that a stopped counter cannot turn this into a  */
+/*    hang.  The caller has already been told whether the counter runs.   */
+/*                                                                        */
+/**************************************************************************/
+
+void zx_el2_dwell(uint32_t counts)
+{
+    uint64_t target = zx_read_cntpct() + (uint64_t)counts;
+    uint32_t guard;
+
+    for (guard = 0U; guard < ZX_DWELL_GUARD; guard++)
+    {
+        if (zx_read_cntpct() >= target)
+        {
+            break;
+        }
+    }
+}
+
+
+/**************************************************************************/
+/*                                                                        */
+/*  FUNCTION                                               RELEASE        */
+/*                                                                        */
+/*    zx_el2_guest_time_reset                              Cortex-R52     */
+/*    zx_el2_guest_time_suspend                                           */
+/*    zx_el2_guest_time_resume                                            */
+/*    zx_el2_guest_time_offset                                            */
+/*                                                                        */
+/*  DESCRIPTION                                                           */
+/*                                                                        */
+/*    CNTVOFF, which is the whole of temporal partitioning as a partition  */
+/*    can observe it.                                                     */
+/*                                                                        */
+/*    A partition reads time through the VIRTUAL counter, and the virtual  */
+/*    counter is defined as the physical one MINUS CNTVOFF.  CNTVOFF is    */
+/*    writable only at EL2.  So the hypervisor can decide, exactly, what   */
+/*    time a partition believes it is:                                    */
+/*                                                                        */
+/*      RESET    CNTVOFF = the physical count now, so the partition's own  */
+/*               clock reads zero.  Done when a partition is loaded, so    */
+/*               that every excursion of a guest begins from the same      */
+/*               point on its own clock -- which is what makes two runs    */
+/*               of one guest comparable at all.                          */
+/*      SUSPEND  record where the physical counter was.  The partition's   */
+/*               clock is now unchanging in the only sense that matters,   */
+/*               because nothing of the partition is executing to read it. */
+/*      RESUME   add everything that elapsed since to CNTVOFF.  The        */
+/*               virtual counter therefore reads exactly what it read when */
+/*               the partition stopped: from inside, no time passed.       */
+/*                                                                        */
+/*    WHY THE PHYSICAL TIMER COULD NOT DO THIS, which is D7 stated as      */
+/*    mechanism rather than as policy: there is no CNTPOFF on this         */
+/*    architecture.  Physical time is the system's and cannot be given a   */
+/*    per-partition origin, so a guest on the physical timer would see the */
+/*    gaps -- and a partition that can observe that it was not running is  */
+/*    a partition whose worst-case execution time cannot be argued about   */
+/*    from the inside.  ZoneX therefore leaves CNTHCTL.PL1PCTEN and        */
+/*    PL1PCEN clear (D23) and hands out the virtual timer instead.         */
+/*                                                                        */
+/*    WITH ONE PARTITION THE GAP BEING CLOSED IS THE HYPERVISOR'S OWN      */
+/*    WORK -- printing a report between two excursions, which on a polled  */
+/*    UART is millions of cycles.  That is a small demonstration of a      */
+/*    mechanism whose real use is the next one: with two partitions the    */
+/*    gap is the other partition's window, and closing it is what makes    */
+/*    the two clocks independent.                                         */
+/*                                                                        */
+/*  MISRA C:2012 deviations (justified)                                   */
+/*                                                                        */
+/*    Directive 4.3 -- CNTVOFF is reachable only through a 64-bit          */
+/*      coprocessor transfer, and every such access is encapsulated in     */
+/*      one of the two one-line accessors below.                           */
+/*                                                                        */
+/**************************************************************************/
+
+static uint64_t zx_read_cntvoff(void)
+{
+    uint32_t low;
+    uint32_t high;
+
+    __asm__ volatile("mrrc p15, 4, %0, %1, c14" : "=r"(low), "=r"(high));
+
+    return ((uint64_t)high << 32) | (uint64_t)low;
+}
+
+
+static void zx_write_cntvoff(uint64_t value)
+{
+    uint32_t low  = (uint32_t)(value & 0xFFFFFFFFU);
+    uint32_t high = (uint32_t)(value >> 32);
+
+    __asm__ volatile("mcrr p15, 4, %0, %1, c14"
+                     : : "r"(low), "r"(high) : "memory");
+    __asm__ volatile("isb" ::: "memory");
+}
+
+
+void zx_el2_guest_time_reset(void)
+{
+    uint64_t now = zx_read_cntpct();
+
+    zx_write_cntvoff(now);
+    zx_guest_time_frozen_at    = now;
+    zx_guest_time_resumed_at   = now;
+    zx_guest_virtual_at_freeze = 0U;
+}
+
+
+void zx_el2_guest_time_suspend(void)
+{
+    zx_guest_time_frozen_at    = zx_read_cntpct();
+    zx_guest_virtual_at_freeze = zx_guest_time_frozen_at - zx_read_cntvoff();
+}
+
+
+static void zx_el2_guest_time_resume_inner(uint32_t credit)
+{
+    uint64_t now = zx_read_cntpct();
+
+    /* The elapsed time is ADDED rather than the offset being recomputed from
+       scratch, because "how much time has this partition been given" is
+       cumulative and recomputing it would silently reset the partition's
+       clock on every entry -- which would look like a working freeze and
+       would in fact be a partition whose time never advances at all.
+
+       A resume that was never preceded by a suspend adds nothing: both were
+       set together by the reset above, so the subtraction is zero.  */
+
+    if ((credit != 0U) && (now > zx_guest_time_frozen_at))
+    {
+        zx_write_cntvoff(zx_read_cntvoff() + (now - zx_guest_time_frozen_at));
+    }
+
+    /* THE BOOKKEEPING HAPPENS EITHER WAY, and that is the whole reason the
+       uncredited variant exists rather than the caller simply not calling.
+       These two words are what a check of the freeze is measured against; a
+       path that left them stale would make the MEASUREMENT undefined instead
+       of making the MECHANISM wrong, and a negative build has to do the
+       second.  The first version of the broken build skipped the call
+       outright, and its "the partition could not observe the gap" check then
+       passed -- comparing a real interval against the time since boot.  */
+
+    zx_guest_time_resumed_at = now;
+    zx_guest_time_frozen_at  = now;
+}
+
+
+void zx_el2_guest_time_resume(void)
+{
+    zx_el2_guest_time_resume_inner(1U);
+}
+
+
+/**************************************************************************/
+/*                                                                        */
+/*  FUNCTION                                               RELEASE        */
+/*                                                                        */
+/*    zx_el2_guest_time_resume_uncredited                  Cortex-R52     */
+/*                                                                        */
+/*  DESCRIPTION                                                           */
+/*                                                                        */
+/*    A resume that does NOT give the partition back the time it spent    */
+/*    descheduled.  It exists so that the freeze can be seen to fail.     */
+/*                                                                        */
+/*    A claim whose pass condition is "the guest could not tell it was    */
+/*    descheduled" has to be capable of failing, or a green run shows     */
+/*    only that the arithmetic did not crash.  This is the defect, made   */
+/*    reproducible: everything else about the partition is identical, and */
+/*    its clock counts every cycle the hypervisor spent between two       */
+/*    windows.                                                            */
+/*                                                                        */
+/*    It keeps the BOOKKEEPING, which is what makes it a broken mechanism */
+/*    rather than a missing one.  Simply not resuming would leave the     */
+/*    recorded instants stale, and the observable check would then be     */
+/*    comparing a real interval against the time since boot -- passing    */
+/*    for a reason that has nothing to do with the freeze.  That was      */
+/*    observed before this function existed.                              */
+/*                                                                        */
+/**************************************************************************/
+
+void zx_el2_guest_time_resume_uncredited(void)
+{
+    zx_el2_guest_time_resume_inner(0U);
+}
+
+
+uint64_t zx_el2_guest_time_offset(void)
+{
+    return zx_read_cntvoff();
+}
+
+
+uint64_t zx_el2_guest_virtual_count(void)
+{
+    return zx_read_cntpct() - zx_read_cntvoff();
+}
+
+
+uint64_t zx_el2_guest_time_suspended_at(void)
+{
+    return zx_guest_time_frozen_at;
+}
+
+
+uint64_t zx_el2_guest_virtual_when_suspended(void)
+{
+    return zx_guest_virtual_at_freeze;
+}
+
+
+uint64_t zx_el2_guest_time_resumed_at(void)
+{
+    return zx_guest_time_resumed_at;
+}
+
+
+/**************************************************************************/
+/*                                                                        */
+/*  FUNCTION                                               RELEASE        */
+/*                                                                        */
+/*    zx_el2_guest_timer_stop                              Cortex-R52     */
+/*                                                                        */
+/*  DESCRIPTION                                                           */
+/*                                                                        */
+/*    Disarm a partition's virtual timer, from EL2.                       */
+/*                                                                        */
+/*    WHY THE HYPERVISOR DOES THIS AND NOT THE GUEST.  A partition can be  */
+/*    taken from at any instant -- by a stage-2 violation, and later by a  */
+/*    window expiring -- including with its timer armed.  The generic      */
+/*    timer asserts a LEVEL, so an expired comparator holds the PPI        */
+/*    asserted at the GIC indefinitely.  Nothing bad happens while the     */
+/*    hypervisor is running, because EL2 keeps PSTATE.I set and could not  */
+/*    take it anyway; the damage is at the NEXT ERET into a guest, which   */
+/*    would be interrupted before it had reinitialised its own kernel.     */
+/*                                                                        */
+/*    BOTH BITS ARE CLEARED, not just ENABLE.  Setting IMASK alone leaves  */
+/*    the comparator running and its ISTATUS set, so a guest re-entered    */
+/*    later would find a timer it never armed already expired -- which is  */
+/*    a tick it did not schedule, arriving at a moment it did not choose.  */
+/*                                                                        */
+/*    THIS IS PER-GUEST STATE and it is named here as such, because the    */
+/*    same is true of CNTV_CVAL and CNTV_TVAL: a partition switch that     */
+/*    saved neither would hand the next partition the previous one's       */
+/*    deadline.  Stopping the timer makes that harmless for one partition  */
+/*    and does not make it correct for two.                                */
+/*                                                                        */
+/**************************************************************************/
+
+void zx_el2_guest_timer_stop(void)
+{
+    uint32_t control;
+
+    /* Read-modify-write rather than a store of zero.  ISTATUS is read-only
+       and the other twenty-nine bits are reserved today, so the two are the
+       same instruction sequence with the same effect -- and a store would
+       stop being equivalent the day the architecture defines one of them.
+       Naming the two bits being cleared is also what makes the paragraph
+       above checkable against the code.  */
+
+    __asm__ volatile("mrc p15, 0, %0, c14, c3, 1" : "=r"(control));
+    control &= ~(uint32_t)(ZX_CNTV_CTL_ENABLE | ZX_CNTV_CTL_IMASK);
+    __asm__ volatile("mcr p15, 0, %0, c14, c3, 1"
+                     : : "r"(control) : "memory");
+    __asm__ volatile("isb" ::: "memory");
 }

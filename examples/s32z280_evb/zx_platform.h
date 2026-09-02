@@ -130,6 +130,22 @@
 #define ZX_S32Z_GIC_BASE            0x47800000UL
 #define ZX_S32Z_GIC_SIZE            0x00200000UL    /* 2 MB */
 
+/* The three frames inside it, at the offsets Cortex-R52 TRM Table 9-1 gives:
+   the distributor at the base, then a redistributor made of TWO consecutive
+   64 KB frames per core -- RD, which carries GICR_WAKER, and SGI, which
+   carries the enable, group, priority and configuration bits for INTIDs 0 to
+   31.  The same offsets as the Armv8-R AEM FVP's, which is not a coincidence:
+   they are architectural, and only the base differs.
+
+   ALL THREE STAY AT ZX_AP_EL2_RW_GUEST_NONE.  A partition reaches its own
+   interrupt through system registers and needs none of this mapped -- and it
+   must not have the SGI frame, which holds the enable bit for the
+   hypervisor's own timer as well as its own.  See docs/decisions.md D24.  */
+
+#define ZX_S32Z_GICD_BASE           (ZX_S32Z_GIC_BASE + 0x000000UL)
+#define ZX_S32Z_GICR_RD_BASE        (ZX_S32Z_GIC_BASE + 0x100000UL)
+#define ZX_S32Z_GICR_SGI_BASE       (ZX_S32Z_GIC_BASE + 0x110000UL)
+
 /* Memory-mapped register access.
    MISRA C:2012 Rule 11.4/11.6 deviation: casting an integer address to a
    volatile pointer is inherent to memory-mapped device access.  */

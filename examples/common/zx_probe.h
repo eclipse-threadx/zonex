@@ -138,6 +138,38 @@ void zx_board_report(void);
 
 ZX_NODISCARD uint32_t zx_board_counter_hz(void);
 
+/* START this board's system counter, if starting it is a thing this board
+ * needs.
+ *
+ * PROGRAMMING CNTFRQ DOES NOT START THE COUNTER, and the two are separate
+ * hooks because on the two ZoneX targets they have opposite answers.  The
+ * Armv8-R AEM FVP leaves its counter STOPPED at reset and documents that
+ * firmware is expected to start it, through a memory-mapped counter control
+ * frame; the S32Z280's runs out of reset, clocked through the RTU's own
+ * divider, and has no frame for a hypervisor to write.
+ *
+ * IT IS EL2'S JOB EITHER WAY.  The system counter is one per system: it is
+ * not a partition's to start, and a partition that could start or stop it
+ * would be deciding how fast time ran for every other partition.  This is the
+ * same division of labour as the GIC, and it arrives at the same place from a
+ * different direction.
+ *
+ * Whether it worked is NOT this function's answer.  zx_counter_is_running
+ * reads the counter twice and says whether it moved, which is the question
+ * that matters and is answered identically on both boards.  */
+
+void zx_board_counter_start(void);
+
+/* Where this board's GICv3 frames are.
+ *
+ * The Cortex-R52 layer knows the register offsets inside a GICv3, which are
+ * architectural; it does not and must not know where the frames sit, which is
+ * a board fact.  A board that had no GIC at all would leave the structure
+ * zeroed and zx_gic_el2_init would refuse -- which is a reported failure
+ * rather than three writes into address zero.  */
+
+void zx_board_gic_layout(ZX_GIC_LAYOUT *layout_ptr);
+
 /**************************************************************************/
 /*                    Symbols the linker script defines                   */
 /**************************************************************************/

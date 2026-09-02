@@ -78,6 +78,7 @@
 #include "zx_mm.h"
 #include "zx_partition.h"
 #include "zx_guest_console.h"
+#include "zx_guest_launch.h"
 
 /* THE GUEST'S HYPERCALL NUMBERS AND THE HYPERVISOR'S MUST AGREE, and this
    is the only translation unit that can see both spellings.  The guest is a
@@ -119,53 +120,32 @@ static ZX_MANIFEST_ENV  zx_env;
 static ZX_PARTITION_CB  zx_partition_a;
 static ZX_REGION        zx_mmio[ZX_BOARD_MAX_MMIO_REGIONS];
 
+/* Where partition A's guest lives, for the shared launcher in
+   zx_guest_launch.c.  Filled at run time rather than being a static
+   initialiser, because every field is the address of a LINKER symbol and the
+   address of a linker symbol is not a constant expression.  */
 
-/**************************************************************************/
-/*  The mailbox, as the hypervisor sees it.                               */
-/*                                                                        */
-/*  EL2 can read and write a partition's memory because stage-2 AP cannot  */
-/*  deny EL2 (docs/decisions.md D3) -- the same property that stops AP     */
-/*  from isolating partitions is what makes a hypervisor-to-guest mailbox  */
-/*  free.  It is at a fixed offset in the window rather than passed in a   */
-/*  register because a real kernel's reset path clobbers r0 long before    */
-/*  any of its C runs.                                                    */
-/**************************************************************************/
+static ZX_GUEST_LAUNCH  zx_launch;
 
-static volatile uint32_t *zx_mailbox(void)
+
+static void zx_describe_launch(void)
 {
-    return (volatile uint32_t *)(uintptr_t)
-        (zx_symbol_address(__zx_partition_a_start)
-         + ZX_GUEST_IMAGE_OFF_MAILBOX);
-}
-
-
-static uint32_t zx_mailbox_read(uint32_t offset)
-{
-    return zx_mailbox()[offset / 4U];
-}
-
-
-static void zx_mailbox_write(uint32_t offset, uint32_t value)
-{
-    zx_mailbox()[offset / 4U] = value;
-}
-
-
-/**************************************************************************/
-/*  zx_image_word -- one word out of the embedded guest image.            */
-/*                                                                        */
-/*  Read from the SOURCE and not from the window, deliberately: the point  */
-/*  of the header check is to refuse before anything is copied, and a      */
-/*  check performed on the copy would already have overwritten whatever    */
-/*  was there.                                                            */
-/**************************************************************************/
-
-static uint32_t zx_image_word(uint32_t offset)
-{
-    const volatile uint32_t *image = (const volatile uint32_t *)(uintptr_t)
+    zx_launch.zx_launch_window_base   =
+        zx_symbol_address(__zx_partition_a_start);
+    zx_launch.zx_launch_window_end    =
+        zx_symbol_address(__zx_partition_a_end);
+    zx_launch.zx_launch_image_start   =
         zx_symbol_address(__zx_guest_a_blob_start);
+    zx_launch.zx_launch_image_end     =
+        zx_symbol_address(__zx_guest_a_blob_end);
+    zx_launch.zx_launch_sentinel      = ZX_GUEST_A_SENTINEL;
+    zx_launch.zx_launch_partition_id  = ZX_PARTITION_A_ID;
+    zx_launch.zx_launch_partition_name = zx_partitions[0].zx_partition_name;
 
-    return image[offset / 4U];
+    /* This guest has no clock and reads none, so the freeze has nothing to
+       freeze -- and it is switched ON anyway, because the code path that
+       runs in every image is the code path that stays correct.  */
+    zx_launch.zx_launch_freeze_time   = 1U;
 }
 
 
@@ -226,229 +206,6 @@ static void zx_build_manifest(uint32_t board_regions)
        any other index would get a zero MAIR byte, which is Device-nGnRnE:
        memory that works, slowly, with nothing to fault on.  */
     zx_env.zx_env_attr_written_mask = 0x07U;
-}
-
-
-/**************************************************************************/
-/*  zx_check_image_header                                                 */
-/*                                                                        */
-/*  THE CHECK THAT CATCHES A GUEST BUILT FOR SOMEWHERE ELSE.              */
-/*                                                                        */
-/*  A guest is LINKED for one window; every absolute address inside it is  */
-/*  baked in.  The hypervisor holds a raw blob with no symbol table, so     */
-/*  without the header the guest carries there is no way to know which     */
-/*  window that was -- and the failure is slow, not immediate: the entry   */
-/*  branch is PC-relative, so a guest copied into the wrong window STARTS,  */
-/*  runs to its first literal pool load, and then faults at an address     */
-/*  that looks entirely reasonable in the report.                          */
-/*                                                                        */
-/*  The magic earns its four bytes twice over.  A window nobody wrote      */
-/*  reads as zero, and an .incbin whose linker input pattern matched       */
-/*  nothing produces an EMPTY section rather than an error -- so "the      */
-/*  header does not carry the magic" catches both a missing guest and a    */
-/*  wrong one.                                                             */
-/**************************************************************************/
-
-static uint32_t zx_check_image_header(void)
-{
-    uint32_t magic     = zx_image_word(ZX_GUEST_IMAGE_OFF_MAGIC);
-    uint32_t link_base = zx_image_word(ZX_GUEST_IMAGE_OFF_LINK_BASE);
-    uint32_t link_size = zx_image_word(ZX_GUEST_IMAGE_OFF_LINK_SIZE);
-    uint32_t window_base = (uint32_t)zx_symbol_address(__zx_partition_a_start);
-    uint32_t window_size = (uint32_t)(zx_symbol_address(__zx_partition_a_end)
-                                      - zx_symbol_address(__zx_partition_a_start));
-
-    zx_console_puts("\n--- the guest image declares what it was built for ---\n");
-    zx_note("magic                 ", magic);
-    zx_note("linked for base       ", link_base);
-    zx_note("linked for size       ", link_size);
-    zx_note("this window's base    ", window_base);
-    zx_note("this window's size    ", window_size);
-
-    zx_check("the embedded image carries the ZoneX guest magic, so a missing\n"
-             "         .incbin or an empty section is caught before anything runs",
-             (magic == (uint32_t)ZX_GUEST_IMAGE_MAGIC) ? 1U : 0U);
-
-    zx_check("the guest was linked for THIS window's base -- a guest built\n"
-             "         for another address starts and then faults at an\n"
-             "         address that looks perfectly reasonable",
-             (link_base == window_base) ? 1U : 0U);
-
-    zx_check("and for this window's size, so a guest that expected more room\n"
-             "         than the manifest grants is refused rather than\n"
-             "         discovered at its first stack overflow",
-             (link_size == window_size) ? 1U : 0U);
-
-    return ((magic == (uint32_t)ZX_GUEST_IMAGE_MAGIC)
-            && (link_base == window_base)
-            && (link_size == window_size)) ? 1U : 0U;
-}
-
-
-/**************************************************************************/
-/*  zx_load_partition -- copy the image and make it executable.           */
-/*                                                                        */
-/*  The COPY is here and the DECISION about where to copy is in            */
-/*  core/src/zx_partition_manager.c, which is the split zx_partition.h     */
-/*  describes: the arithmetic is testable on a workstation, the copy is    */
-/*  not.                                                                   */
-/*                                                                        */
-/*  A word copy, not a byte copy, and both ends are granule aligned by     */
-/*  construction -- the linker script asserts it at each end -- so the     */
-/*  alignment the word copy needs is a property of the build rather than   */
-/*  a run-time hope.  The length is rounded UP to a word because a blob     */
-/*  ending mid-word would otherwise lose its last bytes, and objcopy has    */
-/*  no obligation to pad.                                                  */
-/**************************************************************************/
-
-static void zx_load_partition(const ZX_PARTITION_LOAD *load_ptr)
-{
-    const volatile uint32_t *source = (const volatile uint32_t *)(uintptr_t)
-        load_ptr->zx_load_image_source;
-    volatile uint32_t *destination = (volatile uint32_t *)(uintptr_t)
-        load_ptr->zx_load_window_base;
-    uint32_t words = (uint32_t)((load_ptr->zx_load_image_length + 3U) / 4U);
-    uint32_t index;
-
-    for (index = 0U; index < words; index++)
-    {
-        destination[index] = source[index];
-    }
-
-    /* The bytes just written will be FETCHED as instructions, and on this
-       core the instruction side is not coherent with the data cache.  ZoneX
-       runs with its caches off today, so this is currently redundant -- and
-       it is here anyway, because the change that turns caches on will be one
-       line in the reset path made by somebody with no reason to think about
-       the loader.  A cold instruction cache over an address nothing has
-       executed HAPPENS TO WORK until an eviction lands differently.  */
-
-    zx_cache_sync_after_load(load_ptr->zx_load_window_base,
-                             load_ptr->zx_load_image_length);
-}
-
-
-/**************************************************************************/
-/*  zx_hand_over -- what the hypervisor tells the guest before it runs.   */
-/*                                                                        */
-/*  AFTER the copy, never before.  The mailbox is a LOADED section in the  */
-/*  guest image -- zeroed by the copy -- which is what keeps the blob's    */
-/*  offset zero equal to the window's offset zero.  Writing the handover   */
-/*  first would have it copied over.                                       */
-/**************************************************************************/
-
-static void zx_hand_over(uint32_t probe_target, uint32_t options)
-{
-    zx_mailbox_write(ZX_GD_PROGRESS, 0U);
-    zx_mailbox_write(ZX_GD_SCRATCH, ZX_GUEST_A_SENTINEL);
-    zx_mailbox_write(ZX_GD_TARGET, probe_target);
-    zx_mailbox_write(ZX_GD_PROBED, 0U);
-    zx_mailbox_write(ZX_GD_SHARED, 0U);
-    zx_mailbox_write(ZX_GD_OPTIONS, options);
-    zx_mailbox_write(ZX_GD_SEQUENCE, 0U);
-    zx_mailbox_write(ZX_GD_CHECKSUM, 0U);
-    zx_mailbox_write(ZX_GD_TICKS, 0U);
-    zx_mailbox_write(ZX_GD_THREAD_A, 0U);
-    zx_mailbox_write(ZX_GD_THREAD_B, 0U);
-    zx_mailbox_write(ZX_GD_MESSAGES, 0U);
-    zx_mailbox_write(ZX_GD_VERDICT, ZX_GV_NONE);
-    zx_mailbox_write(ZX_GD_FAULT_STATUS, 0U);
-    zx_mailbox_write(ZX_GD_FAULT_ADDRESS, 0U);
-    zx_mailbox_write(ZX_GD_STAGE1, ZX_GS_NONE);
-
-    __asm__ volatile("dsb" ::: "memory");
-}
-
-
-/**************************************************************************/
-/*  zx_run_guest -- one excursion, measured.                              */
-/*                                                                        */
-/*  The PMU counter is read either side rather than a timer, because       */
-/*  CNTFRQ reads zero on both ZoneX targets and there is nothing to        */
-/*  convert with.  Cycles are also the unit a worst-case-execution-time    */
-/*  argument is made in, so no conversion is wanted.                       */
-/**************************************************************************/
-
-static uint32_t zx_run_guest(uint32_t *cycles_ptr)
-{
-    zx_addr_t entry = zx_partition_a.zx_partition_load.zx_load_entry;
-    uint32_t  start;
-    uint32_t  outcome;
-
-    zx_fault_record_reset(zx_el2_fault_record());
-
-    /* The tag comes from the partition the hypervisor SCHEDULED, which is
-       the only party that knows it.  A guest that prefixed its own lines
-       could claim to be another partition, and every line of a captured log
-       would then be evidence of nothing.  */
-
-    zx_guest_console_attach(ZX_PARTITION_A_ID,
-                            zx_partitions[0].zx_partition_name);
-
-    start = zx_pmu_cycles();
-
-    /* The argument is zero and is not a mailbox pointer.  A real kernel's
-       reset path clobbers r0 within two instructions of the ERET, so
-       anything passed in it would be gone before any C ran -- which is
-       exactly why the mailbox is at a fixed offset in the window instead.  */
-
-    outcome = zx_el2_run_payload(entry, 0U);
-
-    *cycles_ptr = zx_pmu_cycles() - start;
-
-    zx_guest_console_detach();
-
-    zx_partition_returned(&zx_partition_a, zx_el2_fault_record());
-
-    return outcome;
-}
-
-
-/**************************************************************************/
-/*  zx_report_mailbox                                                     */
-/*                                                                        */
-/*  The checksum is verified before anything the guest reported is         */
-/*  believed, and that ordering is the point.  Three failures it catches:  */
-/*  a window nobody ever wrote (every field zero, which the magic in the   */
-/*  checksum makes fail), a guest torn off mid-update, and a value read    */
-/*  out of the WRONG partition's window -- the sentinel the hypervisor     */
-/*  itself planted is folded in, so a report can be attributed.           */
-/**************************************************************************/
-
-static uint32_t zx_report_mailbox(void)
-{
-    uint32_t progress = zx_mailbox_read(ZX_GD_PROGRESS);
-    uint32_t sequence = zx_mailbox_read(ZX_GD_SEQUENCE);
-    uint32_t checksum = zx_mailbox_read(ZX_GD_CHECKSUM);
-    uint32_t expected = (uint32_t)zx_guest_report_checksum(
-        zx_mailbox_read(ZX_GD_SCRATCH), progress, sequence,
-        zx_mailbox_read(ZX_GD_TICKS), zx_mailbox_read(ZX_GD_THREAD_A),
-        zx_mailbox_read(ZX_GD_THREAD_B), zx_mailbox_read(ZX_GD_MESSAGES),
-        zx_mailbox_read(ZX_GD_VERDICT));
-
-    zx_console_puts("\n--- what the guest reported, read out of its own "
-                    "memory ---\n");
-    zx_note("progress bits   ", progress);
-    zx_note("sequence        ", sequence);
-    zx_note("checksum        ", checksum);
-    zx_note("checksum expected", expected);
-    zx_note("sentinel        ", zx_mailbox_read(ZX_GD_SCRATCH));
-    zx_note("guest ticks     ", zx_mailbox_read(ZX_GD_TICKS));
-    zx_note("producer slices ", zx_mailbox_read(ZX_GD_THREAD_A));
-    zx_note("consumer slices ", zx_mailbox_read(ZX_GD_THREAD_B));
-    zx_note("messages carried", zx_mailbox_read(ZX_GD_MESSAGES));
-    zx_note("guest verdict   ", zx_mailbox_read(ZX_GD_VERDICT));
-    zx_note("stage-1 vector  ", zx_mailbox_read(ZX_GD_STAGE1));
-    zx_note("stage-1 DFSR    ", zx_mailbox_read(ZX_GD_FAULT_STATUS));
-    zx_note("stage-1 DFAR    ", zx_mailbox_read(ZX_GD_FAULT_ADDRESS));
-
-    zx_check("the guest's report is sealed: the sequence advanced and the\n"
-             "         checksum agrees, with the hypervisor's own sentinel\n"
-             "         folded into it -- so this is THIS partition's report,\n"
-             "         whole, and not a torn or misattributed one",
-             ((sequence != 0U) && (checksum == expected)) ? 1U : 0U);
-
-    return progress;
 }
 
 
@@ -553,6 +310,7 @@ ZX_NORETURN void zx_el2_main(void)
     /* ---------------------------------------------------------------- */
 
     zx_build_manifest(board_regions);
+    zx_describe_launch();
     zx_env.zx_env_region_budget = el2_regions;
 
     status = zx_manifest_verify(&zx_manifest, &zx_env, &fault);
@@ -605,7 +363,7 @@ ZX_NORETURN void zx_el2_main(void)
         zx_console_exit(zx_probe_failures());
     }
 
-    if (zx_check_image_header() == 0U)
+    if (zx_guest_image_check(&zx_launch) == 0U)
     {
         zx_console_puts("\n  *** REFUSING to launch this image.  It is either\n"
                         "  *** absent, truncated, or built for a different\n"
@@ -681,6 +439,15 @@ ZX_NORETURN void zx_el2_main(void)
                     "  CNTVOFF instead, which is what freezes a descheduled\n"
                     "  partition's clock.\n");
 
+    /* CNTVOFF, set so that the partition's own clock reads zero when it
+       starts.  This guest never reads it -- it takes no interrupts and asks
+       for no tick -- and the offset is programmed anyway, because CNTVOFF is
+       UNKNOWN out of reset and a register a guest can read must not be left
+       holding whatever the part came up with.  What it is FOR is next door,
+       in the preemptive image.  */
+
+    zx_el2_guest_time_reset();
+
     zx_pmu_enable();
 
     /* ---------------------------------------------------------------- */
@@ -718,8 +485,8 @@ ZX_NORETURN void zx_el2_main(void)
                     "  differed in order as well as in HCR.VM would measure\n"
                     "  neither.  This pass exists to be thrown away.\n");
 
-    zx_load_partition(&zx_partition_a.zx_partition_load);
-    zx_hand_over(0U, ZX_GO_QUIET);
+    zx_guest_image_load(&zx_partition_a.zx_partition_load);
+    zx_guest_hand_over(&zx_launch, 0U, ZX_GO_QUIET);
     zx_partition_loaded(&zx_partition_a);
 
     zx_check("the partition may be entered now that its image is loaded",
@@ -728,15 +495,15 @@ ZX_NORETURN void zx_el2_main(void)
     {
         uint32_t warm_cycles = 0U;
 
-        outcome = zx_run_guest(&warm_cycles);
+        outcome = zx_guest_run(&zx_launch, &zx_partition_a, &warm_cycles);
         zx_note("warm-up excursion, cycles (discarded)", warm_cycles);
     }
 
     zx_check("the warm-up guest reached its own verdict, which rules out the\n"
              "         loader, the entry point and the kernel before stage 2\n"
              "         is added as a variable",
-             ((zx_mailbox_read(ZX_GD_PROGRESS) & (uint32_t)ZX_GP_FINISHED)
-                  != 0U) ? 1U : 0U);
+             ((zx_guest_mailbox_read(&zx_launch, ZX_GD_PROGRESS)
+               & (uint32_t)ZX_GP_FINISHED) != 0U) ? 1U : 0U);
 
     zx_console_puts("\n=========================================================\n"
                     " PASS 1 of 3: the guest with HCR.VM CLEAR, and QUIET\n"
@@ -756,15 +523,15 @@ ZX_NORETURN void zx_el2_main(void)
                     "  in the mailbox -- so the run being measured is the run\n"
                     "  being demonstrated in pass 3.\n");
 
-    zx_load_partition(&zx_partition_a.zx_partition_load);
-    zx_hand_over(0U, ZX_GO_QUIET);
+    zx_guest_image_load(&zx_partition_a.zx_partition_load);
+    zx_guest_hand_over(&zx_launch, 0U, ZX_GO_QUIET);
 
     zx_check("the partition may be entered again after yielding",
              zx_partition_enter(&zx_partition_a));
 
-    outcome = zx_run_guest(&cycles_without_stage2);
+    outcome = zx_guest_run(&zx_launch, &zx_partition_a, &cycles_without_stage2);
     zx_note("outcome", outcome);
-    progress = zx_report_mailbox();
+    progress = zx_guest_report(&zx_launch);
 
     zx_check("with stage 2 off, the guest reached its own verdict",
              (((progress & (uint32_t)ZX_GP_FINISHED) != 0U)
@@ -786,8 +553,16 @@ ZX_NORETURN void zx_el2_main(void)
                               + ZX_GUEST_IMAGE_OFF_ENTRY);
 #endif
 #ifdef ZX_ONE_PROBE_GRANTED
+
+    /* ZX_GD_PROBE_SCRATCH and not offset zero, which is ZX_GD_PROGRESS.  The
+       probe WRITES a sentinel to whatever it is aimed at, so a target inside
+       the guest's own report corrupts the report -- and the seal then
+       certifies the corrupted value, which is worse than not checking at
+       all.  See the note on ZX_GD_PROBE_SCRATCH in zx_guest_abi.h.  */
+
     probe_target = (uint32_t)(zx_symbol_address(__zx_partition_a_start)
-                              + ZX_GUEST_IMAGE_OFF_MAILBOX);
+                              + ZX_GUEST_IMAGE_OFF_MAILBOX
+                              + ZX_GD_PROBE_SCRATCH);
 #endif
 
     zx_console_puts("\n=========================================================\n"
@@ -800,8 +575,8 @@ ZX_NORETURN void zx_el2_main(void)
                     "  traffic (none), one bit of hypervisor configuration\n"
                     "  apart.\n");
 
-    zx_load_partition(&zx_partition_a.zx_partition_load);
-    zx_hand_over(0U, ZX_GO_QUIET);
+    zx_guest_image_load(&zx_partition_a.zx_partition_load);
+    zx_guest_hand_over(&zx_launch, 0U, ZX_GO_QUIET);
 
     zx_stage2_enable();
     zx_note("HCR now", zx_read_hcr());
@@ -818,9 +593,9 @@ ZX_NORETURN void zx_el2_main(void)
     zx_check("the partition may be entered again after yielding",
              zx_partition_enter(&zx_partition_a));
 
-    outcome = zx_run_guest(&cycles_with_stage2);
+    outcome = zx_guest_run(&zx_launch, &zx_partition_a, &cycles_with_stage2);
     zx_note("outcome", outcome);
-    progress = zx_report_mailbox();
+    progress = zx_guest_report(&zx_launch);
 
     zx_check("with stage 2 in force, the guest did the same work and reached\n"
              "         the same verdict",
@@ -849,8 +624,8 @@ ZX_NORETURN void zx_el2_main(void)
         zx_console_puts("\n");
     }
 
-    zx_load_partition(&zx_partition_a.zx_partition_load);
-    zx_hand_over(probe_target, 0U);
+    zx_guest_image_load(&zx_partition_a.zx_partition_load);
+    zx_guest_hand_over(&zx_launch, probe_target, 0U);
 
     zx_check("the partition may be entered a third time",
              zx_partition_enter(&zx_partition_a));
@@ -858,12 +633,12 @@ ZX_NORETURN void zx_el2_main(void)
     {
         uint32_t loud_cycles = 0U;
 
-        outcome = zx_run_guest(&loud_cycles);
+        outcome = zx_guest_run(&zx_launch, &zx_partition_a, &loud_cycles);
         zx_note("outcome", outcome);
         zx_note("loud excursion, cycles", loud_cycles);
     }
 
-    progress = zx_report_mailbox();
+    progress = zx_guest_report(&zx_launch);
 
     zx_partition_report(&zx_partition_a);
 
@@ -909,7 +684,8 @@ ZX_NORETURN void zx_el2_main(void)
     zx_check("and the guest's OWN vectors saw nothing, so this was stage 2\n"
              "         and not stage 1 -- the two are reported by different\n"
              "         code at different privilege levels",
-             (zx_mailbox_read(ZX_GD_STAGE1) == ZX_GS_NONE) ? 1U : 0U);
+             (zx_guest_mailbox_read(&zx_launch, ZX_GD_STAGE1)
+              == ZX_GS_NONE) ? 1U : 0U);
     zx_check("the guest PC is inside the partition's window, so it resolves\n"
              "         against guest_a.map by hand",
              ((zx_el2_fault_record()->zx_fault_elr
@@ -942,12 +718,15 @@ ZX_NORETURN void zx_el2_main(void)
              (zx_fault_classify(zx_el2_fault_record()->zx_fault_hsr)
               == ZX_FAULT_HYPERCALL) ? 1U : 0U);
     zx_check("the guest's own vector reports a DATA ABORT at EL1",
-             (zx_mailbox_read(ZX_GD_STAGE1) == ZX_GS_DABT) ? 1U : 0U);
+             (zx_guest_mailbox_read(&zx_launch, ZX_GD_STAGE1)
+              == ZX_GS_DABT) ? 1U : 0U);
     zx_check("its DFAR is exactly the address it was asked to touch",
-             (zx_mailbox_read(ZX_GD_FAULT_ADDRESS) == probe_target) ? 1U : 0U);
+             (zx_guest_mailbox_read(&zx_launch, ZX_GD_FAULT_ADDRESS)
+              == probe_target) ? 1U : 0U);
     zx_check("its DFSR is non-zero, so the syndrome was captured rather than\n"
              "         the word merely being written",
-             (zx_mailbox_read(ZX_GD_FAULT_STATUS) != 0U) ? 1U : 0U);
+             (zx_guest_mailbox_read(&zx_launch, ZX_GD_FAULT_STATUS)
+              != 0U) ? 1U : 0U);
     zx_check("the probe did NOT survive",
              ((progress & (uint32_t)ZX_GP_PROBE_SURVIVED) == 0U) ? 1U : 0U);
 
@@ -997,10 +776,12 @@ ZX_NORETURN void zx_el2_main(void)
     zx_check("the semaphore granted once and refused the second get",
              ((progress & (uint32_t)ZX_GP_SEMAPHORE_OK) != 0U) ? 1U : 0U);
     zx_check("the guest published its own verdict, and it is PASSED",
-             (zx_mailbox_read(ZX_GD_VERDICT) == ZX_GV_PASSED) ? 1U : 0U);
+             (zx_guest_mailbox_read(&zx_launch, ZX_GD_VERDICT)
+              == ZX_GV_PASSED) ? 1U : 0U);
     zx_check("no stage-1 fault was taken, so the guest's own MPU permitted\n"
              "         everything the kernel legitimately did",
-             (zx_mailbox_read(ZX_GD_STAGE1) == ZX_GS_NONE) ? 1U : 0U);
+             (zx_guest_mailbox_read(&zx_launch, ZX_GD_STAGE1)
+              == ZX_GS_NONE) ? 1U : 0U);
 
     zx_console_puts("\n--- the guest printed through the hypervisor ---\n");
     zx_note("characters forwarded", zx_guest_console_characters());

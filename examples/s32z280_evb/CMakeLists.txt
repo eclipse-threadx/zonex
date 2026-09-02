@@ -156,6 +156,7 @@ if(ZX_THREADX_SOURCE_DIR)
     function(zx_add_s32z_one_partition target_name)
         add_executable(${target_name} EXCLUDE_FROM_ALL
             ${ZX_COMMON_DIR}/zx_one_partition.c
+            ${ZX_COMMON_DIR}/zx_guest_launch.c
             ${ZX_COMMON_DIR}/zx_report.c
             ${ZX_COMMON_DIR}/zx_guest_image.S
             ${ZX_S32Z_DIR}/zx_board.c
@@ -207,6 +208,78 @@ if(ZX_THREADX_SOURCE_DIR)
     zx_add_s32z_one_partition(zx_one_partition_granted.elf)
     target_compile_definitions(zx_one_partition_granted.elf PRIVATE
                                ZX_ONE_PROBE_GRANTED)
+
+    ###########################################################################
+    # The PREEMPTIVE partition: the same guest, granted a clock
+    ###########################################################################
+    #
+    # A separate image rather than another build of zx_one_partition.c,
+    # because of what each of them MEASURES: the cooperative one runs a pair
+    # of passes differing in HCR.VM and nothing else, so its number is the
+    # cost of stage 2, and a tick would have been a third variable in that
+    # pair.  This one keeps stage 2 on throughout and measures two identical
+    # excursions instead.
+    #
+    # They share the loader and they share the GUEST blob byte for byte:
+    # whether a partition has a clock is a word in the mailbox rather than a
+    # build option.
+    #
+    # ON THIS BOARD THE GIC IS THE INTERESTING PART.  It sits in the Normal
+    # write-through band of the background map, so it already costs a Device
+    # EL2 region -- which the model cannot show -- and every frame of it stays
+    # at guest-no-access.  A partition here reaches its timer through system
+    # registers and through nothing else.
+    function(zx_add_s32z_preemptive target_name)
+        add_executable(${target_name} EXCLUDE_FROM_ALL
+            ${ZX_COMMON_DIR}/zx_preemptive_partition.c
+            ${ZX_COMMON_DIR}/zx_guest_launch.c
+            ${ZX_COMMON_DIR}/zx_report.c
+            ${ZX_COMMON_DIR}/zx_guest_image.S
+            ${ZX_S32Z_DIR}/zx_board.c
+        )
+
+        add_dependencies(${target_name} zx_guest_a)
+
+        target_include_directories(${target_name} PRIVATE
+            ${ZX_S32Z_DIR}
+            ${ZX_COMMON_DIR}
+        )
+
+        set_source_files_properties(${ZX_COMMON_DIR}/zx_guest_image.S
+            PROPERTIES
+                COMPILE_OPTIONS "-Wa,-I${ZX_GUEST_A_BUILD}"
+                OBJECT_DEPENDS  "${ZX_GUEST_A_BLOB}"
+        )
+
+        target_link_libraries(${target_name} PRIVATE
+            eclipse-threadx::zonex
+            zonex::warnings
+        )
+
+        target_link_options(${target_name} PRIVATE
+            -T${ZX_S32Z_DIR}/zx_one_partition.lds
+            -nostartfiles
+            -Wl,-Map=${target_name}.map
+            ${ZX_LINK_QUIET_RWX}
+        )
+
+        set_target_properties(${target_name} PROPERTIES
+            LINK_DEPENDS ${ZX_S32Z_DIR}/zx_one_partition.lds
+        )
+    endfunction()
+
+    zx_add_s32z_preemptive(zx_preemptive.elf)
+
+    # The two negative verifications, breaking different halves: an interrupt
+    # the guest cannot enable for itself, and a clock the hypervisor forgets
+    # to give back.  Each must report FAILED.
+    zx_add_s32z_preemptive(zx_preemptive_no_ppi.elf)
+    target_compile_definitions(zx_preemptive_no_ppi.elf PRIVATE
+                               ZX_PREEMPT_NO_PPI)
+
+    zx_add_s32z_preemptive(zx_preemptive_no_freeze.elf)
+    target_compile_definitions(zx_preemptive_no_freeze.elf PRIVATE
+                               ZX_PREEMPT_NO_FREEZE)
 else()
     message(STATUS
         "ZoneX: ZX_THREADX_SOURCE_DIR is empty, so the ThreadX guest images "

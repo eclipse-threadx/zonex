@@ -854,10 +854,10 @@ upgrading a dependency should look like.
 
 ---
 
-## D23 — What ZoneX takes over from a guest's boot path · **settled 2 Sep 2026**
+## D23 — What ZoneX takes over from a guest's boot path · **settled 2 Sep 2026; amended when a partition was first given a clock**
 
-**Two things: `CNTFRQ` and `HCPTR.TCP10/TCP11`. One thing deliberately NOT:
-`CNTHCTL.PL1PCTEN` and `PL1PCEN`.**
+**Three things: `CNTFRQ`, `HCPTR.TCP10/TCP11`, and starting the system
+counter. One thing deliberately NOT: `CNTHCTL.PL1PCTEN` and `PL1PCEN`.**
 
 A standalone Cortex-R52 kernel resets *into* EL2 and configures it in its own
 boot path. Built as a guest it skips that block entirely — which is the whole
@@ -874,6 +874,24 @@ a guest's expectations.
   measured-and-cross-checked clock tree on the S32Z280.
 * **`HCPTR.TCP10/TCP11` are cleared**, so a guest may use its FPU without every
   access trapping to EL2. Both reset SET.
+* **The system counter is STARTED**, and this was added when a partition was
+  first granted a timer. It is a separate job from programming `CNTFRQ` and the
+  two are easy to confuse: `CNTFRQ` is a software-declared constant saying what
+  the counter *would* run at, and writing it does not make the counter move.
+  The Armv8-R AEM FVP leaves its counter stopped at reset and documents that
+  firmware is expected to start it, through a memory-mapped counter control
+  frame; the S32Z280's runs out of reset, clocked through the RTU's divider,
+  and has no frame to write. So it is a **board hook** with opposite answers on
+  the two targets, and it belongs at EL2 on both for the same reason the GIC
+  does: the system counter is one per system, and a partition able to start or
+  stop it would be deciding how fast time ran for every other partition.
+
+  Whether it worked is a **third** question, asked separately and answered the
+  same way on both boards: read `CNTPCT` twice and see whether it moved. That
+  check earns its place — a guest that arms a timer against a stopped counter
+  blocks for ever, and the run ends in a harness timeout, which is the least
+  informative failure this suite can produce and looks identical to a broken
+  loader, a broken context switch and a broken GIC.
 
 **And the omission is the interesting half.** A standalone kernel opens
 `CNTHCTL.PL1PCTEN` and `PL1PCEN`, because it owns the physical timer. A
@@ -895,3 +913,76 @@ rather than by a fault.
 The same list, written from the kernel's side, is at the `#ifndef` in the
 S32Z280 `entry.S` — next to the code it replaces, which is where somebody
 adding a third board will be looking.
+
+---
+
+## D24 — Who owns the GIC, and how a partition's interrupt is delivered · **settled, and measured on both targets**
+
+**ZoneX owns every byte of memory-mapped GIC state. A partition gets its own
+CPU interface, which on this part is system registers, and nothing else.
+`HCR.IMO`, `FMO` and `AMO` stay CLEAR, so a physical interrupt taken while a
+partition is running is delivered straight to EL1 with no hypervisor
+involvement at all.**
+
+### The division, and why it is sharper than "shared things belong to EL2"
+
+A GICv3 interrupt reaches a thread through three pieces of state:
+
+| | scope | reachable by |
+|---|---|---|
+| distributor | one per system | memory-mapped |
+| redistributor | one per **core**, two 64 KB frames | memory-mapped |
+| CPU interface | per exception level | **system registers** |
+
+Only the third is a partition's. The obvious argument for keeping the first two
+is that they are shared, which is true and weak. The real argument is specific:
+the redistributor's SGI frame holds the enable, group, priority and
+edge/level bits for all thirty-two SGIs and PPIs of that core — **including
+PPI 26, the hypervisor's own timer**, which is what will end a partition's
+window. A partition with a writable mapping of that frame could clear that bit
+and never be descheduled again. Nothing about that is a memory-isolation
+failure, so no region set would show it; it is the temporal-determinism claim,
+gone.
+
+The sketch this work started from expected the opposite — that a guest would be
+given a mapped GIC region and would call the port's own `gicv3_enable_ppi`.
+That would have cost two extra EL2 regions on the S32Z280 (the window has to be
+split three ways, because PMSAv8-R has no region priority) *and* opened the
+hole above. Doing it the other way costs the partition nothing: **its manifest
+is unchanged, and it is granted no device region of any kind.** That is the
+strongest form the claim could take, and it is why it is worth stating as a
+decision rather than as an implementation detail.
+
+**ZoneX disables all thirty-two before it enables one.** An enable bit is not
+reset state a hypervisor may assume: on silicon ZoneX is not the first thing to
+run. `GICR_ICENABLER0` is write-one-to-clear, so all ones is a single write and
+touches nothing outside this core's SGIs and PPIs.
+
+### `HCR.IMO` clear, and what it costs
+
+With `IMO` clear the guest's timer PPI is a **physical** interrupt taken
+directly to EL1. No injection, no List Register, no EL2 work per tick. The
+Cortex-R52 does implement the virtual CPU interface — `ICH_HCR`, `ICH_VTR` and
+four List Registers, confirmed on both targets — so injection is available and
+is deliberately not used.
+
+**The cost is stated here because it becomes the next phase's whole problem:**
+with `IMO` clear the hypervisor cannot take an interrupt of its own while a
+partition is running either, *including its own timer*. A hypervisor tick that
+ENDS a partition's window therefore needs `IMO` SET — and with `IMO` set, every
+guest interrupt has to be injected through a List Register. That is a change to
+`zx_gic.c` and `zx_trap_handler.S` and to **no guest**, which is exactly why the
+shape here is worth having first: it is the version whose correctness can be
+established before the delivery mechanism becomes complicated.
+
+### What a partition ends up touching
+
+`ICC_SRE`, `ICC_PMR`, `ICC_BPR1`, `ICC_IGRPEN1`, `ICC_IAR1`, `ICC_EOIR1`,
+`CNTV_TVAL`, `CNTV_CTL`, `CNTVCT`, `CNTFRQ`. All system registers. `ICC_IGRPEN0`
+is deliberately left alone: Group 0 is delivered as FIQ and a partition is
+granted no Group 0 interrupt, so a group it has nothing in is a group it has no
+business enabling.
+
+Verified on both targets: the partition receives INTID 27 and no other, and the
+hypervisor's own timer PPI reads back disabled.
+

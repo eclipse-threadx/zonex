@@ -34,25 +34,31 @@
 /*          one UART.  Resolved here: the guest hypercalls and the        */
 /*          hypervisor writes.  See console_putc below.                   */
 /*                                                                        */
-/*      2.  IT INITIALISES THE GIC DISTRIBUTOR.  The distributor is       */
-/*          shared across partitions, so two guests configuring it fight. */
-/*          NOT resolved here, because this guest takes no interrupts at  */
-/*          all -- see the note at guest_mpu_init.  The hypervisor has to */
-/*          take the distributor and hand each partition a virtual        */
-/*          interface.                                                    */
+/*      2.  IT INITIALISES THE GIC DISTRIBUTOR AND THE REDISTRIBUTOR.     */
+/*          Both are shared: there is one distributor for the system and  */
+/*          one redistributor per CORE, and every partition on this core  */
+/*          shares that redistributor.  Resolved here by NOT DOING IT AT  */
+/*          ALL.  The hypervisor owns every byte of GIC memory-mapped     */
+/*          state and enables a partition's timer PPI on its behalf; the  */
+/*          guest brings up only its own CPU INTERFACE, which on this     */
+/*          part is system registers and touches no device.  See          */
+/*          guest_interrupts_init below.                                  */
 /*                                                                        */
 /*      3.  IT USES THE PHYSICAL TIMER.  A partition's physical time      */
 /*          keeps running while it is descheduled, so a guest on the      */
 /*          physical timer can observe that it was not running -- which   */
-/*          is exactly the temporal-determinism claim, lost.  NOT         */
-/*          resolved here.  The virtual timer with a per-partition        */
-/*          CNTVOFF is what freezes a descheduled partition's clock.      */
+/*          is exactly the temporal-determinism claim, lost.  Resolved    */
+/*          here: this guest arms the VIRTUAL timer, whose counter the    */
+/*          hypervisor freezes with CNTVOFF while the partition is not    */
+/*          running.  The guest cannot reach the physical counter at all: */
+/*          CNTHCTL.PL1PCTEN and PL1PCEN are left clear at EL2 on         */
+/*          purpose.  See docs/decisions.md D7 and D23.                   */
 /*                                                                        */
-/*    Only the first is answered by this step.  The other two are left as */
-/*    they are, deliberately and visibly, because a single cooperative    */
-/*    partition does not need them and inventing an answer before there   */
-/*    is a second partition to test it against is how a wrong answer gets */
-/*    written down.                                                       */
+/*    All three are now answered, and the shape of each answer is the     */
+/*    same: the guest keeps what is PER-THREAD or PER-CORE-INTERFACE and  */
+/*    gives up what is SHARED.  A partition may acknowledge an interrupt  */
+/*    and read a clock; it may not decide which interrupts exist or how   */
+/*    fast time runs.                                                     */
 /*                                                                        */
 /*  MISRA C:2012 deviations (justified)                                   */
 /*                                                                        */
@@ -62,6 +68,14 @@
 /*      inherent to describing memory to an MPU.                          */
 /*                                                                        */
 /**************************************************************************/
+
+/* tx_api.h is here for ONE constant: TX_TIMER_TICKS_PER_SECOND, which the
+   virtual timer's interval is derived from.  The kernel and its board
+   support have to agree about how long a tick is, and taking the number
+   from the kernel's own header is the only way that agreement cannot
+   drift.  */
+
+#include "tx_api.h"
 
 #include "zx_guest_abi.h"
 #include "zx_guest_bsp.h"
@@ -301,26 +315,298 @@ unsigned int guest_mpu_init(void)
 
 
 /**************************************************************************/
-/*  board_irq_handler / board_fiq_handler                                 */
+/*                    THE PARTITION'S OWN CPU INTERFACE                   */
 /*                                                                        */
-/*  THE PORT'S BOARD SUPPORT EXPECTS THESE TO EXIST, and a partition has   */
-/*  no interrupt controller to service.                                    */
+/*  WHAT A PARTITION IS ALLOWED TO TOUCH, AND WHY IT IS SO LITTLE.         */
 /*                                                                        */
-/*  They are all but unreachable: the guest replaces VBAR with its own     */
-/*  vector table before anything can raise an interrupt, so the port's own */
-/*  IRQ and FIQ vectors -- which is what calls these -- stop being the      */
-/*  ones installed.  They exist because the port's reset path REFERENCES    */
-/*  them on one of the two boards, and an unresolved symbol would fail the  */
-/*  link rather than the run.                                              */
+/*  A GICv3 interrupt reaches a thread through three pieces of state, and  */
+/*  they belong to three different owners:                                 */
 /*                                                                        */
-/*  Reaching one anyway means an interrupt arrived at a partition that has  */
-/*  none configured, in the window before its own vectors were installed.   */
-/*  So each records which vector it was and hands control back, rather than */
-/*  returning to a context that has no reason to be sound.  A handler that  */
-/*  silently returned would turn that into a partition that ran on with an  */
-/*  interrupt still asserted, which on this hardware is a storm rather than */
-/*  a glitch.                                                              */
+/*    the DISTRIBUTOR    one per system.  Decides which interrupts exist,  */
+/*                       where they are routed, and at what priority.      */
+/*    the REDISTRIBUTOR  one per CORE.  Holds the enable, group, priority  */
+/*                       and edge/level bits for the 32 SGIs and PPIs of   */
+/*                       that core -- INCLUDING every partition's, and     */
+/*                       including the hypervisor's own.                   */
+/*    the CPU INTERFACE  per exception level, and on this part it is       */
+/*                       entirely SYSTEM REGISTERS.  Priority mask, group  */
+/*                       enable, acknowledge, end-of-interrupt.            */
+/*                                                                        */
+/*  Only the third is a partition's.  The first two are memory-mapped and  */
+/*  the hypervisor keeps them at ZX_AP_EL2_RW_GUEST_NONE, so this file     */
+/*  could not reach them even if it tried -- and the reason is sharper     */
+/*  than "they are shared".  The redistributor's SGI frame holds the       */
+/*  enable bit for PPI 26, the hypervisor's OWN timer, which is what ends  */
+/*  a partition's window.  A partition with a writable mapping of that     */
+/*  frame could clear that bit and never be descheduled again.  That is    */
+/*  not a memory-isolation leak; it is the temporal-determinism claim,     */
+/*  gone, and no amount of stage-2 region programming would show it.       */
+/*                                                                        */
+/*  So the hypervisor enables this partition's timer PPI on its behalf,    */
+/*  before the ERET, and the guest does the four system-register writes    */
+/*  below.  Nothing here is a device access.                               */
+/*                                                                        */
+/*  ICC_SRE.SRE IS ALREADY SET.  ZoneX's reset path sets ICC_HSRE.SRE and  */
+/*  ICC_HSRE.Enable, and the second of those is what makes an EL1 access   */
+/*  to ICC_SRE legal rather than a trap to EL2.  Without SRE every other   */
+/*  ICC_* register is UNDEFINED and reading one takes an undefined-        */
+/*  instruction exception -- measured at EL2 during this work, and it      */
+/*  would present at EL1 as a guest dying in its own board support.  It is */
+/*  read-modify-written here anyway rather than assumed, because "somebody */
+/*  else set it" is the kind of dependency that is true until a boot path  */
+/*  is reordered.                                                          */
 /**************************************************************************/
+
+#define ICC_SRE_SRE             0x1UL
+#define ICC_IGRPEN1_ENABLE      0x1UL
+#define ICC_PMR_UNMASK_ALL      0xFFUL
+
+
+static unsigned long read_icc_sre(void)
+{
+    unsigned long value;
+    __asm__ volatile("mrc p15, 0, %0, c12, c12, 5" : "=r"(value));
+    return value;
+}
+
+
+static unsigned long read_icc_iar1(void)
+{
+    unsigned long value;
+    __asm__ volatile("mrc p15, 0, %0, c12, c12, 0" : "=r"(value));
+    return value;
+}
+
+
+static void write_icc_eoir1(unsigned long value)
+{
+    __asm__ volatile("mcr p15, 0, %0, c12, c12, 1" : : "r"(value) : "memory");
+}
+
+
+static void guest_interrupts_init(void)
+{
+    unsigned long sre = read_icc_sre() | ICC_SRE_SRE;
+
+    __asm__ volatile("mcr p15, 0, %0, c12, c12, 5" : : "r"(sre) : "memory");
+    __asm__ volatile("isb" ::: "memory");
+
+    /* Priority mask wide open, no subpriority grouping, Group 1 enabled.
+       The partition's interrupts are all Group 1 -- Group 0 is delivered as
+       FIQ and this partition is granted none -- so IGRPEN0 is deliberately
+       left alone rather than enabled "for symmetry": a group a partition has
+       no interrupt in is a group it has no business enabling.  */
+
+    __asm__ volatile("mcr p15, 0, %0, c4, c6, 0"
+                     : : "r"(ICC_PMR_UNMASK_ALL) : "memory");
+    __asm__ volatile("mcr p15, 0, %0, c12, c12, 3" : : "r"(0UL) : "memory");
+    __asm__ volatile("mcr p15, 0, %0, c12, c12, 7"
+                     : : "r"(ICC_IGRPEN1_ENABLE) : "memory");
+    __asm__ volatile("isb" ::: "memory");
+}
+
+
+/**************************************************************************/
+/*                      THE PARTITION'S OWN CLOCK                         */
+/*                                                                        */
+/*  CNTV, not CNTP, and the difference is the whole of temporal            */
+/*  partitioning.  The physical counter keeps running while a partition is */
+/*  descheduled, so a guest reading it could observe that it was not       */
+/*  running.  The virtual counter is the physical one minus CNTVOFF, and   */
+/*  CNTVOFF is the hypervisor's: it advances it by exactly the time the    */
+/*  partition spent off the core, so from inside, time simply did not pass */
+/*  while the partition was not running.  See docs/decisions.md D7.        */
+/*                                                                        */
+/*  The guest needs no permission for any of this.  EL1 access to the      */
+/*  virtual timer is not gated by anything -- it is the PHYSICAL one that  */
+/*  CNTHCTL.PL1PCTEN and PL1PCEN gate, and ZoneX leaves both CLEAR, so a   */
+/*  partition that tried CNTP would trap to EL2 rather than get an answer. */
+/*                                                                        */
+/*  TVAL AND NOT CVAL, deliberately.  TVAL is a 32-bit down-count loaded   */
+/*  relative to now, so re-arming is one register write with no 64-bit     */
+/*  arithmetic and no read of the counter -- which matters because the     */
+/*  re-arm happens inside the interrupt handler on every tick.  Writing    */
+/*  TVAL is also what deasserts the timer's LEVEL output; a handler that   */
+/*  acknowledged the interrupt without re-arming would take it again the   */
+/*  instant interrupts were re-enabled, for ever.                          */
+/**************************************************************************/
+
+#define CNTV_CTL_ENABLE         0x1UL
+#define CNTV_CTL_IMASK          0x2UL
+
+static unsigned long guest_tick_interval;
+
+
+unsigned long guest_counter_frequency(void)
+{
+    unsigned long value;
+    __asm__ volatile("mrc p15, 0, %0, c14, c0, 0" : "=r"(value));
+    return value;
+}
+
+
+unsigned long guest_virtual_count(void)
+{
+    unsigned long low;
+    unsigned long high;
+
+    /* CNTVCT is 64-bit and comes back as a register pair.  Only the low
+       half is returned: this is used to answer "is the counter moving at
+       all", and a 32-bit answer at 8 MHz wraps in nine minutes, which is
+       three orders of magnitude longer than the question needs.  */
+
+    __asm__ volatile("mrrc p15, 1, %0, %1, c14" : "=r"(low), "=r"(high));
+    (void) high;
+
+    return low;
+}
+
+
+void guest_tick_reload(void)
+{
+    __asm__ volatile("mcr p15, 0, %0, c14, c3, 0"
+                     : : "r"(guest_tick_interval) : "memory");
+}
+
+
+/**************************************************************************/
+/*  guest_counter_is_moving                                               */
+/*                                                                        */
+/*  THE PRE-FLIGHT THAT EXISTS BECAUSE THE ALTERNATIVE IS A HANG.          */
+/*                                                                        */
+/*  Programming CNTFRQ does not start the system counter, and on the       */
+/*  Armv8-R AEM FVP the counter is left STOPPED at reset -- the model      */
+/*  documents that firmware is expected to start it.  A guest that armed   */
+/*  its timer and went straight to tx_thread_sleep on a target whose       */
+/*  counter never started would wait for ever, and the run would end in a  */
+/*  harness timeout: the one failure mode that names nothing at all and    */
+/*  looks identical to a broken loader, a broken context switch and a      */
+/*  broken GIC.                                                            */
+/*                                                                        */
+/*  So the guest reads its own counter twice before it blocks on anything. */
+/*  The bound is what makes this a check rather than a second hang.  A     */
+/*  counter that is running advances on the first spin at either target's  */
+/*  frequency; one that is stopped never will, and the guest reports that  */
+/*  and hands the machine back.                                            */
+/*                                                                        */
+/*  The hypervisor checks the same thing before it hands over, and both    */
+/*  checks are worth having: ZoneX's says the counter it STARTED is        */
+/*  running, and this one says the counter the PARTITION can see is --     */
+/*  which is a different register, reached through CNTVOFF.                */
+/**************************************************************************/
+
+unsigned int guest_counter_is_moving(void)
+{
+    unsigned long first = guest_virtual_count();
+    unsigned long guard;
+
+    for (guard = 0UL; guard < 100000UL; guard++)
+    {
+        if (guest_virtual_count() != first)
+        {
+            return 1U;
+        }
+    }
+
+    return 0U;
+}
+
+
+/**************************************************************************/
+/*  board_init -- called by the port's _tx_initialize_low_level.          */
+/*                                                                        */
+/*  The port calls this because the guest is built with                    */
+/*  TX_R52_USE_THREADX_IRQ, which is also what routes the port's EL1 IRQ   */
+/*  vector into _tx_thread_context_save.  It runs with interrupts still    */
+/*  MASKED -- _tx_thread_schedule is what opens them -- so arming the      */
+/*  timer here cannot deliver a tick before the kernel can service one.    */
+/*                                                                        */
+/*  WHETHER A PARTITION HAS A CLOCK AT ALL IS THE HYPERVISOR'S DECISION,   */
+/*  and it arrives as a word in the mailbox rather than as a build option. */
+/*  With ZX_GO_TICK clear this function touches nothing: no CPU interface, */
+/*  no timer, no GIC.  That is what keeps a cooperative excursion of this  */
+/*  image byte-for-byte the same program as before it had a tick, so the   */
+/*  two are comparable -- and it means the run that demonstrates isolation */
+/*  and the run that demonstrates preemption are the same binary.          */
+/**************************************************************************/
+
+void board_init(void);
+
+
+void board_init(void)
+{
+    unsigned long frequency;
+
+    if ((guest_mailbox_read(ZX_GD_OPTIONS) & (unsigned long) ZX_GO_TICK) == 0UL)
+    {
+        return;
+    }
+
+    guest_interrupts_init();
+
+    /* CNTFRQ is a software-declared constant that the HYPERVISOR programmed:
+       it is writable only at the highest implemented exception level and
+       reads zero out of reset on both targets, so a guest booting at EL1
+       cannot write it.  Dividing by it without checking would be a divide by
+       zero on any target where ZoneX had not, which is why the guard is here
+       rather than a comment saying it cannot happen.  */
+
+    frequency = guest_counter_frequency();
+
+    if (frequency == 0UL)
+    {
+        guest_tick_interval = 0UL;
+        return;
+    }
+
+    guest_tick_interval = frequency / (unsigned long) TX_TIMER_TICKS_PER_SECOND;
+
+    guest_tick_reload();
+
+    __asm__ volatile("mcr p15, 0, %0, c14, c3, 1"
+                     : : "r"(CNTV_CTL_ENABLE) : "memory");
+    __asm__ volatile("isb" ::: "memory");
+}
+
+
+/**************************************************************************/
+/*  board_irq_handler -- the partition's whole interrupt service.          */
+/*                                                                        */
+/*  Called from the port's __tx_irq_processing_return, which means         */
+/*  _tx_thread_context_save has already saved the interrupted context and  */
+/*  interrupts are still masked.  It RETURNS -- the port branches to       */
+/*  _tx_thread_context_restore afterwards, and that is what turns a tick   */
+/*  into a thread switch.  An earlier version of this function yielded to  */
+/*  the hypervisor instead, which was right while a partition had no       */
+/*  interrupts and would now discard a thread's context on every tick.     */
+/*                                                                        */
+/*  THE ORDER IS THE WHOLE FUNCTION.                                       */
+/*                                                                        */
+/*    ACKNOWLEDGE FIRST.  Reading ICC_IAR1 raises the running priority to  */
+/*    this interrupt's own, which masks it and everything of equal or      */
+/*    lower priority.  Nothing else may happen before it.                  */
+/*                                                                        */
+/*    THE SPURIOUS INTID IS NOT AN INTERRUPT.  1023 means nothing was      */
+/*    actually pending, and it must NOT be given an end-of-interrupt: the  */
+/*    priority was never raised, so dropping it would corrupt the GIC's    */
+/*    running-priority stack rather than merely be redundant.              */
+/*                                                                        */
+/*    RE-ARM BEFORE SERVICING.  Writing CNTV_TVAL restarts the down-count  */
+/*    and DEASSERTS the timer's level output.  The generic timer asserts a */
+/*    level, not an edge, so a handler that ended the interrupt without    */
+/*    re-arming would be re-entered the instant interrupts reopened, and   */
+/*    again, until the stack was gone.                                     */
+/*                                                                        */
+/*    _tx_timer_interrupt LAST, because it is the part that can change     */
+/*    which thread runs next.                                             */
+/*                                                                        */
+/*  EVERY COUNTER HERE IS WRITTEN THROUGH THE MAILBOX rather than kept in  */
+/*  a static and copied out later.  A handler that stashed its counts in   */
+/*  .bss would lose all of them if the guest were taken by a fault, which  */
+/*  is precisely the run whose interrupt history is worth having.          */
+/**************************************************************************/
+
+extern void _tx_timer_interrupt(void);
 
 void board_irq_handler(void);
 void board_fiq_handler(void);
@@ -328,11 +614,59 @@ void board_fiq_handler(void);
 
 void board_irq_handler(void)
 {
+    unsigned long intid = read_icc_iar1() & 0xFFFFFFUL;
+
+    if (intid == (unsigned long) ZX_GUEST_SPURIOUS_INTID)
+    {
+        return;
+    }
+
+    if (intid == (unsigned long) ZX_GUEST_TIMER_INTID)
+    {
+        guest_mailbox_write(ZX_GD_TIMER_INTID, intid);
+        guest_mailbox_write(ZX_GD_IRQ_COUNT,
+                            guest_mailbox_read(ZX_GD_IRQ_COUNT) + 1UL);
+
+        guest_tick_reload();
+
+        write_icc_eoir1(intid);
+
+        _tx_timer_interrupt();
+
+        return;
+    }
+
+    /* Something the hypervisor never granted this partition.  Recorded by
+       INTID rather than as a flag, because "an interrupt arrived" sends a
+       reader nowhere and "INTID 26 arrived" says the hypervisor's own timer
+       was delivered to a guest.  ZX_GS_IRQ is set as well, so a run that
+       reports nothing else still says an unexpected interrupt happened.  */
+
+    guest_mailbox_write(ZX_GD_ODD_INTID, intid);
     guest_mailbox_write(ZX_GD_STAGE1,
                         guest_mailbox_read(ZX_GD_STAGE1) | ZX_GS_IRQ);
-    guest_yield();
+
+    write_icc_eoir1(intid);
 }
 
+
+/**************************************************************************/
+/*  board_fiq_handler                                                     */
+/*                                                                        */
+/*  A partition is granted no Group 0 interrupt, so nothing can deliver an */
+/*  FIQ to it: the guest never enables ICC_IGRPEN0, and the hypervisor     */
+/*  puts its timer PPI in Group 1.  This exists because the port's board   */
+/*  support references it, and an unresolved symbol would fail the LINK    */
+/*  rather than the run.                                                   */
+/*                                                                        */
+/*  Reaching it anyway means an assumption above is wrong, so it records   */
+/*  that and hands the machine back rather than returning into a context   */
+/*  with no reason to be sound.  Yielding is right HERE and would be wrong */
+/*  in the IRQ handler above, and the difference is that an IRQ is         */
+/*  expected: an unexpected FIQ has no re-arm, no acknowledge and no       */
+/*  handler behind it, so returning would leave it asserted and turn one   */
+/*  interrupt into a storm.                                                */
+/**************************************************************************/
 
 void board_fiq_handler(void)
 {
