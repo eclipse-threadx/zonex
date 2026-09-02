@@ -352,11 +352,17 @@ like the ThreadX one and does not mean the same thing.
 
 ---
 
-## D12 — C17, and ZoneX as the reference implementation · **settled**
+## D12 — C17 from the first commit · **settled; heading and one claim corrected 2 Sep 2026**
 
-**ZoneX is built to C17 from its first commit, with `CMAKE_C_EXTENSIONS OFF`,
-and it is the reference implementation of the suite-wide C17/CMake plan rather
-than an exception to it.**
+**ZoneX is built to C17 from its first commit, with `CMAKE_C_EXTENSIONS OFF`.**
+
+This entry originally said ZoneX "is the reference implementation of the
+suite-wide C17/CMake plan rather than an exception to it." That overstated it
+in both halves, and the claim was load-bearing in a later argument before
+anyone checked it — see D19. The plan makes no such claim: it says it is
+independent of the ZoneX roadmap, and asks only that ZoneX be started directly
+in C17 with the capability macros. And ZoneX *is* an exception on one point,
+recorded below.
 
 Every other component migrates to C17 from C99. ZoneX is the only one *born*
 there, which makes it the cheapest place to get the pattern right: the
@@ -364,6 +370,13 @@ capability macro block, `cmake_minimum_required(VERSION 3.28...4.2)`, the
 `ci-strict` preset with `CMAKE_COMPILE_WARNING_AS_ERROR`, and `FILE_SET
 HEADERS` are all in place from commit one. A later component copying the shape
 should copy ZoneX's.
+
+**Where ZoneX deviates.** The plan proposes `CMAKE_C_EXTENSIONS OFF` in the CI
+strict preset with extensions **ON** in the default build, so that ports
+relying on compiler builtins can be fixed incrementally. ZoneX has it off in
+the *default* build. That is stricter, it is worth keeping — a repository with
+no legacy ports to migrate pays nothing for it — but it is a deviation and not
+a reference implementation of that proposal.
 
 Two details that must survive any later edit of `common/inc/zx_api.h`:
 
@@ -557,3 +570,54 @@ person needs, and a report that quietly picked one reading would hide it.
 `HPFAR` is also not updated at all for a fault taken from Hyp mode, so the
 report omits any reading of it there rather than presenting a stale value as an
 address.
+
+---
+
+## D19 — What vocabulary the manifest is written in · **settled 2 Sep 2026, partly by measurement**
+
+**The suite's own type names, with `zx_addr_t` for addresses.** `UCHAR` for the
+region attribute fields, `UINT` for identifiers and counts, `ULONG` for tick
+counts, and ZoneX's own copy of the eight typedefs every ThreadX port carries.
+
+The manifest is the user-facing contract, so the cost of getting this wrong is
+paid by every later port. Two arguments for spelling it in `<stdint.h>` terms
+were considered and both fail:
+
+* *"ZoneX cannot reach those names without linking ThreadX."* It does not need
+  to. They are eight plain typedefs, and copying them is not a dependency.
+  ZoneX keeps its own copy so that a manifest is readable with no ThreadX
+  checkout present — which is also what lets the host suite build without one.
+  The copy is deliberately **unguarded**: identical typedef redeclaration is
+  legal from C11, so including both headers is well-formed, and a port that
+  ever respelled one of these would then fail loudly at the include rather
+  than diverge quietly.
+* *"ZoneX is the reference implementation of the C17 migration, so it should
+  set the precedent."* The suite-wide plan says the opposite — it is
+  independent of the ZoneX roadmap and asks only that ZoneX start at C17 with
+  the capability macros. It also settles the migration risk outright: it
+  changes no struct layout, no calling convention and no type name, and
+  regression-tests that a C99 application still compiles against the new
+  headers. Those names are load-bearing for that promise, and therefore
+  permanent. Adopting them costs nothing later. See the correction in D12.
+
+Addresses remain `zx_addr_t` (D5) and that is not an inconsistency: `ULONG` is
+`unsigned long`, which is not pointer-width on every ABI the suite targets.
+
+**The attribute fields are `UCHAR` and not an enum, and that was measured.** An
+enum reads better and would let the compiler check the value, so it was tried:
+
+| Toolchain | `sizeof` a four-value enum |
+|---|---|
+| `arm-none-eabi-gcc`, Cortex-R52 | **1 byte** (AAPCS short enums) |
+| ATfE clang, `armv8r-none-eabi` | **4 bytes** |
+| host gcc | **4 bytes** |
+
+ZoneX builds with all three, so an enum field would give the manifest a
+different layout in each lane — for a published contract, in a codebase that
+already asserts structure offsets from assembly. `UCHAR` is one byte in all
+three. Legal-value checking therefore lives in the validator, which is also
+where it can name the offender. The descriptor's layout is asserted rather
+than assumed: the four attribute bytes consecutive in every lane, and the
+whole descriptor pinned to 12 bytes on a 32-bit port, so that a layout change
+in either target toolchain fails the build instead of producing two images
+that disagree about the manifest.

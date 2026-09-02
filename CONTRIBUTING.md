@@ -103,12 +103,15 @@ ZoneX follows the convention the other Eclipse ThreadX repositories use: `script
 | `scripts/build_s32z280.sh`, `scripts/test_s32z280.sh` | NXP S32Z280-594EVB | Cross-builds the same images for silicon. Running them needs the board. |
 | `scripts/install.sh` | — | Installs the build and test dependencies on Ubuntu. |
 | `scripts/check_terminology.sh` | — | Rejects register and concept names that belong to other architectures. See below. |
+| `scripts/check_references.sh` | — | Rejects local absolute paths, citations of documents that are not in the repository, and a tracked agent-instruction file. |
 
 `CMakePresets.json` offers the same builds directly: `--preset default` for a warning-tolerant host build, `--preset ci-strict` for the host build with warnings as errors, `--preset coverage`, and `--preset fvp` / `--preset s32z280` for the cross builds.
 
 **Which suite does your change belong in?** ZoneX runs two, and the split is deliberate. Architecture-independent logic — the partition manifest and its validator, the partition tables, the schedule arithmetic — is covered by the host suite, which runs anywhere in seconds. Stage-2 MPU programming, the trap path, isolation and every timing claim are only true on the FVP and on silicon and are tested there; a host simulator would be testing a simulation of the mechanism rather than the mechanism. [`docs/decisions.md`](docs/decisions.md) D11 has the full reasoning, including why ZoneX does not hold the suite's usual coverage threshold over the whole repository.
 
 **A note on terminology.** ZoneX targets Armv8-R AArch32, where both stages of address control are region-based MPUs. Register names from the AArch64 system-register set, the translation-table registers, and RISC-V memory-protection vocabulary are wrong here by construction, and code that uses one was written against the wrong architecture. `scripts/check_terminology.sh` checks this mechanically and runs in CI; [`docs/armv8r-el2-reference.md`](docs/armv8r-el2-reference.md) holds the verified names, encodings and field layouts. Read it before writing anything that touches a register.
+
+**A note on what a comment may cite.** Write for someone who has only this repository. A comment that points at a local path, or at a numbered step of a document that is not here, tells that reader nothing and dates badly besides — and in a build script a local path means the script runs on one machine. Keep the fact and drop the citation. "A real guest comes later" survives both the reader and the schedule; a comment deferring to a numbered stage of an external plan survives neither. `scripts/check_references.sh` checks this mechanically and runs in CI.
 
 **ZoneX is written to C17**, not C99 — it is the one component of the suite born on that baseline. Extensions are off and `-Wpedantic` is in force, so GNU-only constructs are rejected.
 
@@ -120,7 +123,7 @@ Four GitHub Actions workflows. **Every one of them triggers on `pull_request` ag
 
 | Workflow | What it checks |
 | -------- | -------------- |
-| `host_tests.yml` | The host unit tests, built with warnings as errors, plus a coverage report. Runs `check_terminology.sh` as a separate job so its answer is unambiguous. |
+| `host_tests.yml` | The host unit tests, built with warnings as errors, plus a coverage report. Runs `check_terminology.sh` and `check_references.sh` in a separate job so their answers are unambiguous. |
 | `gcc_check.yml` | Cross-builds every Cortex-R52 configuration — FVP, S32Z280, hard float — with the Arm GNU Toolchain and warnings as errors. Compiles and links; executes nothing. |
 | `clang_check.yml` | The same sources with Arm Toolchain for Embedded. GNU `as` accepts non-canonical assembly forms that LLVM's assembler rejects, and ZoneX is going to be substantially assembly. |
 | `zx_fvp.yml` | Builds the Cortex-R52 images and **executes** them on the Armv8-R AEM FVP, judging each by its self-reported result. There is no static check for "the partition still runs". |

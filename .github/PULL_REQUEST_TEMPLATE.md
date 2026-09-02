@@ -35,5 +35,7 @@ SPDX-License-Identifier: MIT and CC0-1.0
 - [ ] Regression tests added or updated, or a stated reason why not.
 - [ ] Builds clean under the strict warning set (`--preset ci-strict`).
 - [ ] No A-profile or RISC-V terminology (`scripts/check_terminology.sh` passes).
+- [ ] No local paths, and no comment citing a document that is not in the
+      repository (`scripts/check_references.sh` passes).
 - [ ] API or behaviour changes have a matching documentation pull request
       against `rtos-docs-asciidoc`.
