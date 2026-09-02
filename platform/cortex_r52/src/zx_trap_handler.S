@@ -28,7 +28,10 @@
 @   +0x10, which makes the vector an INDEPENDENT witness to what HSR claims.
 @   Both are captured, and core/src/zx_fault.c reports it when they disagree.
 @
-@     0x12  HVC executed -- the hypercall seam
+@     0x12  HVC executed -- the hypercall seam.  Three immediates, and
+@           which one it is decides whether control goes back to the guest
+@           transparently (#0, the empty vector, and #2, a console
+@           character) or back to the hypervisor (#1, a yield).
 @     0x24  data abort ROUTED to Hyp -- a guest violating its partition,
 @           with the faulting address in HPFAR.  This is the event the
 @           Phase-0 demonstrator exists to show.
@@ -142,9 +145,12 @@ zx_el2_vectors:
     .type   zx_el2_hyp_trap_entry, %function
 zx_el2_hyp_trap_entry:
 
-    @ The guest's r0 and r1 are saved because the HVC #0 path below returns
-    @ to it transparently and must not have changed anything.  Every other
-    @ path discards them, explicitly, before it goes on.
+    @ The guest's r0 and r1 are saved because the two TRANSPARENT hypercall
+    @ paths below return to the guest and must not have changed anything --
+    @ and the console path needs the guest's r0 after clobbering it, which is
+    @ why it reads the character back off this stack rather than out of the
+    @ register.  Every other path discards the pair, explicitly, before it
+    @ goes on.
 
     push    {r0, r1}
 
@@ -153,9 +159,12 @@ zx_el2_hyp_trap_entry:
     cmp     r1, #ZX_ASM_EC_HVC
     bne     zx_el2_trap_not_hypercall
 
-    @ An HVC.  Which one is in HSR.ISS[15:0], and the two ZoneX uses mean
-    @ opposite things: #0 is the empty Phase-0 hypercall vector and returns
-    @ to the guest, #1 is a payload handing EL2 the machine back.
+    @ An HVC.  Which one is in HSR.ISS[15:0], and the three ZoneX uses do not
+    @ all mean the same kind of thing: #0 is the empty Phase-0 hypercall
+    @ vector and #2 is a console character, both of which RETURN to the
+    @ guest, while #1 is a guest handing EL2 the machine back.  The two
+    @ transparent ones are decoded first because they are the ones taken
+    @ most often -- a printing guest takes #2 once per character.
 
     ubfx    r1, r0, #0, #16
     cmp     r1, #ZX_ASM_HVC_IMM_NOP
@@ -170,6 +179,37 @@ zx_el2_hyp_trap_entry:
     eret
 
 zx_el2_trap_hvc_not_nop:
+    cmp     r1, #ZX_ASM_HVC_IMM_PUTC
+    bne     zx_el2_trap_hvc_not_putc
+
+    @ THE GUEST CONSOLE.  One character, in the guest's r0, printed by the
+    @ hypervisor and tagged with the partition it scheduled.  Handled HERE,
+    @ in the vector, rather than by returning a result code the way a fault
+    @ is: zx_el2_run_payload is a one-way transfer out, so returning through
+    @ it would end the guest's excursion, and a console write must leave the
+    @ guest exactly where it was.  This is a service and not a policy
+    @ decision, which is what makes it safe to answer in the vector.
+    @
+    @ EVERY CALLER-SAVED REGISTER IS THE GUEST'S HERE.  Hyp mode banks only
+    @ SP, LR and SPSR; r0-r12 are shared with EL1.  So r2, r3 and r12 are
+    @ saved as well as r0 and r1, and LR with them because BL overwrites
+    @ LR_hyp.  Four registers is 16 bytes, which keeps SP 8-byte aligned as
+    @ AAPCS requires at the call.  Nothing here captures the fault record:
+    @ a console write must not overwrite the evidence of the last fault.
+    @
+    @ UXTB, because the character is whatever the guest put in r0.  A guest
+    @ cannot be trusted to have narrowed it, and the upper bytes are not
+    @ part of the contract.
+
+    push    {r2, r3, r12, lr}
+    ldr     r0, [sp, #16]                       @ the guest's r0
+    uxtb    r0, r0
+    bl      zx_guest_console_putc
+    pop     {r2, r3, r12, lr}
+    pop     {r0, r1}                            @ balanced with the push
+    eret
+
+zx_el2_trap_hvc_not_putc:
     cmp     r1, #ZX_ASM_HVC_IMM_YIELD
     bne     zx_el2_trap_not_hypercall
 

@@ -103,14 +103,23 @@ case "${command}" in
         # code.
         #
         # So the floor covers the files where a real number is defensible:
-        # the manifest validator and the region-layout planner.  Both are
-        # pure functions with no hardware in them, both are reachable in
-        # full from a workstation, and neither has an excuse for an
-        # unreached line.  100% is not aspirational -- it is what they
-        # measure, on lines and on branches both.  A rule added without a
-        # case that fails it drops this and fails the build, which is the
-        # entire point: a validator rule nothing has ever seen reject
-        # anything is not a rule, it is a comment.
+        # the manifest validator, the region-layout planner, the partition
+        # loader and the guest console.  All four are pure functions with no
+        # hardware in them, all four are reachable in full from a
+        # workstation, and none has an excuse for an unreached line.  100%
+        # is not aspirational -- it is what they measure, on lines and on
+        # branches both.  A rule added without a case that fails it drops
+        # this and fails the build, which is the entire point: a validator
+        # rule nothing has ever seen reject anything is not a rule, it is a
+        # comment.
+        #
+        # The guest console is on this list for a reason worth stating: its
+        # whole output is TEXT that somebody reads at three in the morning
+        # with two partitions interleaving, and the properties that matter
+        # about it -- one tag per line, no dangling tag, a partial line
+        # closed before the hypervisor speaks -- are properties of the
+        # characters.  There is nowhere better than a workstation to assert
+        # those, and nowhere worse than a model log read by eye.
         #
         # A file joins this list when it becomes reachable in full, not
         # when it is written.  Adding one that cannot be is how a floor
@@ -122,8 +131,10 @@ case "${command}" in
         echo ""
         echo "Enforcing the coverage floor on the fully reachable core:"
         gcovr --root "${ROOT}" \
+              --filter "${ROOT}/core/src/zx_guest_console.c" \
               --filter "${ROOT}/core/src/zx_manifest_verify.c" \
               --filter "${ROOT}/core/src/zx_mm_setup.c" \
+              --filter "${ROOT}/core/src/zx_partition_manager.c" \
               --txt - \
               --fail-under-line 100 \
               --fail-under-branch 100

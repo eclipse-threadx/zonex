@@ -21,9 +21,26 @@
 /*                                                                        */
 /*  DESCRIPTION                                                           */
 /*                                                                        */
-/*    The contract between the hypervisor and the RELOCATABLE guest blob: */
-/*    where each entry point sits inside the blob, and what each word of  */
-/*    the partition's data window means.                                  */
+/*    The contract between the hypervisor and a guest image: where each   */
+/*    entry point sits, and what each word of the readback mailbox means. */
+/*                                                                        */
+/*    TWO KINDS OF GUEST SHARE THIS FILE, and the difference is worth      */
+/*    stating before either section is read.                              */
+/*                                                                        */
+/*      * The RELOCATABLE BLOB -- a few dozen instructions, assembled     */
+/*        once and copied into two partitions, which is what makes "set   */
+/*        A denies B and set B denies A" demonstrable.  Its entry points  */
+/*        are at fixed offsets and it reaches its data through a base     */
+/*        pointer handed to it in r0.                                     */
+/*      * A REAL KERNEL IMAGE -- a whole ThreadX, linked for one          */
+/*        partition's window, which owns its own vectors, stacks and      */
+/*        stage-1 MPU.  It cannot take a base pointer in r0, because its  */
+/*        reset path clobbers r0 long before any C runs, so its mailbox   */
+/*        is at a FIXED OFFSET IN ITS OWN WINDOW that both sides know.    */
+/*                                                                        */
+/*    The mailbox layout is shared between them deliberately: one         */
+/*    vocabulary for "what a partition reported" means one reader at the  */
+/*    hypervisor end, whichever kind of guest produced it.                */
 /*                                                                        */
 /*  WHY A RELOCATABLE BLOB AT ALL                                         */
 /*                                                                        */
@@ -111,6 +128,100 @@
 #define ZX_GD_SHARED                0x10U   /* EL2 writes: shared granule   */
 #define ZX_GD_PUBLISH_VALUE         0x14U   /* EL2 writes: what to publish  */
 
+/* THE SAME WORD, UNDER A SECOND NAME, for a kernel guest.
+ *
+ * A kernel guest has no publisher role -- the shared granule and its
+ * heartbeat belong to the relocatable blob, which is what needs two
+ * partitions running the same code.  So this word is free at that end, and
+ * it carries run options instead.
+ *
+ * Two names for one offset is worth one sentence of explanation and no more:
+ * each has exactly one reader, and both are in this file where a reader of
+ * either can see the other.  Adding a seventeenth word to a sixteen-word
+ * granule would have cost a second granule and a second stage-2 region.  */
+
+#define ZX_GD_OPTIONS               0x14U   /* EL2 writes: ZX_GO_*          */
+
+/* ZX_GO_QUIET exists so that "what does stage 2 cost a guest" can be
+   measured at all.
+ *
+ * The guest's console is one hypercall PER CHARACTER through a polled UART,
+ * which on silicon is several million cycles for a few hundred lines -- three
+ * orders of magnitude more than everything else the guest does.  A run with
+ * the console on cannot resolve the cost of stage 2 from noise; it can only
+ * bound it from above, which is a different and much weaker statement.
+ *
+ * So the measured passes run quiet and the demonstration pass runs loud.
+ * Both are the same guest image: the option is a word in the mailbox, not a
+ * build, precisely so that the run being measured is the run being
+ * demonstrated.  */
+
+#define ZX_GO_QUIET                 0x00000001U
+
+/* THE READBACK CONVENTION, and why it is a structure rather than one word.
+ *
+ * A single progress word is enough to say "the guest got somewhere".  It is
+ * not enough for a regression to BELIEVE what it read, and three separate
+ * failures make that difference concrete:
+ *
+ *   * A window nobody ever wrote reads as zero, and zero is a perfectly
+ *     plausible progress value.  "The guest never started" and "the guest
+ *     started and reported nothing" are different diagnoses.
+ *   * A run that reads a partition's memory AFTER the fact attributes the
+ *     last writer's value to everyone who shared the address.  That cost a
+ *     wrong conclusion during the Cortex-R52 Modules port work, where a
+ *     progress word in a shared granule was read back as one module's when
+ *     it was another's.
+ *   * A guest torn off mid-update -- descheduled, or faulted -- leaves a
+ *     half-written set of words that is individually valid and jointly
+ *     nonsense.
+ *
+ * So the guest publishes a SEQUENCE it increments on every update and a
+ * CHECKSUM over everything it reported, and the sentinel that identifies
+ * which partition wrote it is folded INTO that checksum.  A reader then has
+ * three independent things to check: the sequence advanced, the checksum
+ * agrees, and the identity inside it is the partition it thinks it is
+ * reading.  Cheap for a guest -- one add per field -- and it is what lets a
+ * later determinism regression compare two runs rather than merely observe
+ * one.
+ *
+ * The order matters at the guest end and is stated where it is implemented:
+ * every reported field is written BEFORE the sequence, and the sequence
+ * before the checksum, so a torn update fails the checksum instead of
+ * passing with stale content.  */
+
+#define ZX_GD_SEQUENCE              0x18U   /* guest writes: update count   */
+#define ZX_GD_CHECKSUM              0x1CU   /* guest writes: over the above */
+#define ZX_GD_TICKS                 0x20U   /* guest writes: its own ticks  */
+#define ZX_GD_THREAD_A              0x24U   /* guest writes: thread A count */
+#define ZX_GD_THREAD_B              0x28U   /* guest writes: thread B count */
+#define ZX_GD_MESSAGES              0x2CU   /* guest writes: queue traffic  */
+#define ZX_GD_VERDICT               0x30U   /* guest writes: ZX_GV_*        */
+
+/* What the guest's OWN vectors saw, when a stage-1 fault took it.
+ *
+ * A stage-1 fault never reaches EL2 -- that is the whole difference between
+ * the two stages, and it is what makes them distinguishable in a log -- so
+ * the only way the hypervisor learns of one is if the guest tells it.  These
+ * two words are DFSR and DFAR as the guest's abort handler read them, and
+ * they are the evidence that the guest's own MPU is live underneath stage 2
+ * rather than merely programmed.  */
+
+#define ZX_GD_FAULT_STATUS          0x34U   /* guest writes: its own DFSR    */
+#define ZX_GD_FAULT_ADDRESS         0x38U   /* guest writes: its own DFAR    */
+#define ZX_GD_STAGE1                0x3CU   /* guest writes: ZX_GS_* vector  */
+
+/* THESE THREE WORDS ARE DELIBERATELY OUTSIDE THE CHECKSUM, and the reason is
+   who writes them.  They are written by the guest's own exception vector,
+   which runs with no stack, no literal pool beyond the mailbox address, and
+   an obligation to disturb as little as possible -- computing a checksum
+   there would be absurd.  So the sealed snapshot covers what a THREAD
+   reported, and these carry what a HANDLER saw afterwards.
+
+   That is not a hole.  ZX_GD_STAGE1 is a single word naming which vector
+   fired, so a torn write of the three leaves it zero and the hypervisor
+   reads "no stage-1 fault" rather than a half-described one.  */
+
 #define ZX_GD_WINDOW_SIZE           0x40U
 
 /**************************************************************************/
@@ -131,6 +242,42 @@
 #define ZX_GP_PUBLISHED             0x08U
 #define ZX_GP_CONSUMED              0x10U
 
+/* The bits a REAL kernel guest sets, as it gets further.  Each one is a
+   milestone the one before it cannot fake: reaching bsp_main proves the
+   ERET landed and the boot path ran, reaching tx_application_define proves
+   the kernel initialised, and a thread running proves the ported context
+   switch works underneath stage 2.  A run that stops between two of them
+   says where it stopped, which a single "did it work" bit cannot.  */
+
+#define ZX_GP_BSP_MAIN              0x0100U /* the boot path reached C      */
+#define ZX_GP_KERNEL_ENTERED        0x0200U /* tx_application_define ran    */
+#define ZX_GP_THREADS_RAN           0x0400U /* both threads took a slice    */
+#define ZX_GP_QUEUE_OK              0x0800U /* the queue carried every item */
+#define ZX_GP_SEMAPHORE_OK          0x1000U /* the semaphore handed off     */
+#define ZX_GP_TICKING               0x2000U /* the guest's own tick advanced */
+#define ZX_GP_FINISHED              0x4000U /* the guest reached its verdict */
+
+/* WHAT THE GUEST'S OWN VECTORS SAW, in ZX_GD_STAGE1.
+ *
+ * A stage-1 fault is taken to EL1 and never reaches the hypervisor, which is
+ * the whole difference between the two stages -- so this word is the only
+ * channel by which one becomes visible at EL2, and a report of one is
+ * evidence that the guest's own MPU is LIVE rather than merely programmed.
+ *
+ * One value per vector rather than one "the guest faulted" flag, because a
+ * data abort, a prefetch abort and an undefined instruction send a reader to
+ * three different halves of a kernel.  Each is a single bit so that an ORR
+ * with an immediate assembles: the handlers that set them run before
+ * anything else, with no stack and no literal pool beyond the mailbox
+ * address.  */
+
+#define ZX_GS_NONE                  0x00000000U /* no stage-1 fault         */
+#define ZX_GS_DABT                  0x00000001U /* data abort at EL1        */
+#define ZX_GS_PABT                  0x00000002U /* prefetch abort at EL1    */
+#define ZX_GS_UNDEF                 0x00000004U /* undefined instruction    */
+#define ZX_GS_IRQ                   0x00000008U /* an IRQ with no handler   */
+#define ZX_GS_OTHER                 0x00000010U /* a vector nothing expects */
+
 /* The sentinel a guest writes into its own scratch word.  Distinct per
    partition so that EL2 reading both back cannot mistake one for the
    other -- which is the failure a single shared sentinel would hide.  */
@@ -139,5 +286,178 @@
 
 /* What the publisher puts in the shared granule.  */
 #define ZX_GUEST_HEARTBEAT          0x48420000U
+
+/**************************************************************************/
+/*                    A REAL KERNEL IMAGE IN A WINDOW                     */
+/**************************************************************************/
+
+/* Where things sit inside a partition window that holds a whole kernel.
+ *
+ * WHY A TRAMPOLINE AT OFFSET ZERO RATHER THAN THE KERNEL'S OWN _start.
+ * The hypervisor computes the ERET target as window_base + a constant, so it
+ * needs that constant at compile time.  A real kernel's reset symbol is
+ * wherever its linker put it, after its vector tables, and its address is
+ * therefore neither zero nor predictable.  Three ways out were considered:
+ *
+ *   * extract the ELF entry point at build time into a generated header --
+ *     works, and makes the hypervisor's manifest depend on a build step
+ *     whose output nothing checks;
+ *   * match the boot object's .text by input pattern in the linker script so
+ *     that _start lands first -- the pattern has to name an object file
+ *     suffix, which differs between toolchains, and a pattern that matches
+ *     nothing produces an empty section at whatever address the location
+ *     counter held rather than an error;
+ *   * put ONE BRANCH at the window base and let it reach the kernel's own
+ *     reset symbol PC-relatively.
+ *
+ * The third is four bytes, needs no build step, and its correctness is
+ * asserted by the guest's own linker script.  It is also the thing a real
+ * boot ROM does, which is a reasonable sign it is not a trick.
+ *
+ * WHY THE MAILBOX IS NOT IN .bss.  The kernel's reset path zeroes .bss
+ * before any C runs.  The hypervisor writes the mailbox before it ERETs --
+ * it has to, that is how the guest is told which partition it is -- so a
+ * mailbox in .bss would be handed over and then wiped by its recipient.  It
+ * therefore gets a section of its own, placed before .data, and the guest's
+ * linker script asserts it is outside the range the reset path clears.  */
+
+/* THE MAILBOX COMES FIRST, AND THE ORDER IS FORCED.
+ *
+ * Two constraints point the same way and a third decides between the
+ * remaining options.
+ *
+ *   * The mailbox may not sit INSIDE the guest's own executable region.
+ *     PMSAv8-R has no region priority at either stage, so a writable
+ *     granule overlapping a read-only executable region is two enabled
+ *     regions on one address -- CONSTRAINED UNPREDICTABLE, and an abort on
+ *     the S32Z280.  So the mailbox cannot be tucked between the entry
+ *     branch and the vector table.
+ *   * The mailbox may not be in .bss.  The kernel's reset path zeroes .bss
+ *     before any C runs, and the hypervisor writes the mailbox BEFORE it
+ *     ERETs -- that is how the guest is told which partition it is -- so a
+ *     mailbox in .bss would be handed over and then wiped by its recipient.
+ *   * It is LOADED rather than NOLOAD, which is what settles its position.
+ *     objcopy -O binary emits only sections with contents, so a NOLOAD
+ *     section at the front of the window would be skipped and the blob's
+ *     first byte would correspond to the SECOND section -- the whole image
+ *     shifted by a granule, copied to the window base, and executed from
+ *     the wrong place.  A loaded, zero-filled granule keeps the blob's
+ *     offset zero equal to the window's offset zero, which is the property
+ *     the loader's arithmetic rests on.
+ *
+ * Being loaded also means the copy leaves the mailbox ZEROED, which is a
+ * defined starting state rather than whatever the window held before.  The
+ * hypervisor writes its handover fields after the copy, never before.  */
+
+#define ZX_GUEST_IMAGE_OFF_MAILBOX  0x00U   /* one granule, ZX_GD_* inside  */
+#define ZX_GUEST_IMAGE_OFF_ENTRY    0x40U   /* the branch the ERET lands on */
+
+/* THE IMAGE HEADER, three words after the entry branch.
+ *
+ * A guest is LINKED for one window: every absolute address in it is baked
+ * in.  The hypervisor holds a raw blob with no symbol table, so without
+ * these words it has no way to know which window that was -- and the failure
+ * is slow rather than immediate, because the entry branch is PC-relative.
+ * A guest copied into the wrong window STARTS, runs to its first literal
+ * pool load, and then faults at an address that looks entirely reasonable in
+ * the report.
+ *
+ * The magic is worth its four bytes twice: an unwritten window reads as
+ * zero, and an .incbin whose linker input pattern matched nothing produces
+ * an EMPTY section rather than an error, so "the header does not carry the
+ * magic" catches both a missing guest and a wrong one.  */
+
+#define ZX_GUEST_IMAGE_OFF_LINK_BASE 0x44U  /* the window it was linked for */
+#define ZX_GUEST_IMAGE_OFF_LINK_SIZE 0x48U  /* the size it was linked to fit */
+#define ZX_GUEST_IMAGE_OFF_MAGIC     0x4CU  /* ZX_GUEST_IMAGE_MAGIC          */
+
+/* "ZXG" and a version.  The version is here so that a later ABI change is a
+   REFUSAL rather than a guest that starts and misbehaves: the loader can say
+   "this image was built against a different contract" and name both
+   numbers.  */
+
+#define ZX_GUEST_IMAGE_MAGIC        0x5A584731
+
+/* The verdict a kernel guest publishes into ZX_GD_VERDICT.  Distinct
+   non-zero values, so that an unwritten word -- zero -- is neither a pass
+   nor a fail but the absence of a verdict, which is what it actually is.  */
+
+#define ZX_GV_NONE                  0x00000000U
+#define ZX_GV_PASSED                0x600DBEEFU
+#define ZX_GV_FAILED                0x0BADBEEFU
+
+/**************************************************************************/
+/*                        The hypercalls a guest makes                    */
+/**************************************************************************/
+
+/* The HVC immediates, spelled WITHOUT an integer suffix so that the guest's
+   own assembly can write "hvc #ZX_HVC_GUEST_YIELD" directly.
+ *
+ * These are the same three values the hypervisor decodes, where they are
+ * called ZX_HVC_NOP, ZX_HVC_YIELD and ZX_HVC_PUTC.  Two spellings is one
+ * more than nobody wants, and it is unavoidable: the guest cannot include
+ * the hypervisor's own headers -- it is a separate program with a separate
+ * toolchain invocation and its own type vocabulary -- so the contract has to
+ * be restated at this end.
+ *
+ * What makes that safe rather than a latent divergence is that the ZoneX
+ * example which includes BOTH headers asserts they agree, at compile time.
+ * A guest built against a renumbered immediate would then fail the
+ * hypervisor's build rather than fail on the model.  */
+
+#define ZX_HVC_GUEST_NOP            0x0000
+#define ZX_HVC_GUEST_YIELD          0x0001
+#define ZX_HVC_GUEST_PUTC           0x0002
+
+/**************************************************************************/
+/*                     The readback checksum                              */
+/**************************************************************************/
+
+/* Folded over every field the guest reports, plus the sentinel that says
+   WHICH partition reported it.  Defined here, as one function, so that the
+   guest computing it and the hypervisor checking it cannot drift: two
+   implementations of a checksum agree until the day they do not, and the
+   day they do not looks exactly like a corrupted guest.
+
+   Deliberately additive and deliberately weak.  This is not a defence
+   against a hostile guest -- a partition can write whatever it likes into
+   its own window, and no checksum changes that.  It defends against three
+   accidents: a window nobody wrote (every field zero, which the magic makes
+   fail), a torn update (the sequence is folded in and is written last but
+   one), and a value read out of the WRONG partition's window (the sentinel
+   is folded in).  A stronger function would cost the guest more and catch
+   nothing further.
+
+   ZX_ASSEMBLER guard: this file is included from zx_payload.S, and an
+   assembler cannot read a function definition.  */
+
+#ifndef __ASSEMBLER__
+
+#define ZX_GUEST_REPORT_MAGIC       0x5A58F00DU
+
+static inline unsigned long zx_guest_report_checksum(unsigned long sentinel,
+                                                     unsigned long progress,
+                                                     unsigned long sequence,
+                                                     unsigned long ticks,
+                                                     unsigned long thread_a,
+                                                     unsigned long thread_b,
+                                                     unsigned long messages,
+                                                     unsigned long verdict)
+{
+    unsigned long sum = (unsigned long) ZX_GUEST_REPORT_MAGIC;
+
+    sum += sentinel;
+    sum += progress;
+    sum += sequence;
+    sum += ticks;
+    sum += thread_a;
+    sum += thread_b;
+    sum += messages;
+    sum += verdict;
+
+    return sum & 0xFFFFFFFFUL;
+}
+
+#endif /* __ASSEMBLER__ */
 
 #endif /* ZX_GUEST_ABI_H */

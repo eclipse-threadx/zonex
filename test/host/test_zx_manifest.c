@@ -60,6 +60,14 @@
 #define P1_DATA_BASE        0x00500000U
 #define P1_DATA_LIMIT       0x0050FFFFU
 
+/* A second executable region for partition 1, one granule wide and well
+   clear of every other range.  It exists so that "the image fits the
+   executable region the ENTRY is in" can be told apart from the weaker
+   "the image fits SOME executable region": with the entry moved here, a
+   large image still fits P1_CODE and must still be rejected.  */
+#define P1_TINY_CODE_BASE   0x00600000U
+#define P1_TINY_CODE_LIMIT  0x0060003FU
+
 #define SHARED_BASE         0x00300000U
 #define SHARED_LIMIT        0x0030003FU
 
@@ -368,9 +376,46 @@ static void test_runnability(void)
     partitions[1].zx_partition_image_end = IMAGE_START - 1U;
     EXPECT(ZX_MANIFEST_IMAGE_RANGE_INVALID, 1U, ZX_MANIFEST_NO_INDEX);
 
+    /* An image of ZERO bytes, which is what a linker input pattern that
+       matched nothing produces: an empty output section whose start and end
+       symbols come out equal.  A separate rule from a reversed range,
+       because it is a separate mistake and it is the one that builds, links
+       and reports a plausible size while containing no guest.  */
+    reset_manifest();
+    partitions[1].zx_partition_image_end = IMAGE_START;
+    EXPECT(ZX_MANIFEST_IMAGE_EMPTY, 1U, ZX_MANIFEST_NO_INDEX);
+
     reset_manifest();
     partitions[1].zx_partition_image_end = IMAGE_START + 0x200000U;
     EXPECT(ZX_MANIFEST_IMAGE_TOO_LARGE, 1U, ZX_MANIFEST_NO_INDEX);
+
+    /* THE CASE THE WEAKER RULE PASSED.  Partition 1 gains a second, tiny
+       executable region and its entry point moves into it, so the image is
+       far too big for the window it will actually be loaded into while
+       still fitting the OTHER executable region comfortably.
+       "The image fits some executable region" accepts this manifest and
+       the copy then overruns the window it targets; "the image fits the
+       region holding the entry" rejects it.  Without this case the
+       difference between those two rules is untested, and the tighter one
+       would be free to rot back into the looser one.  */
+    reset_manifest();
+    set_region(&p1_regions[3], P1_TINY_CODE_BASE, P1_TINY_CODE_LIMIT,
+               ZX_AP_EL2_RW_GUEST_RW, ZX_XN_EXECUTABLE, ATTR_NORMAL);
+    partitions[1].zx_partition_region_count = 4U;
+    partitions[1].zx_partition_entry        = P1_TINY_CODE_BASE;
+    EXPECT(ZX_MANIFEST_IMAGE_TOO_LARGE, 1U, ZX_MANIFEST_NO_INDEX);
+
+    /* And the same geometry with an image that DOES fit the tiny window,
+       which must be accepted.  A rule proved able to reject has to be
+       proved able to accept as well, or it is indistinguishable from one
+       that rejects everything.  */
+    reset_manifest();
+    set_region(&p1_regions[3], P1_TINY_CODE_BASE, P1_TINY_CODE_LIMIT,
+               ZX_AP_EL2_RW_GUEST_RW, ZX_XN_EXECUTABLE, ATTR_NORMAL);
+    partitions[1].zx_partition_region_count = 4U;
+    partitions[1].zx_partition_entry        = P1_TINY_CODE_BASE;
+    partitions[1].zx_partition_image_end    = IMAGE_START + 0x20U;
+    EXPECT(ZX_MANIFEST_SUCCESS, ZX_MANIFEST_NO_INDEX, ZX_MANIFEST_NO_INDEX);
 }
 
 static void test_time_partitioning(void)

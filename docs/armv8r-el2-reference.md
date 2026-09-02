@@ -530,18 +530,61 @@ in. A counter enabled without it reads zero forever, which is
 indistinguishable from a part with no PMU — so ZoneX asks whether the counter
 is advancing before it times anything.
 
-**Measured, 2 September 2026, Armv8-R AEM FVP:**
+**Measured, 2 September 2026, on both targets. The silicon figures are the ones
+to quote.**
+
+| | Armv8-R AEM FVP | S32Z280-594EVB |
+|---|---|---|
+| counter-read overhead, subtracted from both rows below | 5 | 84 |
+| `HPRENR` mask switch (a partition switch) | 13 | **235** |
+| one region descriptor write | 54 | **472** |
+| ratio, region write : mask | 4.2 | **2.0** |
+
+**The model's ratio is optimistic by a factor of two.** Both targets agree that
+a mask switch is the cheaper operation and that the gap is large enough for the
+design to rest on, but a per-region cost extrapolated from the FVP would have
+been half of what the part charges. The FVP is a functional model and its
+absolute numbers are not timing at all; they are reported because printing them
+on every run keeps the measurement path exercised on a machine with no board
+attached.
+
+235 cycles for a single register write also says where a partition switch's
+cost actually sits: in the `DSB`/`ISB` pair that has to retire before the next
+instruction fetch can depend on the new permissions, not in the write.
+
+**The silicon figures are reproducible bit for bit** across separate attach,
+load and run cycles — the same three hexadecimal values every time. That is
+worth knowing before anybody tries to average them: variance here would mean
+something else was going on.
+
+### How to measure an excursion, and the mistake that has to be avoided
+
+⚠ **The first execution of anything on a real core is not comparable to the
+second**, so a measured pair that differs in ORDER as well as in the thing
+under test measures neither.
+
+Measured, on the S32Z280, running one guest twice with the console suppressed:
 
 | | cycles |
 |---|---|
-| counter-read overhead | 5 |
-| `HPRENR` mask switch (a partition switch) | 13 |
-| one region descriptor write | 54 |
+| first excursion (cold) | 38,212 |
+| second excursion, `HCR.VM` clear | 27,154 |
+| third excursion, `HCR.VM` set | 27,052 |
 
-**These are model figures and are not timing.** The FVP is a functional model.
-They are reported because the *ratio* is the design argument — a mask switch
-against a per-region write — and because printing them on every run keeps the
-measurement path exercised. The numbers to quote come from silicon.
+The first version of that measurement ran only two passes and reported stage 2
+as **28% faster** than no stage 2 — 27,202 cycles against 38,002. A hypervisor
+does not give cycles back; the difference was entirely that one pass was the
+first and the other was the second. Warming the core with an excursion that is
+measured and discarded leaves the two comparable passes agreeing to 102 cycles
+in 27,000, which is the honest answer: **with region descriptors programmed
+once at boot, stage 2 costs a warmed guest nothing resolvable at this
+resolution.**
+
+⚠ **And a guest's console has to be off to measure anything at all.** With the
+`HVC` console enabled the same excursion costs 5,051,788 cycles — one trap per
+character through a polled UART, three orders of magnitude above everything
+else the guest does. A loud run can bound the cost of stage 2 from above and
+can never resolve it.
 
 ---
 
@@ -564,13 +607,151 @@ permission on it.
 | `0x08` | address to probe | EL2 |
 | `0x0C` | what the guest read | guest |
 | `0x10` | address of the shared granule | EL2 |
-| `0x14` | value to publish, or the sentinel to use | EL2 |
+| `0x14` | value to publish, or run options for a kernel guest | EL2 |
+| `0x18` | sequence, incremented on every update | guest |
+| `0x1C` | checksum over everything reported | guest |
+| `0x20` | the guest's own tick count | guest |
+| `0x24`-`0x2C` | per-thread counters and queue traffic | guest |
+| `0x30` | the guest's own verdict | guest |
+| `0x34`-`0x3C` | a stage-1 fault its own vectors saw | guest |
 
 The progress word carries the isolation claim **negatively**: the
 probe-survived bit being *clear* after an excursion is the evidence that
 stage 2 stopped the access. A check whose pass condition is the absence of
 something has to be able to fail, which is what the widened-region build
 exists to show.
+
+**A real kernel guest cannot take its window base in a register**, which is
+why the mailbox sits at a fixed offset in the window rather than being passed
+in. A kernel's reset path clobbers `r0` within two instructions of the `ERET`,
+long before any of its C runs. The relocatable probe blob is the opposite case
+— one program copied into two different windows — and takes a base pointer in
+`r0` for exactly that reason. Two guests, two disciplines, and mixing them up
+produces a guest that works in one partition and not the other.
+
+**The sequence and the checksum are what make a report believable**, as opposed
+to merely present. Three failures no single word can distinguish: a window
+nobody ever wrote reads as zero and zero is a plausible value; a guest torn off
+mid-update leaves words that are individually valid and jointly nonsense; and a
+report read out of the wrong partition's window looks exactly like a report.
+The guest writes every reported field, then the sequence, then a checksum with
+the **hypervisor's own sentinel folded into it** — so a torn update fails the
+sum, and a report can be *attributed* rather than merely found. It is
+deliberately weak arithmetic: a partition can write whatever it likes into its
+own window and no checksum changes that. It defends against accidents.
+
+The three words a stage-1 fault leaves are deliberately OUTSIDE the checksum,
+because they are written by the guest's own exception vector — which runs with
+no stack, no literal pool beyond the mailbox address, and an obligation to
+disturb as little as possible. Computing a checksum there would be absurd. A
+torn write of the three leaves the vector word zero, and the hypervisor then
+reads "no stage-1 fault" rather than a half-described one.
+
+
+---
+
+## `ELR_hyp` after an `HVC` points PAST the instruction
+
+**Measured, 2 September 2026, on both targets.** A handler that wants to return
+to the guest transparently does `ERET` and adjusts nothing.
+
+This had to be established rather than assumed, because the two plausible
+conventions differ by four bytes and the wrong one is an infinite loop rather
+than a fault. The measurement is the guest console: it is one `HVC` per
+character, and the guest prints several hundred lines and then reaches its own
+verdict. Had `ELR_hyp` pointed *at* the `HVC`, the first character would have
+re-executed the same instruction forever and the run would have ended in a
+timeout with one character of output.
+
+So it is not a register read that was inspected once; it is a property that
+every run of the one-partition image re-establishes, several thousand times,
+on both targets.
+
+---
+
+## A stage-1 fault and a stage-2 fault arrive in different places
+
+This is the fact that makes the two stages distinguishable in a log, and it is
+stronger than a decode: **they are reported by different code at different
+privilege levels.**
+
+| | Taken to | Syndrome in | How the hypervisor learns of it |
+|---|---|---|---|
+| stage-2 violation | **EL2** | `HSR` (`EC 0x24`), `HDFAR` | directly — the fault is its own |
+| stage-1 fault | **EL1** | the guest's `DFSR`, `DFAR` | only if the guest tells it |
+
+A stage-1 fault never reaches EL2 at all. The hypervisor's fault record is
+untouched by one, which is why "no stage-2 fault was captured" is a positive
+check in the stage-1 demonstration rather than the absence of evidence.
+
+**Measured, 2 September 2026, on both targets**, by having a guest write to its
+own code — permitted by stage 2, because the loader had to be able to write the
+window, and refused by the guest's own EL1 MPU:
+
+| | value |
+|---|---|
+| guest `DFSR` | `0x00000A0C` — DFSC `0x0C`, a permission fault |
+| guest `DFAR` | exactly the address written |
+| hypervisor `HSR` | `EC 0x12` — an `HVC`, the guest handing control back |
+| hypervisor fault record | no stage-2 capture |
+
+⚠ **Both stages are checked and the stricter wins** (TRM §8.3.1), which has a
+consequence for any test of stage 2 from a real kernel: **an address outside
+the guest's own EL1 regions is denied by stage 1 first**, and the abort goes to
+EL1. A guest whose own MPU stops at its window boundary therefore cannot
+demonstrate that stage 2 stops anything — stage 1 gets there first. To reach a
+stage-2 violation the guest has to grant *itself* the granule first, so that
+its own MPU says it owns memory the manifest never gave it. That is not a
+contrivance; it is the configuration a hypervisor exists to be right about.
+
+The same rule applies to attributes, not only to permissions: a partition
+window with a Device attribute makes every Normal-memory region a guest
+programs inside it Device too, which is a spectacular slowdown rather than a
+fault. Partition windows get Normal write-back attributes and mean it.
+
+---
+
+## A guest cannot program a TCM, on the S32Z280
+
+**`IMP_ATCMREGIONR` and `IMP_BTCMREGIONR` `ENABLEEL2` is silently IGNORED when
+written from EL1** — measured on both BTCM and CTCM during the Cortex-R52
+bring-up: the base took and bit 0 took while bit 1 stayed clear. There is no
+fault and no indication.
+
+The consequence for partitioning is that TCM programming is per-core state that
+belongs to EL2 now. A guest that places anything in a TCM depends on the
+hypervisor having programmed **and ECC-preloaded** it, because ECC is enabled on
+this part and a TCM location must be WRITTEN before it can be read (TRM 6.2.2).
+
+ZoneX's own images place nothing in a TCM and neither does its guest, so
+neither programs one — which is why this is recorded here rather than
+implemented. The register that has the same shape and does *not* have this
+problem is `IMP_PERIPHPREGIONR`: an EL1 write to it traps to EL2 when
+`HACTLR.PERIPHPREGIONR` is clear, so it fails loudly instead of quietly.
+
+---
+
+## `CNTFRQ` is EL2-writable only, and reads zero on both targets
+
+Not a documentation nicety: it is why a guest built to boot at EL1 needs the
+hypervisor to program it. `CNTFRQ` is writable only at the highest implemented
+exception level, and a guest deriving a tick interval from a zero divides by
+zero.
+
+The value is a **software-declared constant** on both targets — nothing in
+either part reports the frequency:
+
+| Target | `CNTFRQ` at reset | Programmed | Established by |
+|---|---|---|---|
+| Armv8-R AEM FVP | `0x00000000` | `0x05F5E100` (100 MHz) | `CNTFID0` read back from the counter control frame |
+| S32Z280-594EVB | `0x00000000` | `0x007A1200` (8 MHz) | measured at 8.0227 MHz against host wall-clock over 32 s; `CFG_CNTDV` = 4 so the divider is 5; FXOSC 40 MHz, itself confirmed from the boot ROM's LINFlexD baud divisors. 40 / 5 = 8 |
+
+⚠ **Programming `CNTFRQ` does not start the counter.** On the FVP the system
+counter is left stopped (`bp.refcounter.non_arch_start_at_default=0`,
+documented as "firmware is expected to enable the timer at boot time"), so a
+guest that *waited* on this timer would still wait forever. The cooperative
+guest deliberately does not. Starting the counter belongs with interrupt
+delivery.
 
 ---
 

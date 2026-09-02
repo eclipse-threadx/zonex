@@ -30,14 +30,31 @@ name: zx_fvp
 # repository-variable arrangement for the model, because Arm has no stable
 # unauthenticated download URL for it.
 #
-# WHAT IT RUNS.  zx_probe.elf, which must PASS, plus two builds of the same
-# image that must FAIL -- one whose deliberate violation is aimed at an address
-# the payload is granted, and one told it needs more MPU regions than exist.
-# Both are registered with the runner's "--expect fail", because a check that
-# has never been seen to fail is not evidence that it can.  CTest runs all
-# three.  (CTest's WILL_FAIL is deliberately NOT used: it inverts the exit
-# status and nothing else, so it cannot tell a reported failure from an image
-# that was never built.  See test/fvp/run_fvp_test.py.)
+# WHAT IT RUNS.  Two families of image, and every one of them through CTest.
+#
+# The stage-2 probes: zx_probe.elf, which must PASS, plus builds of the same
+# image that must FAIL -- a violation aimed at an address the payload is
+# granted, a region budget claimed larger than any implementation has, a window
+# widened by one granule, an overlapping manifest, and an unwritten MAIR index.
+#
+# The one-partition images: a REAL ThreadX kernel booting at EL1 inside a
+# stage-2 confined partition, one build that stops it at its stage-2 boundary,
+# one that provokes a fault in its OWN stage-1 MPU, and one aimed at an address
+# it genuinely owns -- which must FAIL, and whose failing is what makes the
+# other two evidence.
+#
+# The builds that must fail are registered with the runner's "--expect fail",
+# because a check that has never been seen to fail is not evidence that it can.
+# (CTest's WILL_FAIL is deliberately NOT used: it inverts the exit status and
+# nothing else, so it cannot tell a reported failure from an image that was
+# never built.  See test/fvp/run_fvp_test.py.)
+#
+# THE GUEST NEEDS A THREADX CHECKOUT, so this workflow makes one.  ZoneX links
+# no ThreadX -- at EL2 it is a standalone bare-metal program -- but the guest
+# IS ThreadX, built as a separate program and embedded as a raw binary.  The
+# checkout is pinned to a commit rather than to a branch: an unpinned guest
+# would mean this suite's results changed when a different repository did, and
+# a hypervisor regression is the last place to want that.
 #
 # zx_probe_el2_fault.elf is deliberately NOT registered: its expected outcome
 # is a hypervisor-fault report, and a suite taught to accept that as a pass
@@ -58,6 +75,8 @@ on:
       - "common/**"
       - "core/**"
       - "platform/**"
+      - "examples/common/**"
+      - "examples/guest_common/**"
       - "examples/fvp_baser_aemv8r/**"
       - "test/fvp/**"
   pull_request:
@@ -71,6 +90,8 @@ on:
       - "common/**"
       - "core/**"
       - "platform/**"
+      - "examples/common/**"
+      - "examples/guest_common/**"
       - "examples/fvp_baser_aemv8r/**"
       - "test/fvp/**"
 
@@ -106,6 +127,26 @@ jobs:
     steps:
     - name: Check out the repository
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+    # The kernel the GUEST images are built from.
+    #
+    # Pinned to a commit, not to a branch.  The alternative -- track dev --
+    # would make this suite's verdict depend on a second repository's latest
+    # state, so a ZoneX pull request could go red for a reason that had nothing
+    # to do with it and everything to do with a kernel change landing that
+    # morning.  Bumping the pin is then a deliberate, reviewable change with
+    # its own diff, which is what upgrading a dependency should look like.
+    #
+    # The Cortex-R52 port has carried TX_R52_BOOT_AT_EL1 since it was written,
+    # for exactly this case -- "an earlier boot stage or a vendor EL2 monitor
+    # has already dropped privilege to EL1" -- so the guest needs no change to
+    # the kernel or to its port.  ZoneX is that monitor.
+    - name: Check out ThreadX, for the guest images
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        repository: eclipse-threadx/threadx
+        ref: 8c681c188ee748c777185e229024255c054a49d9
+        path: threadx
 
     - name: Cache the AArch32 Arm GNU toolchain
       id: cache-arm32
@@ -234,6 +275,7 @@ jobs:
             -DCMAKE_COMPILE_WARNING_AS_ERROR=ON \
             -DZX_BUILD_FVP_EXAMPLE=ON \
             -DZX_BUILD_S32Z280_EXAMPLE=OFF \
+            -DZX_THREADX_SOURCE_DIR="$GITHUB_WORKSPACE/threadx" \
             $fvp_arg
 
         cmake --build build/fvp
@@ -259,6 +301,24 @@ jobs:
             echo "The hypervisor libraries built, but the ninja graph named no \`*.elf\` targets."
             echo "ZoneX does have FVP images, so this is a build-system failure rather than"
             echo "a repository that has not got there yet."
+          } >>"$GITHUB_STEP_SUMMARY"
+          exit 1
+        fi
+
+        # AND THE GUEST IMAGES SPECIFICALLY.  Without a ThreadX checkout the
+        # example CMakeLists SKIPS them, with a message -- which is right for a
+        # contributor who has no kernel sources to hand and wrong here, where
+        # it would mean half this suite quietly stopped running.  The stage-2
+        # probes would still be green, and nothing would say that a real
+        # kernel had not been booted at all.
+        if ! echo "$images" | grep -q '^zx_one_partition\.elf$'; then
+          echo "::error::The ThreadX guest images were not built. ZX_THREADX_SOURCE_DIR did not reach CMake, so no real kernel was booted and half this suite did not run."
+          {
+            echo "### ZoneX FVP execution: NO GUEST IMAGES"
+            echo ""
+            echo "The stage-2 probe images built, but the one-partition images -- the ones that"
+            echo "boot a real ThreadX kernel inside a partition -- were skipped, which happens"
+            echo "when \`ZX_THREADX_SOURCE_DIR\` is empty. Check the ThreadX checkout step."
           } >>"$GITHUB_STEP_SUMMARY"
           exit 1
         fi

@@ -102,6 +102,29 @@ void zx_board_report(void)
 
 
 /**************************************************************************/
+/*  zx_board_counter_hz                                                   */
+/*                                                                        */
+/*  The model resets CNTFRQ to zero and leaves the system counter STOPPED  */
+/*  -- bp.refcounter.non_arch_start_at_default=0, documented as "firmware  */
+/*  is expected to enable the timer at boot time".  The value below is     */
+/*  CNTFID0 read back from the counter control frame during the            */
+/*  Cortex-R52 port work, so it is what the counter WOULD run at once      */
+/*  something starts it.                                                   */
+/*                                                                        */
+/*  ZoneX programs CNTFRQ from this so that a guest reading it gets a      */
+/*  number rather than a zero.  Starting the counter itself is a different */
+/*  job and belongs with interrupt delivery, which Phase 0 does not have    */
+/*  yet -- so a guest that tried to WAIT on this timer would still wait     */
+/*  forever, and the cooperative guest deliberately does not.              */
+/**************************************************************************/
+
+uint32_t zx_board_counter_hz(void)
+{
+    return (uint32_t)ZX_FVP_SYSTEM_COUNTER_HZ;
+}
+
+
+/**************************************************************************/
 /*  zx_board_describe_mmio_regions                                        */
 /*                                                                        */
 /*  Nothing to describe: this model's console and GIC already sit in the   */

@@ -110,19 +110,35 @@ extern "C" {
 #define ZX_ISS_FNV_MASK             0x00000400U /* [10]   FAR not valid     */
 #define ZX_ISS_ISV_MASK             0x01000000U /* [24]   ISS[23:14] valid  */
 
-/* HVC immediate: HSR.ISS[15:0].  ZoneX gives the two immediates it uses
-   names, because "HVC #1" in a trace says nothing about what was asked.
+/* HVC immediate: HSR.ISS[15:0].  ZoneX gives every immediate it uses a name,
+   because "HVC #1" in a trace says nothing about what was asked.
 
    ZX_HVC_NOP is the empty hypercall vector Phase 0 promises: counted at EL2
    and returned from, which proves the seam is live without giving a guest
    anything to call.  ZX_HVC_YIELD is how a Phase-0 test payload hands control
    back to EL2 on purpose, as opposed to being taken from it by a fault.  The
    distinction is what lets a run say "the payload survived its violation"
-   instead of only "no fault was captured".  */
+   instead of only "no fault was captured".
+
+   ZX_HVC_PUTC is one character for the hypervisor to print, in r0.
+
+   THE IMMEDIATE IS THE FUNCTION SELECTOR, and a register is not.  A general
+   hypercall ABI usually puts a function id in a register so that the vector
+   can dispatch through a table, and that is the right shape for one with
+   dozens of calls.  This one has three, the vector already compares
+   immediates to tell a yield from a transparent return, and the immediate
+   costs a guest nothing: a console backend receives its character in r0
+   under AAPCS and can issue the HVC with no register shuffling at all.  An
+   id in r0 would mean moving the character to r1 and loading a constant into
+   r0 on every character of a path that is already the slowest thing a guest
+   does.  When a fourth call arrives this stays; when a fortieth does, the
+   selector moves to a register and this comment is the record of why it was
+   not there to begin with.  */
 
 #define ZX_HSR_HVC_IMM_MASK         0x0000FFFFU
 #define ZX_HVC_NOP                  0x0000U
 #define ZX_HVC_YIELD                0x0001U
+#define ZX_HVC_PUTC                 0x0002U
 
 /**************************************************************************/
 /*                                HPFAR                                   */

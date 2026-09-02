@@ -503,6 +503,34 @@ static UINT zx_manifest_partition_check(const ZX_MANIFEST *manifest_ptr,
                                      ZX_MANIFEST_NO_INDEX);
     }
 
+    /* An image of ZERO bytes, which is a separate rule from a reversed range
+       and catches a different mistake.
+
+       A guest image reaches the hypervisor as a section pulled in with
+       .incbin, and the manifest names that section's start and end symbols.
+       When the linker script's input pattern matches nothing -- a pattern
+       missing the object-file suffix does exactly this -- the output section
+       is created EMPTY at whatever address the location counter happened to
+       hold, and the two symbols come out equal.  The image then builds,
+       links, reports a plausible size in the map file, and contains no
+       guest; the run copies nothing and ERETs into whatever the window held.
+       That failure cost real time during the Cortex-R52 Modules port work,
+       and it is decidable here in one comparison.
+
+       A partition that genuinely has no image to copy -- code already
+       resident in ROM, say -- is a case Phase 0 does not have and would need
+       an explicit declaration rather than an empty range, because an empty
+       range is indistinguishable from the mistake above.  */
+
+    if (partition_ptr->zx_partition_image_end
+            == partition_ptr->zx_partition_image_start)
+    {
+        return zx_manifest_fault_set(fault_ptr, ZX_MANIFEST_IMAGE_EMPTY,
+                                     partition_index, ZX_MANIFEST_NO_INDEX,
+                                     ZX_MANIFEST_NO_INDEX,
+                                     ZX_MANIFEST_NO_INDEX);
+    }
+
     if (partition_ptr->zx_partition_window_ticks == 0U)
     {
         return zx_manifest_fault_set(fault_ptr, ZX_MANIFEST_ZERO_WINDOW,
@@ -586,25 +614,37 @@ static UINT zx_manifest_partition_check(const ZX_MANIFEST *manifest_ptr,
                         <= region_ptr->zx_region_limit)
                 {
                     entry_is_executable = 1U;
-                }
-            }
 
-            /* The image is copied into a code region, so it has to fit one.
-               Both subtractions are safe without a guard: image_end >= start
-               was established before this loop, and limit >= base by the
-               per-region check just above.  No guard is added for them on
-               purpose -- a condition that cannot be false is dead code, and
-               dead code in a function with a coverage floor is a branch
-               nobody can ever cover.  */
-            {
-                zx_addr_t image_size = partition_ptr->zx_partition_image_end
-                                       - partition_ptr->zx_partition_image_start;
-                zx_addr_t region_size = region_ptr->zx_region_limit
-                                        - region_ptr->zx_region_base;
+                    /* THE IMAGE IS CHECKED AGAINST THIS REGION AND NO
+                       OTHER, because this is the one it will be loaded
+                       into: the loader copies to the base of the
+                       executable region that holds the entry point.
 
-                if (image_size <= region_size)
-                {
-                    image_fits = 1U;
+                       The weaker rule -- "the image fits SOME executable
+                       region" -- is the one this replaces, and it passes a
+                       manifest whose entry sits in a small region while a
+                       large one elsewhere absorbs the size.  The copy then
+                       overruns the window it actually targets, into
+                       whatever is next in the address space, and the first
+                       symptom is a neighbouring partition behaving oddly.
+                       Naming the window makes the rule mean what a reader
+                       assumes it means.
+
+                       Both subtractions are safe without a guard:
+                       image_end > start was established before this loop,
+                       and limit >= base by the per-region check just
+                       above.  No guard is added for them on purpose -- a
+                       condition that cannot be false is dead code, and
+                       dead code in a function with a coverage floor is a
+                       branch nobody can ever cover.  */
+
+                    if ((partition_ptr->zx_partition_image_end
+                         - partition_ptr->zx_partition_image_start)
+                            <= (region_ptr->zx_region_limit
+                                - region_ptr->zx_region_base))
+                    {
+                        image_fits = 1U;
+                    }
                 }
             }
         }

@@ -63,78 +63,19 @@
 /*                                                                        */
 /*    Rule 11.4/11.6 -- casting a linker symbol's address to an integer    */
 /*      address is inherent to describing memory to an MPU.  Confined to   */
-/*      zx_symbol_address below.                                          */
+/*      zx_symbol_address, which lives in zx_report.c with the other       */
+/*      shared reporting helpers.                                         */
 /*                                                                        */
 /**************************************************************************/
 
 #include "zx_probe.h"
 #include "zx_platform.h"
 
-/* How many checks failed.  Accumulated rather than returned, because the
-   image reports EVERY check and then its verdict: stopping at the first
-   failure would hide the identity block that explains it.  */
-
-static uint32_t zx_failures;
-
 /* Region 16's descriptor is kept because two phases need it -- the enabled
    probe and, when the deliberate EL2 fault is built in, a reprogramming of
    the same region with EL2 read-only permissions.  */
 
 static ZX_REGION zx_high_probe_region;
-
-
-/**************************************************************************/
-/*  zx_symbol_address -- a linker symbol's address as an MPU address.      */
-/**************************************************************************/
-
-zx_addr_t zx_symbol_address(const char *symbol)
-{
-    return (zx_addr_t)(uintptr_t)symbol;
-}
-
-
-/**************************************************************************/
-/*  zx_report / zx_check -- one labelled line each.                       */
-/*                                                                        */
-/*  Fixed-width labels so that a captured log lines up and a missing       */
-/*  result is visible as a gap rather than having to be counted.          */
-/**************************************************************************/
-
-void zx_check(const char *label, uint32_t passed)
-{
-    zx_console_puts("  [");
-    zx_console_puts((passed != 0U) ? "PASS" : "FAIL");
-    zx_console_puts("] ");
-    zx_console_puts(label);
-    zx_console_puts("\n");
-
-    if (passed == 0U)
-    {
-        zx_failures++;
-    }
-}
-
-
-uint32_t zx_probe_failures(void)
-{
-    return zx_failures;
-}
-
-
-void zx_probe_fail(void)
-{
-    zx_failures++;
-}
-
-
-void zx_note(const char *label, uint32_t value)
-{
-    zx_console_puts("  ");
-    zx_console_puts(label);
-    zx_console_puts(" = ");
-    zx_console_puthex(value);
-    zx_console_puts("\n");
-}
 
 
 /**************************************************************************/
@@ -818,7 +759,7 @@ static void zx_phase_provoke_el2_fault(void)
     zx_console_puts("\n  *** THE WRITE SUCCEEDED.  A region marked read-only at\n"
                     "  *** EL2 did not deny an EL2 write, so AP 0b10 does not\n"
                     "  *** mean what TRM Table 3-82 says it means.\n");
-    zx_failures++;
+    zx_probe_fail();
 }
 #endif
 
@@ -1004,10 +945,10 @@ ZX_NORETURN void zx_el2_main(void)
         " partitioning.\n");
 
     zx_console_puts("\n  checks failed: ");
-    zx_console_putdec(zx_failures);
+    zx_console_putdec(zx_probe_failures());
     zx_console_puts("\n");
 
-    if (zx_failures == 0U)
+    if (zx_probe_failures() == 0U)
     {
         zx_console_puts("\nZONEX RESULT: ALL CHECKS PASSED\n");
     }
@@ -1016,5 +957,5 @@ ZX_NORETURN void zx_el2_main(void)
         zx_console_puts("\nZONEX RESULT: FAILED\n");
     }
 
-    zx_console_exit(zx_failures);
+    zx_console_exit(zx_probe_failures());
 }

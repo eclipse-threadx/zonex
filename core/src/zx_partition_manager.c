@@ -21,14 +21,461 @@
 /*                                                                        */
 /*  DESCRIPTION                                                           */
 /*                                                                        */
-/*    The partition manager: partition creation from the manifest, entry  */
-/*    into a partition, and the halt path taken when one faults.          */
+/*    The partition manager: where a guest image goes, what state a       */
+/*    partition is in, and what the syndrome says happened to it.         */
 /*                                                                        */
-/*    This translation unit is deliberately empty of implementation.      */
-/*    The change that founded this repository builds the repository, not  */
-/*    the hypervisor; the unit exists so that the change which writes the */
-/*    code opens a tree that already configures, compiles and links.      */
+/*    Nothing here copies a byte, maintains a cache or writes a register.  */
+/*    See the note on the split in zx_partition.h -- the caller does all   */
+/*    three, and this decides what the caller should do and records that   */
+/*    it was done.                                                        */
+/*                                                                        */
+/*  MISRA C:2012 deviations (justified)                                   */
+/*                                                                        */
+/*    None.  Every function here is straight-line arithmetic over a       */
+/*    manifest with a single loop and no pointer arithmetic beyond array  */
+/*    subscripting.                                                      */
 /*                                                                        */
 /**************************************************************************/
 
 #include "zx_partition.h"
+#include "zx_console.h"
+
+
+/**************************************************************************/
+/*                                                                        */
+/*  FUNCTION                                               RELEASE        */
+/*                                                                        */
+/*    zx_partition_reset                                   PORTABLE C     */
+/*                                                                        */
+/*  DESCRIPTION                                                           */
+/*                                                                        */
+/*    Zeroes a control block and points it at its declaration.            */
+/*                                                                        */
+/*    Written field by field rather than with a library memset, because   */
+/*    ZoneX at EL2 links no C library (docs/decisions.md D9) and a        */
+/*    freestanding implementation is not obliged to provide one.  Six     */
+/*    assignments are also easier to audit than a call whose length       */
+/*    argument is a sizeof.                                              */
+/*                                                                        */
+/**************************************************************************/
+
+void zx_partition_reset(ZX_PARTITION_CB *cb_ptr,
+                        const ZX_PARTITION *declaration_ptr)
+{
+    if (cb_ptr == (ZX_PARTITION_CB *)0)
+    {
+        return;
+    }
+
+    cb_ptr->zx_partition_declaration    = declaration_ptr;
+    cb_ptr->zx_partition_state          = ZX_PARTITION_DECLARED;
+    cb_ptr->zx_partition_entries        = 0U;
+    cb_ptr->zx_partition_faults         = 0U;
+    cb_ptr->zx_partition_last_hsr       = 0U;
+    cb_ptr->zx_partition_last_address   = 0U;
+    cb_ptr->zx_partition_last_guest_pc  = 0U;
+
+    cb_ptr->zx_partition_load.zx_load_window_base   = 0U;
+    cb_ptr->zx_partition_load.zx_load_window_limit  = 0U;
+    cb_ptr->zx_partition_load.zx_load_image_source  = 0U;
+    cb_ptr->zx_partition_load.zx_load_image_length  = 0U;
+    cb_ptr->zx_partition_load.zx_load_entry         = 0U;
+    cb_ptr->zx_partition_load.zx_load_region_index  = ZX_MANIFEST_NO_INDEX;
+}
+
+
+/**************************************************************************/
+/*                                                                        */
+/*  FUNCTION                                               RELEASE        */
+/*                                                                        */
+/*    zx_partition_prepare                                 PORTABLE C     */
+/*                                                                        */
+/*  DESCRIPTION                                                           */
+/*                                                                        */
+/*    Locates the window the image is copied into, and fills the load     */
+/*    record.                                                             */
+/*                                                                        */
+/*    THE ORDER OF THIS FUNCTION IS THE POINT.  Everything derivable from */
+/*    the manifest is written into the record BEFORE the search that can  */
+/*    fail, so that a failure leaves a record describing what was         */
+/*    attempted rather than a block of zeros.  A zeroed window base is a  */
+/*    plausible address, and an end-of-run consistency check that met one */
+/*    would report a second, invented problem and point the reader at it. */
+/*                                                                        */
+/**************************************************************************/
+
+UINT zx_partition_prepare(ZX_PARTITION_CB *cb_ptr)
+{
+    const ZX_PARTITION *declaration_ptr;
+    UINT                region_index;
+
+    if (cb_ptr == (ZX_PARTITION_CB *)0)
+    {
+        return ZX_MANIFEST_NULL_POINTER;
+    }
+
+    declaration_ptr = cb_ptr->zx_partition_declaration;
+
+    if (declaration_ptr == (const ZX_PARTITION *)0)
+    {
+        return ZX_MANIFEST_NULL_POINTER;
+    }
+
+    if (declaration_ptr->zx_partition_regions == (const ZX_REGION *)0)
+    {
+        return ZX_MANIFEST_NULL_POINTER;
+    }
+
+    /* Recorded first, unconditionally.  See the note above.  */
+
+    cb_ptr->zx_partition_load.zx_load_image_source =
+        declaration_ptr->zx_partition_image_start;
+    cb_ptr->zx_partition_load.zx_load_image_length =
+        (zx_size_t)(declaration_ptr->zx_partition_image_end
+                    - declaration_ptr->zx_partition_image_start);
+    cb_ptr->zx_partition_load.zx_load_entry =
+        declaration_ptr->zx_partition_entry;
+
+    if (declaration_ptr->zx_partition_image_end
+            < declaration_ptr->zx_partition_image_start)
+    {
+        return ZX_MANIFEST_IMAGE_RANGE_INVALID;
+    }
+
+    if (declaration_ptr->zx_partition_image_end
+            == declaration_ptr->zx_partition_image_start)
+    {
+        return ZX_MANIFEST_IMAGE_EMPTY;
+    }
+
+    /* The window is the EXECUTABLE region that contains the entry point.
+       Not the first executable region, and not the largest: the image is
+       copied to the base of the region the guest will start executing in,
+       so any other choice would load the image somewhere the entry does
+       not point.  */
+
+    for (region_index = 0U;
+         region_index < declaration_ptr->zx_partition_region_count;
+         region_index++)
+    {
+        const ZX_REGION *region_ptr =
+            &declaration_ptr->zx_partition_regions[region_index];
+
+        if (region_ptr->zx_region_xn != ZX_XN_EXECUTABLE)
+        {
+            continue;
+        }
+
+        if (declaration_ptr->zx_partition_entry < region_ptr->zx_region_base)
+        {
+            continue;
+        }
+
+        if (declaration_ptr->zx_partition_entry > region_ptr->zx_region_limit)
+        {
+            continue;
+        }
+
+        cb_ptr->zx_partition_load.zx_load_window_base =
+            region_ptr->zx_region_base;
+        cb_ptr->zx_partition_load.zx_load_window_limit =
+            region_ptr->zx_region_limit;
+        cb_ptr->zx_partition_load.zx_load_region_index = region_index;
+
+        /* The limit is INCLUSIVE, so the window holds limit - base + 1
+           bytes.  Written as a comparison against (limit - base) with the
+           length reduced by one rather than as base + length - 1, because
+           the second form overflows for a window that reaches the top of
+           the address space and then reports a real overrun as a fit.  */
+
+        if ((cb_ptr->zx_partition_load.zx_load_image_length - 1U)
+                > (zx_size_t)(region_ptr->zx_region_limit
+                              - region_ptr->zx_region_base))
+        {
+            return ZX_MANIFEST_IMAGE_TOO_LARGE;
+        }
+
+        cb_ptr->zx_partition_state = ZX_PARTITION_PREPARED;
+
+        return ZX_MANIFEST_SUCCESS;
+    }
+
+    return ZX_MANIFEST_ENTRY_NOT_EXECUTABLE;
+}
+
+
+/**************************************************************************/
+/*                                                                        */
+/*  FUNCTION                                               RELEASE        */
+/*                                                                        */
+/*    zx_partition_loaded                                  PORTABLE C     */
+/*                                                                        */
+/*  DESCRIPTION                                                           */
+/*                                                                        */
+/*    Records that the caller has copied the image and synchronised the   */
+/*    instruction side.                                                   */
+/*                                                                        */
+/*    THE CACHE MAINTENANCE THIS ATTESTS TO IS NOT OPTIONAL.  A copied    */
+/*    image arrives through the data side, and on this core the           */
+/*    instruction side is not coherent with the D-cache; a cold I-cache   */
+/*    over an address nothing has executed HAPPENS TO WORK until an       */
+/*    eviction lands differently.  The Cortex-R52 Modules port work       */
+/*    passed a two-address test before the maintenance was added.         */
+/*                                                                        */
+/*    Refusing to move a partition that was never prepared is the whole   */
+/*    reason this is a state machine.  Without it, a transfer to EL1 for  */
+/*    a partition whose image was never copied is an ERET into whatever   */
+/*    the window happened to hold -- which on a NOLOAD window is          */
+/*    uninitialised memory, and presents as a guest that started and did  */
+/*    something arbitrary.                                                */
+/*                                                                        */
+/**************************************************************************/
+
+void zx_partition_loaded(ZX_PARTITION_CB *cb_ptr)
+{
+    if (cb_ptr == (ZX_PARTITION_CB *)0)
+    {
+        return;
+    }
+
+    if (cb_ptr->zx_partition_state != ZX_PARTITION_PREPARED)
+    {
+        return;
+    }
+
+    cb_ptr->zx_partition_state = ZX_PARTITION_LOADED;
+}
+
+
+/**************************************************************************/
+/*                                                                        */
+/*  FUNCTION                                               RELEASE        */
+/*                                                                        */
+/*    zx_partition_enter                                   PORTABLE C     */
+/*                                                                        */
+/*  DESCRIPTION                                                           */
+/*                                                                        */
+/*    May this partition be entered, and if so, count the entry.          */
+/*                                                                        */
+/*    A partition that FAULTED is not re-entered.  That is a policy        */
+/*    choice and it is the conservative one: whatever invariant the guest  */
+/*    broke to reach its boundary is still broken, and a hypervisor that   */
+/*    restarted it would be hiding a repeating failure behind a run that   */
+/*    eventually looked fine.  Restart-on-fault is a real requirement for  */
+/*    some systems and belongs in a scheduler with a policy, not here.     */
+/*                                                                        */
+/**************************************************************************/
+
+UINT zx_partition_enter(ZX_PARTITION_CB *cb_ptr)
+{
+    if (cb_ptr == (ZX_PARTITION_CB *)0)
+    {
+        return 0U;
+    }
+
+    if ((cb_ptr->zx_partition_state != ZX_PARTITION_LOADED)
+        && (cb_ptr->zx_partition_state != ZX_PARTITION_YIELDED))
+    {
+        return 0U;
+    }
+
+    cb_ptr->zx_partition_state = ZX_PARTITION_RUNNING;
+    cb_ptr->zx_partition_entries++;
+
+    return 1U;
+}
+
+
+/**************************************************************************/
+/*                                                                        */
+/*  FUNCTION                                               RELEASE        */
+/*                                                                        */
+/*    zx_partition_returned                                PORTABLE C     */
+/*                                                                        */
+/*  DESCRIPTION                                                           */
+/*                                                                        */
+/*    Classifies what came back, from the syndrome and from nothing else.  */
+/*                                                                        */
+/*    The address is taken from HDFAR and not HPFAR.  The two registers    */
+/*    do not mean the same thing on the two ZoneX targets -- the model     */
+/*    implements the TRM's figure and returns a 4 KB page number where     */
+/*    the S32Z280 implements the table row and returns the full address    */
+/*    -- so a manager that recorded HPFAR would be wrong by a factor of    */
+/*    256 on one of them.  HDFAR carries the full faulting virtual         */
+/*    address on both.  See docs/decisions.md D18.                        */
+/*                                                                        */
+/*    ELR_hyp is recorded as the guest PC, and it is the field that makes  */
+/*    a fault report actionable: it resolves against the guest's own map   */
+/*    file, which is why the guest ELF is kept beside its blob in the      */
+/*    build tree.                                                         */
+/*                                                                        */
+/**************************************************************************/
+
+void zx_partition_returned(ZX_PARTITION_CB *cb_ptr,
+                           const zx_fault_record_t *record_ptr)
+{
+    if (cb_ptr == (ZX_PARTITION_CB *)0)
+    {
+        return;
+    }
+
+    if (record_ptr == (const zx_fault_record_t *)0)
+    {
+        /* A return with no syndrome is not a yield.  Nothing is known about
+           why control came back, and calling that a clean hand-back would
+           be inventing the one fact the caller failed to supply.  */
+        cb_ptr->zx_partition_state = ZX_PARTITION_STOPPED;
+        return;
+    }
+
+    cb_ptr->zx_partition_last_hsr      = record_ptr->zx_fault_hsr;
+    cb_ptr->zx_partition_last_address  = record_ptr->zx_fault_hdfar;
+    cb_ptr->zx_partition_last_guest_pc = record_ptr->zx_fault_elr;
+
+    switch (zx_fault_classify(record_ptr->zx_fault_hsr))
+    {
+    case ZX_FAULT_HYPERCALL:
+        cb_ptr->zx_partition_state = ZX_PARTITION_YIELDED;
+        break;
+
+    case ZX_FAULT_GUEST_VIOLATION:
+        cb_ptr->zx_partition_state = ZX_PARTITION_FAULTED;
+        cb_ptr->zx_partition_faults++;
+        break;
+
+    case ZX_FAULT_HYPERVISOR_BUG:
+    case ZX_FAULT_UNEXPECTED_TRAP:
+    default:
+        /* A hypervisor bug is NOT recorded as a partition fault.  The
+           partition is stopped either way, but counting it as a boundary
+           violation would let a ZoneX defect be read as the demonstrator
+           working.  */
+        cb_ptr->zx_partition_state = ZX_PARTITION_STOPPED;
+        break;
+    }
+}
+
+
+/**************************************************************************/
+/*                                                                        */
+/*  FUNCTION                                               RELEASE        */
+/*                                                                        */
+/*    zx_partition_state_name                              PORTABLE C     */
+/*                                                                        */
+/**************************************************************************/
+
+const CHAR *zx_partition_state_name(UINT state)
+{
+    const CHAR *name;
+
+    switch (state)
+    {
+    case ZX_PARTITION_DECLARED:
+        name = "DECLARED (in the manifest, not yet loaded)";
+        break;
+    case ZX_PARTITION_PREPARED:
+        name = "PREPARED (window located, nothing copied)";
+        break;
+    case ZX_PARTITION_LOADED:
+        name = "LOADED (image copied, instruction side synchronised)";
+        break;
+    case ZX_PARTITION_RUNNING:
+        name = "RUNNING (control is at EL1)";
+        break;
+    case ZX_PARTITION_YIELDED:
+        name = "YIELDED (handed control back on purpose)";
+        break;
+    case ZX_PARTITION_FAULTED:
+        name = "FAULTED (taken from at its boundary)";
+        break;
+    case ZX_PARTITION_STOPPED:
+        name = "STOPPED (something else reached EL2)";
+        break;
+    default:
+        name = "an UNKNOWN state, which is a ZoneX bug";
+        break;
+    }
+
+    return name;
+}
+
+
+/**************************************************************************/
+/*                                                                        */
+/*  FUNCTION                                               RELEASE        */
+/*                                                                        */
+/*    zx_partition_report                                  PORTABLE C     */
+/*                                                                        */
+/**************************************************************************/
+
+void zx_partition_report(const ZX_PARTITION_CB *cb_ptr)
+{
+    const ZX_PARTITION *declaration_ptr;
+
+    if (cb_ptr == (const ZX_PARTITION_CB *)0)
+    {
+        zx_console_puts("  no partition control block to report\n");
+        return;
+    }
+
+    declaration_ptr = cb_ptr->zx_partition_declaration;
+
+    zx_console_puts("\n--- partition ");
+
+    if (declaration_ptr != (const ZX_PARTITION *)0)
+    {
+        zx_console_putdec(declaration_ptr->zx_partition_id);
+
+        if (declaration_ptr->zx_partition_name != (const CHAR *)0)
+        {
+            zx_console_puts(", ");
+            zx_console_puts(declaration_ptr->zx_partition_name);
+        }
+    }
+    else
+    {
+        zx_console_puts("with NO declaration, which is a ZoneX bug");
+    }
+
+    zx_console_puts(" ---\n");
+
+    zx_console_puts("  state         ");
+    zx_console_puts(zx_partition_state_name(cb_ptr->zx_partition_state));
+    zx_console_puts("\n");
+
+    zx_console_puts("  window        ");
+    zx_console_puthex((uint32_t)cb_ptr->zx_partition_load.zx_load_window_base);
+    zx_console_puts(" .. ");
+    zx_console_puthex((uint32_t)cb_ptr->zx_partition_load.zx_load_window_limit);
+    zx_console_puts("  (region ");
+    zx_console_putdec(cb_ptr->zx_partition_load.zx_load_region_index);
+    zx_console_puts(" of this partition's own list)\n");
+
+    zx_console_puts("  image         ");
+    zx_console_puthex((uint32_t)cb_ptr->zx_partition_load.zx_load_image_source);
+    zx_console_puts(" + ");
+    zx_console_puthex((uint32_t)cb_ptr->zx_partition_load.zx_load_image_length);
+    zx_console_puts(" bytes, copied into the window above\n");
+
+    zx_console_puts("  entry         ");
+    zx_console_puthex((uint32_t)cb_ptr->zx_partition_load.zx_load_entry);
+    zx_console_puts("\n");
+
+    zx_console_puts("  entries       ");
+    zx_console_putdec(cb_ptr->zx_partition_entries);
+    zx_console_puts(", of which faulted: ");
+    zx_console_putdec(cb_ptr->zx_partition_faults);
+    zx_console_puts("\n");
+
+    if (cb_ptr->zx_partition_entries != 0U)
+    {
+        zx_console_puts("  last HSR      ");
+        zx_console_puthex(cb_ptr->zx_partition_last_hsr);
+        zx_console_puts("\n  last address  ");
+        zx_console_puthex(cb_ptr->zx_partition_last_address);
+        zx_console_puts("  (HDFAR, not HPFAR -- see the decision log)\n");
+        zx_console_puts("  guest PC      ");
+        zx_console_puthex(cb_ptr->zx_partition_last_guest_pc);
+        zx_console_puts("  resolve against the guest's own .map file\n");
+    }
+}

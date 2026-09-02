@@ -93,6 +93,8 @@ _Static_assert(ZX_ASM_HVC_IMM_NOP == (int)ZX_HVC_NOP,
                "ZX_ASM_HVC_IMM_NOP and ZX_HVC_NOP have drifted apart");
 _Static_assert(ZX_ASM_HVC_IMM_YIELD == (int)ZX_HVC_YIELD,
                "ZX_ASM_HVC_IMM_YIELD and ZX_HVC_YIELD have drifted apart");
+_Static_assert(ZX_ASM_HVC_IMM_PUTC == (int)ZX_HVC_PUTC,
+               "ZX_ASM_HVC_IMM_PUTC and ZX_HVC_PUTC have drifted apart");
 
 _Static_assert(ZX_ASM_VEC_RESET == (int)ZX_VECTOR_RESET,
                "ZX_ASM_VEC_RESET and ZX_VECTOR_RESET have drifted apart");

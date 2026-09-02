@@ -33,10 +33,19 @@
 /*    the hypervisor.  See docs/decisions.md D3 and the AP table in       */
 /*    docs/armv8r-el2-reference.md.                                       */
 /*                                                                        */
-/*  STATUS                                                                */
+/*  WHERE THE SPLIT IS                                                    */
 /*                                                                        */
-/*    Declared empty.  The control block is defined alongside the         */
-/*    manifest, and the first guest partition boots into it after that.   */
+/*    This header DECIDES; it does not touch the machine.  Everything     */
+/*    here is arithmetic over a manifest and a state machine over what    */
+/*    came back from a partition, and none of it reads a register, copies */
+/*    a byte or maintains a cache.  The caller -- which does have         */
+/*    hardware -- performs the copy the load record describes, does the   */
+/*    cache maintenance, programs the enable mask and transfers to EL1.   */
+/*                                                                        */
+/*    That is the same split zx_mm.h makes for region programming, and it */
+/*    is made for the same reason: the interesting part is decidable on a */
+/*    workstation, and it stops being testable there the moment it is     */
+/*    interleaved with CP15 writes.                                       */
 /*                                                                        */
 /**************************************************************************/
 
@@ -44,10 +53,180 @@
 #define ZX_PARTITION_H
 
 #include "zx_api.h"
+#include "zx_manifest.h"
+#include "zx_fault.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/**************************************************************************/
+/*                          Lifecycle states                              */
+/**************************************************************************/
+
+/* A partition's state, as the hypervisor knows it.
+ *
+ * The states that matter are the last three, and they must not be conflated.
+ * YIELDED means a partition handed control back on purpose; FAULTED means it
+ * was taken from at its boundary; STOPPED means something reached EL2 that
+ * neither of those describes.  A run that reported the third as the second
+ * would be reporting a hypervisor or configuration problem as a partition
+ * behaving badly, and would pass while proving nothing.
+ *
+ * DECLARED is deliberately zero, so that a zeroed control block reads as
+ * "in the manifest, nothing done yet" rather than as some more advanced
+ * state a caller might act on.  */
+
+#define ZX_PARTITION_DECLARED       0U  /* in the manifest, not yet loaded  */
+#define ZX_PARTITION_PREPARED       1U  /* window located, load record set  */
+#define ZX_PARTITION_LOADED         2U  /* image copied and caches synced   */
+#define ZX_PARTITION_RUNNING        3U  /* control is at EL1 right now      */
+#define ZX_PARTITION_YIELDED        4U  /* handed control back on purpose   */
+#define ZX_PARTITION_FAULTED        5U  /* taken from at its boundary       */
+#define ZX_PARTITION_STOPPED        6U  /* something else reached EL2       */
+
+/**************************************************************************/
+/*                            The load record                             */
+/**************************************************************************/
+
+/* What the loader decided, before it did any of it.
+ *
+ * WHY THIS IS FILLED IN FIRST AND IN FULL.  Every field below is derivable
+ * from the manifest alone, so all of them are written before the first
+ * operation that can fail.  The alternative -- fill each field as its step
+ * succeeds -- leaves zeros behind on a failure, and a later consistency
+ * check then reports a SECOND problem, about a zero window base, pointing at
+ * the wrong thing entirely.  That happened during the Cortex-R52 Modules
+ * port work and cost more time than the original failure did.
+ *
+ * The window is the executable region that CONTAINS THE ENTRY POINT, which
+ * is the region the image is copied into.  It is recorded rather than
+ * recomputed at each use because a fault report has to be able to say which
+ * window an address was or was not inside, and recomputing it from a
+ * manifest at report time is how a report starts disagreeing with the load
+ * it is describing.  */
+
+typedef struct zx_partition_load_struct
+{
+    zx_addr_t   zx_load_window_base;    /* first byte of the code window    */
+    zx_addr_t   zx_load_window_limit;   /* LAST byte, inclusive             */
+    zx_addr_t   zx_load_image_source;   /* where the image is now           */
+    zx_size_t   zx_load_image_length;   /* how many bytes to copy           */
+    zx_addr_t   zx_load_entry;          /* where to start executing         */
+    UINT        zx_load_region_index;   /* which of the partition's regions */
+} ZX_PARTITION_LOAD;
+
+/**************************************************************************/
+/*                          The control block                             */
+/**************************************************************************/
+
+/* Everything the hypervisor knows about one partition at run time.
+ *
+ * It points at its manifest declaration rather than copying it.  The
+ * manifest lives in the hypervisor's own .rodata, covered by no enabled
+ * stage-2 region, so it is both unreachable from a guest and unchanging --
+ * copying it would double the storage and create a second version that could
+ * disagree with the first.
+ *
+ * The counters are here because they answer questions a Phase-0 regression
+ * has to ask and a printed log cannot: how many times a partition was
+ * entered, and how many of those ended at its boundary.  A guest that
+ * faulted on every entry and a guest that ran cleanly both produce plausible
+ * output; the pair of numbers does not.  */
+
+typedef struct zx_partition_cb_struct
+{
+    const ZX_PARTITION *zx_partition_declaration;
+    UINT                zx_partition_state;
+    ZX_PARTITION_LOAD   zx_partition_load;
+
+    UINT                zx_partition_entries;   /* transfers to EL1         */
+    UINT                zx_partition_faults;    /* that ended at a boundary */
+
+    /* The evidence from the LAST return, kept so that a report written after
+       several partitions have run still says what happened to this one.  A
+       single global fault record is overwritten by whoever faults next.  */
+    uint32_t            zx_partition_last_hsr;
+    uint32_t            zx_partition_last_address;
+    uint32_t            zx_partition_last_guest_pc;
+} ZX_PARTITION_CB;
+
+/**************************************************************************/
+/*                              The loader                                */
+/**************************************************************************/
+
+/* Zero a control block and point it at a declaration.  Separate from
+   prepare, so that a caller can build the table before it has decided what
+   to do with it, and so that "nothing has happened to this partition yet" is
+   a state rather than the absence of one.  */
+
+void zx_partition_reset(ZX_PARTITION_CB *cb_ptr,
+                        const ZX_PARTITION *declaration_ptr);
+
+/* Work out where the image goes, and fill the load record.
+ *
+ * Touches nothing: no copy, no cache, no register.  On success the state
+ * becomes ZX_PARTITION_PREPARED and the record describes a copy the caller
+ * can then perform.
+ *
+ * Returns ZX_MANIFEST_SUCCESS or one of the ZX_MANIFEST_* codes -- one
+ * vocabulary rather than two, so that a boot message means the same thing
+ * wherever it came from.  The two failures it can report,
+ * ZX_MANIFEST_ENTRY_NOT_EXECUTABLE and ZX_MANIFEST_IMAGE_TOO_LARGE, are the
+ * SAME rules the validator applies and not a second copy of them: locating
+ * the window is work only the loader does, and once it is located those two
+ * conditions are one comparison each.  A caller that has already run
+ * zx_manifest_verify will never see either, which is the point -- the
+ * validator is what turns them from a run-time failure into a build-time
+ * one.  */
+
+ZX_NODISCARD UINT zx_partition_prepare(ZX_PARTITION_CB *cb_ptr);
+
+/* Say the copy and the cache maintenance are done.  The caller does both,
+   because both are architecture-specific; this records that they happened,
+   so that a transfer to EL1 from a partition whose image was never copied is
+   a state error rather than an ERET into whatever the window held.  */
+
+void zx_partition_loaded(ZX_PARTITION_CB *cb_ptr);
+
+/**************************************************************************/
+/*                          Entering and returning                        */
+/**************************************************************************/
+
+/* About to transfer to EL1.  Returns non-zero when the partition is in a
+   state that can be entered -- loaded, or previously yielded -- and zero
+   when it is not, which is the answer a caller must check rather than a
+   detail it can assume.  */
+
+ZX_NODISCARD UINT zx_partition_enter(ZX_PARTITION_CB *cb_ptr);
+
+/* Control came back.  The RECORD decides what happened, not the caller: the
+   syndrome is the evidence, and a caller that classified the outcome itself
+   would be a second opinion able to disagree with the fault report printed
+   beside it.
+ *
+ * record_ptr may be a null pointer, which is treated as "something came back
+ * and nothing was captured" -- ZX_PARTITION_STOPPED.  That is the honest
+ * reading: a return with no syndrome is not a yield.  */
+
+void zx_partition_returned(ZX_PARTITION_CB *cb_ptr,
+                           const zx_fault_record_t *record_ptr);
+
+/**************************************************************************/
+/*                              Reporting                                 */
+/**************************************************************************/
+
+ZX_NODISCARD const CHAR *zx_partition_state_name(UINT state);
+
+/* Print one partition's load record and outcome.
+ *
+ * Worth its space in the image for the same reason zx_mm_report is: a fault
+ * names a guest PC, and a guest PC means nothing without the window base it
+ * is an offset from.  Printing the window, the image extent and the entry
+ * next to each other is what lets a reader resolve that PC against the
+ * guest's own map file by hand.  */
+
+void zx_partition_report(const ZX_PARTITION_CB *cb_ptr);
 
 #ifdef __cplusplus
 }

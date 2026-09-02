@@ -126,6 +126,18 @@ void zx_board_describe_mmio_regions(ZX_REGION *region_ptr);
 
 void zx_board_report(void);
 
+/* What this board's system counter runs at, in Hz.
+ *
+ * A SOFTWARE-DECLARED CONSTANT, not something read from the hardware.  CNTFRQ
+ * reads ZERO out of reset on both ZoneX targets and nothing else reports the
+ * frequency, so the number has to come from the board's own knowledge -- the
+ * counter control frame on the model, and a measured-and-cross-checked clock
+ * tree on silicon.  ZoneX programs CNTFRQ from it before entering a guest,
+ * because CNTFRQ is writable only at the highest implemented exception level
+ * and a guest deriving a tick interval from a zero would divide by zero.  */
+
+ZX_NODISCARD uint32_t zx_board_counter_hz(void);
+
 /**************************************************************************/
 /*                    Symbols the linker script defines                   */
 /**************************************************************************/

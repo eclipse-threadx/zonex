@@ -87,6 +87,25 @@
    simply the first instance in the Reference Manual's list and reaches no
    connector on this board.  [RM + board]  */
 
+/* What the system counter runs at, in Hz.
+ *
+ * NOT A GUESS, AND NOT READ FROM ANYWHERE.  CNTFRQ is a software-declared
+ * constant: it reads zero out of reset on this silicon exactly as it does on
+ * the model, and nothing in the part reports the frequency.  The number below
+ * was established three ways during the Cortex-R52 port work and all three
+ * agree: the counter was measured against host wall-clock time at 8.0227 MHz
+ * over a 32-second interval; RTU.GPR CFG_CNTDV reads 4, so the divider is
+ * (4 + 1) = 5; and the board's FXOSC is 40 MHz, itself confirmed
+ * independently by the LINFlexD baud divisors the boot ROM left behind.
+ * 40 / 5 = 8.
+ *
+ * It is here rather than in the port because it is a BOARD fact.  ZoneX
+ * programs CNTFRQ from it before entering a guest, because CNTFRQ is writable
+ * only at the highest implemented exception level -- so a guest built to boot
+ * at EL1 cannot program it and would otherwise read zero.  */
+
+#define ZX_S32Z_SYSTEM_COUNTER_HZ   8000000UL
+
 #define ZX_S32Z_LINFLEX_9_BASE      0x42980000UL
 
 /* The window ZoneX maps for it.  16 KB covers the register block with room

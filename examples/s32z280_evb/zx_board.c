@@ -346,6 +346,20 @@ void zx_board_report(void)
 
 
 /**************************************************************************/
+/*  zx_board_counter_hz                                                   */
+/*                                                                        */
+/*  See the note on ZX_S32Z_SYSTEM_COUNTER_HZ in zx_platform.h: measured    */
+/*  three ways and cross-checked, because CNTFRQ is a software-declared    */
+/*  constant that reads zero out of reset on this part.                    */
+/**************************************************************************/
+
+uint32_t zx_board_counter_hz(void)
+{
+    return (uint32_t)ZX_S32Z_SYSTEM_COUNTER_HZ;
+}
+
+
+/**************************************************************************/
 /*  zx_board_describe_mmio_regions                                        */
 /*                                                                        */
 /*  The same two regions zx_board_program_mmio_regions writes, described   */

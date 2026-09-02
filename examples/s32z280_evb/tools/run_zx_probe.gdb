@@ -150,6 +150,27 @@ def sym(name):
 def val(name):
     return rd(sym(name))
 
+def have(name):
+    """Is this symbol in the image that was loaded?
+
+    ONE HARNESS, TWO FAMILIES OF IMAGE.  The stage-2 probe reports through
+    zx_payload_result; the one-partition image reports through a mailbox in
+    its guest's own window.  Everything else about the run -- attaching,
+    clearing EDBGREQ, loading, breaking on the parked symbol, the fault
+    record, the reset snapshots -- is identical, and duplicating two hundred
+    lines of bench procedure so that the last thirty could differ is how two
+    harnesses come to disagree about how the board is driven.
+
+    So the report ASKS what the image has.  lookup_symbol is scoped and
+    returns nothing for a file-scope object at this point, which is why this
+    goes through the symbol table by name instead.
+    """
+    try:
+        gdb.parse_and_eval("(unsigned int)&%s" % name)
+        return True
+    except gdb.error:
+        return False
+
 failures = 0
 
 # --- the image's own verdict -------------------------------------------------
@@ -169,25 +190,112 @@ elif verdict != 0:
 else:
     print("  the image reported every check passing")
 
-# --- what the payload did ----------------------------------------------------
-RAN, OWN_DATA, HVC_RET, PROBE_OK, ATTEMPTED, SURVIVED = (
-    0x01, 0x02, 0x04, 0x08, 0x10, 0x20)
+# --- what the payload did, on a stage-2 probe image --------------------------
+if have("zx_payload_result"):
+    RAN, OWN_DATA, HVC_RET, PROBE_OK, ATTEMPTED, SURVIVED = (
+        0x01, 0x02, 0x04, 0x08, 0x10, 0x20)
 
-progress = val("zx_payload_result")
-print("\n  zx_payload_result    = 0x%08X" % progress)
-for bit, name, want_set in ((RAN, "reached EL1 and ran", True),
-                            (OWN_DATA, "wrote and read back its own data", True),
-                            (HVC_RET, "returned from HVC #0", True),
-                            (ATTEMPTED, "attempted the forbidden access", True),
-                            (SURVIVED, "SURVIVED the forbidden access", False)):
-    got = bool(progress & bit)
-    ok = (got == want_set)
-    if not ok:
+    progress = val("zx_payload_result")
+    print("\n  zx_payload_result    = 0x%08X" % progress)
+    for bit, name, want_set in ((RAN, "reached EL1 and ran", True),
+                                (OWN_DATA, "wrote and read back its own data", True),
+                                (HVC_RET, "returned from HVC #0", True),
+                                (ATTEMPTED, "attempted the forbidden access", True),
+                                (SURVIVED, "SURVIVED the forbidden access", False)):
+        got = bool(progress & bit)
+        ok = (got == want_set)
+        if not ok:
+            failures += 1
+        print("    0x%02X %-34s %-5s  %s" % (bit, name, "set" if got else "clear",
+                                             "ok" if ok else "*** WRONG ***"))
+    if progress & SURVIVED:
+        print("    ISOLATION FAILURE: the payload wrote memory it was never granted.")
+
+# --- what the GUEST reported, on a one-partition image -----------------------
+#
+# Read out of the guest's own window, from EL2's side of the boundary, which
+# is possible because stage-2 AP cannot deny EL2 -- the same property that
+# stops AP from isolating partitions is what lets a debugger attached to the
+# hypervisor read a partition's memory.
+#
+# The CHECKSUM is verified before any of it is believed.  Three things it
+# catches and no single field can: a window nobody ever wrote (every word
+# zero, which the magic folded into the checksum makes fail), a guest torn off
+# mid-update, and a report read out of the wrong partition's window -- the
+# sentinel the hypervisor planted is folded in, so a report can be attributed
+# rather than merely found.
+if have("__zx_partition_a_start"):
+    GD_PROGRESS, GD_SCRATCH   = 0x00, 0x04
+    GD_SEQUENCE, GD_CHECKSUM  = 0x18, 0x1C
+    GD_TICKS, GD_THREAD_A     = 0x20, 0x24
+    GD_THREAD_B, GD_MESSAGES  = 0x28, 0x2C
+    GD_VERDICT                = 0x30
+    GD_FAULT_STATUS           = 0x34
+    GD_FAULT_ADDRESS          = 0x38
+    GD_STAGE1                 = 0x3C
+
+    GP_BSP_MAIN, GP_KERNEL    = 0x0100, 0x0200
+    GP_THREADS, GP_QUEUE      = 0x0400, 0x0800
+    GP_SEMAPHORE, GP_FINISHED = 0x1000, 0x4000
+    GP_PROBE_SURVIVED         = 0x0004
+
+    GV_PASSED = 0x600DBEEF
+    GV_FAILED = 0x0BADBEEF
+
+    REPORT_MAGIC = 0x5A58F00D
+
+    box = sym("__zx_partition_a_start")
+
+    def mb(offset):
+        return rd(box + offset)
+
+    print("\n  partition A's window = 0x%08X" % box)
+    print("  the guest's mailbox, read from EL2's side of the boundary:")
+    print("    progress         = 0x%08X" % mb(GD_PROGRESS))
+    print("    sequence         = %d" % mb(GD_SEQUENCE))
+    print("    sentinel         = 0x%08X" % mb(GD_SCRATCH))
+    print("    guest ticks      = %d" % mb(GD_TICKS))
+    print("    producer slices  = %d" % mb(GD_THREAD_A))
+    print("    consumer slices  = %d" % mb(GD_THREAD_B))
+    print("    messages carried = %d" % mb(GD_MESSAGES))
+    print("    verdict          = 0x%08X" % mb(GD_VERDICT))
+    print("    stage-1 vector   = 0x%08X" % mb(GD_STAGE1))
+    print("    stage-1 DFSR     = 0x%08X" % mb(GD_FAULT_STATUS))
+    print("    stage-1 DFAR     = 0x%08X" % mb(GD_FAULT_ADDRESS))
+
+    expected = (REPORT_MAGIC + mb(GD_SCRATCH) + mb(GD_PROGRESS)
+                + mb(GD_SEQUENCE) + mb(GD_TICKS) + mb(GD_THREAD_A)
+                + mb(GD_THREAD_B) + mb(GD_MESSAGES)
+                + mb(GD_VERDICT)) & 0xFFFFFFFF
+
+    print("    checksum         = 0x%08X, expected 0x%08X"
+          % (mb(GD_CHECKSUM), expected))
+
+    if mb(GD_SEQUENCE) == 0:
+        print("    *** FAIL: the guest never sealed a report, so it either")
+        print("              never ran or never reached its first publish.")
         failures += 1
-    print("    0x%02X %-34s %-5s  %s" % (bit, name, "set" if got else "clear",
-                                         "ok" if ok else "*** WRONG ***"))
-if progress & SURVIVED:
-    print("    ISOLATION FAILURE: the payload wrote memory it was never granted.")
+    elif mb(GD_CHECKSUM) != expected:
+        print("    *** FAIL: the checksum disagrees.  This report is torn,")
+        print("              or it was read out of the wrong window.")
+        failures += 1
+    else:
+        print("    the report is sealed and attributable")
+
+    for bit, name in ((GP_BSP_MAIN,  "reached bsp_main"),
+                      (GP_KERNEL,    "tx_application_define ran"),
+                      (GP_THREADS,   "both threads took slices"),
+                      (GP_QUEUE,     "the queue carried every message"),
+                      (GP_SEMAPHORE, "the semaphore behaved"),
+                      (GP_FINISHED,  "reached its own verdict")):
+        print("    0x%04X %-34s %s"
+              % (bit, name, "yes" if (mb(GD_PROGRESS) & bit) else "no"))
+
+    if mb(GD_PROGRESS) & GP_PROBE_SURVIVED:
+        print("    *** the guest's probe SURVIVED.  On the default image and")
+        print("        on the two fault images that is an ISOLATION FAILURE;")
+        print("        on the granted-address image it is the expected")
+        print("        result and the image's own verdict says FAILED for it.")
 
 # --- what the trap handler captured ------------------------------------------
 print("")

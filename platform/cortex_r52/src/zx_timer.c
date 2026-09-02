@@ -29,10 +29,81 @@
 /*    partition its own CNTVOFF so that guest time freezes while the      */
 /*    partition is descheduled.  See docs/decisions.md D7.                */
 /*                                                                        */
-/*    This translation unit is deliberately empty of implementation.      */
-/*    See docs/armv8r-el2-reference.md for the verified register sheet    */
-/*    the code that lands here must be written against.                   */
+/*    Only ONE thing is implemented here so far, and it is the thing a    */
+/*    guest cannot do for itself.  Interrupt delivery, the partition tick */
+/*    and CNTVOFF arrive with time partitioning; see                      */
+/*    docs/armv8r-el2-reference.md for the verified register sheet the    */
+/*    code that lands here must be written against.                       */
+/*                                                                        */
+/*  MISRA C:2012 deviations (justified)                                   */
+/*                                                                        */
+/*    Directive 4.3 -- each asm statement below is one coprocessor        */
+/*      operation in a function that does nothing else.                   */
 /*                                                                        */
 /**************************************************************************/
 
 #include "zx_port.h"
+
+/* HCPTR.TCP10 and TCP11 trap EL1 and EL0 access to CP10 and CP11 -- the
+   floating-point unit -- to EL2.  Both reset SET.  */
+
+#define ZX_HCPTR_TCP        (ZX_C32(0x3) << 10)
+
+
+/**************************************************************************/
+/*                                                                        */
+/*  FUNCTION                                               RELEASE        */
+/*                                                                        */
+/*    zx_el2_prepare_guest_el1                             Cortex-R52     */
+/*                                                                        */
+/*  DESCRIPTION                                                           */
+/*                                                                        */
+/*    The EL2-only configuration a guest needs and cannot perform itself.  */
+/*                                                                        */
+/*    WHY THIS FUNCTION EXISTS AT ALL.  A standalone Cortex-R52 kernel     */
+/*    resets INTO EL2 and does this work in its own boot path.  Built as a */
+/*    guest it skips that block entirely -- which is the whole point of    */
+/*    the port's TX_R52_BOOT_AT_EL1 option -- so the work does not stop    */
+/*    being necessary, it changes owner.  This is that list, and it is     */
+/*    deliberately short:                                                  */
+/*                                                                        */
+/*      HCPTR.TCP10/TCP11  cleared, so a guest may use its FPU without     */
+/*                         every access trapping to EL2.                   */
+/*      CNTFRQ             programmed, because it is writable only at the  */
+/*                         highest implemented exception level and reads   */
+/*                         ZERO out of reset on both ZoneX targets.  Any   */
+/*                         guest computing a tick interval from it would   */
+/*                         divide by zero.                                 */
+/*                                                                        */
+/*    AND ONE THING DELIBERATELY NOT DONE.  CNTHCTL.PL1PCTEN and PL1PCEN   */
+/*    stay CLEAR, so EL1 cannot reach the physical counter or the physical */
+/*    timer.  A standalone kernel opens both; a partition must not have    */
+/*    them, because a partition's PHYSICAL time keeps running while it is  */
+/*    descheduled and a guest reading it can therefore observe that it was */
+/*    not running.  That observation is the temporal-determinism claim,    */
+/*    lost.  Guests get the VIRTUAL timer with a per-partition CNTVOFF     */
+/*    instead, which is what freezes a descheduled partition's clock --    */
+/*    see docs/decisions.md D7.  The virtual counter needs no enable here. */
+/*                                                                        */
+/*    FLOATING POINT IS NOT YET PARTITION STATE.  Clearing the traps lets  */
+/*    a guest use the FPU; nothing in ZoneX saves or restores FPEXC, FPSCR */
+/*    or the D-registers across a partition switch.  With one partition    */
+/*    that is exactly correct and with two it is a defect, so it is        */
+/*    written down here rather than discovered by two guests sharing a     */
+/*    register bank.                                                       */
+/*                                                                        */
+/**************************************************************************/
+
+void zx_el2_prepare_guest_el1(uint32_t counter_hz)
+{
+    uint32_t hcptr;
+
+    __asm__ volatile("mrc p15, 4, %0, c1, c1, 2" : "=r"(hcptr));
+    hcptr &= ~(uint32_t)ZX_HCPTR_TCP;
+    __asm__ volatile("mcr p15, 4, %0, c1, c1, 2" : : "r"(hcptr) : "memory");
+    __asm__ volatile("isb");
+
+    __asm__ volatile("mcr p15, 0, %0, c14, c0, 0"
+                     : : "r"(counter_hz) : "memory");
+    __asm__ volatile("isb");
+}

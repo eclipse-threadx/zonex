@@ -22,6 +22,11 @@
 # The model is found by CMake, with $HOME/FVP_Base_AEMv8R_11.32_19/bin as the
 # hint.  Point ZX_FVP at a different one to override it.
 #
+# Point ZX_THREADX at a ThreadX checkout to build the ThreadX GUEST images as
+# well.  Without it the guest images are skipped -- with a message rather than
+# an error -- and the stage-2 probe images still build and run, so a
+# contributor with no ThreadX to hand can still exercise most of the suite.
+#
 # The suite is three runs of the same program: zx_probe.elf, which must pass,
 # and two builds that must FAIL -- zx_probe_negative.elf, whose deliberate
 # violation is aimed at an address the payload IS granted, and
@@ -45,6 +50,16 @@ configure() {
     if [ -n "${ZX_FVP:-}" ]; then
         args+=("-DZX_FVP_BASER_AEMV8R=${ZX_FVP}")
     fi
+    # The ThreadX checkout the GUEST images are built from.  ZoneX itself
+    # links no ThreadX -- at EL2 it is a standalone bare-metal program -- but
+    # the examples build ThreadX guests, so the dependency is real and it is
+    # taken from the environment rather than guessed at.  Point ZX_THREADX at
+    # a checkout; leave it unset and the guest images are simply not built,
+    # with a message from CMake saying so.
+    if [ -n "${ZX_THREADX:-}" ]; then
+        args+=("-DZX_THREADX_SOURCE_DIR=${ZX_THREADX}")
+    fi
+
     cmake -S "${ROOT}" -B "${BUILD}" -G Ninja \
         -DCMAKE_TOOLCHAIN_FILE="${ROOT}/cmake/cortex_r52.cmake" \
         -DCMAKE_BUILD_TYPE=Debug \

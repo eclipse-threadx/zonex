@@ -158,7 +158,7 @@ before PMSAv8-R's lack of region priority rules it out.
 
 ---
 
-## D4 — How the region set is switched · **settled 2 Sep 2026; cost measured on the model, silicon pending**
+## D4 — How the region set is switched · **settled; cost measured on silicon 2 Sep 2026**
 
 **One `HPRENR` mask write.** Region descriptors are programmed once at boot,
 each partition owns a fixed block of indices, and a switch changes which
@@ -196,10 +196,41 @@ once at boot. Unrolling them means roughly a hundred inline `MCR`/`MRC`
 statements, because coprocessor register numbers must be compile-time
 constants. That cost buys nothing while the switch is a mask.
 
-**Still open: the figures above are the model's**, and a functional model does
-not model timing. The number a safety customer is quoted has to come from the
-part. The measurement path itself is in the image and runs on every target, so
-this closes with a board session rather than with new code.
+**The figures are now the part's, and they narrow the margin.** Measured on the
+S32Z280-594EVB, reproducible bit for bit across three runs:
+
+| | Armv8-R AEM FVP | S32Z280-594EVB |
+|---|---|---|
+| `HPRENR` mask switch | 13 cycles | **235 cycles** |
+| one region descriptor write | 54 cycles | **472 cycles** |
+| counter read overhead, subtracted | — | 84 cycles |
+| ratio, region write : mask | 4.2 | **2.0** |
+
+The decision does not change and the reasoning for it does. A block rewrite at
+three regions per partition costs 1416 cycles against 235 — still nearly six
+times the mask — and, unlike the mask, that figure **grows with the incoming
+partition's region count**, which is the property a worst-case-execution-time
+argument cannot have. That property, not the ratio, is what the design rests
+on.
+
+But the ratio matters to anyone reading the model's numbers as a guide: on
+silicon a region write costs twice the mask, not four times. **A per-region
+figure taken from the model would have been optimistic by a factor of two.**
+And 235 cycles for one register write says plainly where the mask's own cost
+sits — in the `DSB`/`ISB` pair that has to retire before the next instruction
+fetch can depend on the new permissions, not in the write. Reducing it means
+arguing about barriers, not about encodings.
+
+**A note on how these were measured, because the method is reusable and the
+first version of it was wrong.** Both figures average eight operations with the
+cost of reading the counter measured separately and subtracted, and the
+switches alternate between two masks so that no iteration is writing the value
+already in force — an implementation is entitled to make that cheap in a way a
+real switch is not. The guest-excursion figures in D8 and D23 needed one
+further correction: **the first execution of anything on a real core is not
+comparable to the second**, so a measured pair that also differs in order
+measures neither. The one-partition image spends a warm-up excursion and
+discards it.
 
 The budget arithmetic is unchanged: 20 regions on the S32Z280, minus two for
 the hypervisor's own MMIO (D2), leaves 18 for every partition and guest.
@@ -262,7 +293,7 @@ claim is not simplicity worth having here.
 
 ---
 
-## D8 — The console · **probe settled; sharing open**
+## D8 — The console · **settled; the sharing half settled 2 Sep 2026**
 
 ZoneX needs a console before it needs anything else, because the Armv8-R AEM
 FVP has no debugger seam at all — an Iris server and no GDB stub — so a model
@@ -289,14 +320,49 @@ the SAME image printing cleanly on both targets is itself evidence about the
 region programming. A run whose text arrives intact on the board has
 demonstrated a correct Device region, without a separate test for it.
 
-**Still open: how two partitions share a console.** That decision arrives when
-there are two of them, and the options are:
+**How partitions share the console: an `HVC` console, settled 2 September
+2026.** A guest's `console_putc` is one hypercall with the character in `r0`;
+the hypervisor owns the one device and writes it. Three options were open and
+the other two both fail on the arrival of the second partition:
 
-* one partition owns the UART and the other has no console;
-* both get it mapped, which is honest about there being no device isolation in
-  Phase 0 and should be said out loud if chosen;
-* an `HVC` console hypercall, which costs more and exercises the hypercall
-  vector as a side effect.
+* *One partition owns the UART and the other is mute.* Cheapest, and it makes
+  the demonstrator show half of what it exists to show — the whole point of
+  two partitions is that a reader can watch both.
+* *Map the device into both.* Honest about there being no device isolation in
+  Phase 0, and it puts MMIO into every partition's stage-2 region set, which
+  lengthens the isolation claim the component exists to make and spends region
+  budget per partition rather than once.
+* *The guest asks and the hypervisor writes.* Chosen.
+
+What it buys, beyond surviving a second partition: the device stays out of
+every partition's region set; the hypercall vector is exercised by something
+real rather than by a counter; and the **hypervisor tags each line with the
+partition it scheduled**, so a guest cannot claim to be another one. That last
+point is free — the hypervisor is already in the loop for every character —
+and it is the kind of detail a safety reviewer asks about.
+
+**The cost is real and is not hidden.** One trap per character through a
+polled UART is, on the S32Z280, roughly three orders of magnitude more work
+than everything else a small guest does: a guest excursion measured 27,052
+cycles quiet and 5,051,788 cycles printing. Two consequences, both of them
+implemented rather than noted:
+
+* **A partition that is printing is not a partition whose timing should be
+  measured.** The one-partition image therefore runs its measured passes with
+  the console suppressed by a mailbox option and its demonstration pass loud —
+  the same guest image either way, so that the run being measured is the run
+  being shown. Without that, "what does stage 2 cost" could only be bounded
+  from above and never resolved. See the measurement note in D4.
+* **A later phase that needs both at once buffers per partition and flushes at
+  a window boundary.** That is not written yet, and the shape it needs is a
+  per-partition buffer with a bound on it — `core/src/zx_guest_console.c` says
+  so where the single-partition state is declared.
+
+The tagging rules are text, and text is worth testing where text can be
+tested: the host suite asserts them against a capture buffer — one tag per
+line and no more, no dangling tag after a final newline, a partial line closed
+before the hypervisor speaks, and a guest's forged tag appearing as ordinary
+text inside a correctly attributed line.
 
 ---
 
@@ -437,7 +503,7 @@ be thin whenever ZoneX acquires a reason for one.
 
 ---
 
-## D14 — The seam to a ThreadX checkout · **settled; implemented with the first guest image**
+## D14 — The seam to a ThreadX checkout · **settled; implemented 2 Sep 2026**
 
 **A single CMake cache variable, `ZX_THREADX_SOURCE_DIR`**, declared in the
 root `CMakeLists.txt` now and consumed by the examples once they build guest
@@ -455,6 +521,23 @@ S32Z280 `entry.S` has no `TX_R52_BOOT_AT_EL1` option — the FVP one does — an
 silicon guest cannot start at EL1 without it. That is the reason the seam is a
 path to a checkout rather than a released tarball for now, and it will stop
 being one as soon as that option is upstream.
+
+*Implemented 2 September 2026, and the split it produced is worth recording.*
+The variable is consumed by `examples/*/guest_a`, and **the model's guest needs
+no ThreadX-side change at all**: the FVP `entry.S` has carried
+`TX_R52_BOOT_AT_EL1` since it was written, for exactly this case — "an earlier
+boot stage or a vendor EL2 monitor has already dropped privilege to EL1" — so
+the FVP guest builds from unmodified upstream sources. That is what lets the
+FVP execution workflow pin a public ThreadX commit and build a guest in CI,
+which the silicon half cannot do until the S32Z280 bracket is upstream. Only
+the silicon guest waits on a kernel change, and it is one bracket.
+
+Leaving the variable EMPTY is a supported configuration and not a broken one:
+the guest images are skipped with a message from CMake, the stage-2 probe
+images still build and run, and a contributor with no kernel sources to hand
+can still exercise most of the suite. The FVP workflow nevertheless treats a
+guestless build as an ERROR, because there the checkout is arranged and a
+silent skip would mean half the suite quietly stopped booting a kernel.
 
 ---
 
@@ -642,3 +725,173 @@ than assumed: the four attribute bytes consecutive in every lane, and the
 whole descriptor pinned to 12 bytes on a 32-bit port, so that a layout change
 in either target toolchain fails the build instead of producing two images
 that disagree about the manifest.
+
+---
+
+## D20 — What selects a hypercall · **settled 2 Sep 2026**
+
+**The `HVC` immediate, not a function id in a register.** `HVC #0` is the empty
+Phase-0 vector, `HVC #1` a guest handing control back, `HVC #2` one character
+for the hypervisor to print, with the character in `r0`.
+
+The obvious alternative — a function id in `r0` and arguments from `r1` — is
+the right shape for a general hypercall ABI, and it is what an A-profile
+hypervisor does. It loses here on three counts, and the third is the one that
+decided it.
+
+* **The vector already decodes immediates.** Telling a yield from a
+  transparent return was the first thing the trap handler ever had to do (D16),
+  so the machinery exists and a register-based id would be a second mechanism
+  beside it rather than instead of it.
+* **Phase 0 has three hypercalls.** A dispatch table earns its keep at a few
+  dozen; at three it is a comparison chain either way.
+* **It costs a guest nothing.** A console backend receives its character in
+  `r0` under AAPCS already, so `hvc #2` is the whole call. An id in `r0` means
+  moving the character to `r1` and loading a constant into `r0` on **every
+  character of the slowest path a guest has** — one trap each, through a polled
+  UART (D8).
+
+The cost of being wrong is bounded and visible: sixteen bits of immediate is a
+small namespace, and when a fourth call arrives this stays while a fortieth
+would move the selector into a register. This entry is the record of why it
+was not there to begin with.
+
+**The two spellings are asserted against each other.** A guest is a separate
+program with its own toolchain invocation and cannot include the hypervisor's
+headers, so it restates the immediates in `examples/common/zx_guest_abi.h`
+while the hypervisor decodes them from `core/inc/zx_fault.h`. The one
+translation unit that sees both — the example that builds the image —
+`_Static_assert`s that they agree, so a renumbered immediate fails the BUILD
+rather than making a guest's console output vanish on the model.
+
+---
+
+## D21 — A guest image declares the window it was built for · **settled 2 Sep 2026**
+
+**Three words at a fixed offset in every guest image: the window base it was
+linked for, the window size, and a magic number.** The loader checks all three
+against the manifest before it ERETs anywhere, and refuses by name.
+
+The problem this solves is that **a guest linked for the wrong window starts**.
+Its entry point is reached through a PC-relative branch, which survives being
+copied anywhere; every other absolute address in it — its literal pools, its
+`VBAR`, its own stage-1 MPU bases — is baked in at link time. So the failure is
+not a guest that does not run. It is a guest that boots, schedules, and then
+reads or writes an address in somebody else's partition, taking a stage-2 fault
+whose report names a perfectly reasonable-looking guest PC. Nothing anywhere in
+that chain says "this image was built for a different address", and the reader
+is sent to the loader when the fault is in the build.
+
+Three ways to know the linked address were available:
+
+* *Extract the ELF entry point and load address at build time into a generated
+  header.* Works, and makes the manifest depend on a build step whose output
+  nothing checks.
+* *Match the boot object's `.text` by linker input pattern so the entry lands
+  first.* The pattern has to name an object-file suffix, which differs between
+  toolchains — and a pattern that matches nothing produces an empty section at
+  whatever address the location counter held, rather than an error.
+* *Have the guest say so.* Twelve bytes, no build step, and the guest's own
+  linker script asserts the values it emits.
+
+**The magic number earns its four bytes twice over.** A window nobody wrote
+reads as zero, and an `.incbin` whose file was absent, or a linker input
+pattern that matched nothing, produces an EMPTY section rather than a
+diagnostic — so "the header does not carry the magic" catches a missing guest
+and a wrong guest with one comparison. It is checked from the image SOURCE and
+not from the window, deliberately: a check performed on the copy has already
+overwritten whatever was there.
+
+Two independent checks exist for the empty-image case because it has happened
+before in this suite: the linker script asserts the blob is larger than the
+header it must contain, and the manifest validator rejects an image of zero
+length outright (`ZX_MANIFEST_IMAGE_EMPTY`).
+
+---
+
+## D22 — How a guest is built · **settled 2 Sep 2026**
+
+**A separate CMake project, configured with THREADX's toolchain file, built as
+a superbuild step. Not `add_subdirectory`.** What crosses back is one file: a
+raw binary the hypervisor embeds with `.incbin` (D6).
+
+Three reasons, and the first two are about not contaminating a kernel:
+
+* **The guest is ThreadX and stays C99**, with ThreadX's own settings. ZoneX is
+  C17 with `CMAKE_C_EXTENSIONS OFF` and `-Wpedantic` (D12). One build tree
+  imposes one of those on both, and "the hypervisor's build settings silently
+  changed how the kernel was compiled" is not a sentence anybody wants in a
+  defect report.
+* **The guest is built the way ThreadX's own CI builds it**, because it is
+  configured with ThreadX's toolchain file. A guest compiled some other way is
+  a guest whose failures are not the kernel's.
+* **A guest ELF must never enter the hypervisor's link.** Two ThreadX-shaped
+  images in one link resolve into each other silently, chosen by link order
+  rather than by intent. Separate projects make that impossible rather than
+  merely unlikely.
+
+The guest's toolchain **follows the lane**: ZoneX builds with
+`arm-none-eabi-gcc` and with ATfE clang, and the guest support under
+`examples/guest_common` is ZoneX's own code even though it is compiled into a
+ThreadX image — so it must face both compilers like everything else here.
+Pinning the guest to GCC would leave those files compiled by one toolchain, and
+that is exactly the gap a GNU-only construct gets through.
+
+**`BUILD_ALWAYS` is on, and it is not laziness.** The outer build cannot see
+into the sub-build's dependency graph, so without it, editing the guest's
+application leaves a stale blob embedded in an image that relinks happily —
+the same class of quiet failure as a linker pattern that matches nothing.
+`OBJECT_DEPENDS` on the blob is the other half: `add_dependencies` orders the
+two builds but says nothing about which objects are stale when the blob
+changes.
+
+**CI pins a ThreadX commit rather than tracking a branch.** An unpinned guest
+would make this suite's verdict depend on a second repository's latest state,
+so a ZoneX pull request could go red for a reason that had nothing to do with
+it and everything to do with a kernel change landing that morning. Bumping the
+pin is then a deliberate, reviewable change with its own diff — which is what
+upgrading a dependency should look like.
+
+---
+
+## D23 — What ZoneX takes over from a guest's boot path · **settled 2 Sep 2026**
+
+**Two things: `CNTFRQ` and `HCPTR.TCP10/TCP11`. One thing deliberately NOT:
+`CNTHCTL.PL1PCTEN` and `PL1PCEN`.**
+
+A standalone Cortex-R52 kernel resets *into* EL2 and configures it in its own
+boot path. Built as a guest it skips that block entirely — which is the whole
+point of the port's `TX_R52_BOOT_AT_EL1` option — so the work does not stop
+being necessary, it changes owner. This is the list, and keeping it short is
+itself a design goal: everything on it is a coupling between the hypervisor and
+a guest's expectations.
+
+* **`CNTFRQ` is programmed** from the board's declared counter frequency. It is
+  writable only at the highest implemented exception level and reads **zero out
+  of reset on both ZoneX targets**, so a guest deriving a tick interval from it
+  divides by zero. The frequency is a software-declared constant in both cases:
+  `CNTFID0` read back from the counter control frame on the model, and a
+  measured-and-cross-checked clock tree on the S32Z280.
+* **`HCPTR.TCP10/TCP11` are cleared**, so a guest may use its FPU without every
+  access trapping to EL2. Both reset SET.
+
+**And the omission is the interesting half.** A standalone kernel opens
+`CNTHCTL.PL1PCTEN` and `PL1PCEN`, because it owns the physical timer. A
+partition must not have them: **a partition's physical time keeps running while
+it is descheduled**, so a guest reading it can observe that it was not running
+— and that observation is the temporal-determinism claim, lost. Guests get the
+virtual timer with a per-partition `CNTVOFF` instead (D7), which needs no
+enable here. This is the first place where "what a kernel does standalone" and
+"what a kernel may do as a partition" genuinely diverge, rather than merely
+moving.
+
+**One consequence is recorded now because it becomes a defect later.** Clearing
+the FPU traps lets a guest use floating point; nothing in ZoneX saves or
+restores `FPEXC`, `FPSCR` or the D-registers across a partition switch. With
+one partition that is exactly correct. With two it is two guests sharing a
+register bank, which is the kind of thing that is found by a wrong answer
+rather than by a fault.
+
+The same list, written from the kernel's side, is at the `#ifndef` in the
+S32Z280 `entry.S` — next to the code it replaces, which is where somebody
+adding a third board will be looking.

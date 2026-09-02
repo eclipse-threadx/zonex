@@ -289,6 +289,7 @@
 
 #define ZX_ASM_HVC_IMM_NOP          0x0000
 #define ZX_ASM_HVC_IMM_YIELD        0x0001
+#define ZX_ASM_HVC_IMM_PUTC         0x0002
 
 #define ZX_ASM_VEC_RESET            0x00
 #define ZX_ASM_VEC_UNDEF            0x04
@@ -444,6 +445,53 @@ void zx_hprenr_disable(uint32_t index);
  * the validator accepts can ask for today.  See docs/decisions.md D4.  */
 
 void zx_stage2_enable_set(uint32_t mask);
+
+/**************************************************************************/
+/*                 Preparing EL1 for a guest that boots there             */
+/**************************************************************************/
+
+/* The EL2-only configuration a guest needs and cannot perform itself.
+ *
+ * A standalone Cortex-R52 kernel resets into EL2 and does this in its own boot
+ * path.  Built as a guest it skips that block -- which is what the port's
+ * TX_R52_BOOT_AT_EL1 option is for -- so the work changes owner rather than
+ * ceasing to be necessary.  Clears HCPTR.TCP10/TCP11 and programs CNTFRQ from
+ * the board's counter frequency, and deliberately does NOT open EL1 access to
+ * the physical counter.  The reasoning for each, including the omission, is in
+ * platform/cortex_r52/src/zx_timer.c.  */
+
+void zx_el2_prepare_guest_el1(uint32_t counter_hz);
+
+/**************************************************************************/
+/*                    Making a copied image executable                    */
+/**************************************************************************/
+
+/* Clean the bytes of a freshly copied guest image out of the data cache and
+   invalidate the instruction cache, in that order and with the barriers
+   between them.
+ *
+ * ONE FUNCTION AND NOT TWO, because the failure mode is doing one half.  An
+ * image whose data side was cleaned and whose instruction side was not is
+ * executable by luck: a cold instruction cache over an address nothing has
+ * executed misses, fetches from memory and works, until an eviction lands
+ * differently.  Nothing reports that, and the two-address module test during
+ * the Cortex-R52 Modules port work passed before this maintenance existed.
+ *
+ * ZoneX runs with HSCTLR.C and HSCTLR.I clear today, so this is currently
+ * redundant.  It is here anyway: the change that turns caches on will be one
+ * line in the reset path, made by somebody with no reason to think about the
+ * loader.  See platform/cortex_r52/src/zx_cache.c for why the data side is
+ * cleaned by range and the instruction side invalidated whole.  */
+
+void zx_cache_sync_after_load(zx_addr_t base, zx_size_t length);
+
+/* The smallest cache line on each side, in bytes, across every level.
+   Reported at boot rather than merely used, because a maintenance loop that
+   strode wrongly does not fail -- it leaves lines untouched -- so the stride
+   belongs in a log where it can be compared against the part.  */
+
+ZX_NODISCARD uint32_t zx_cache_dcache_line_bytes(void);
+ZX_NODISCARD uint32_t zx_cache_icache_line_bytes(void);
 
 /**************************************************************************/
 /*                        The PMU cycle counter                           */

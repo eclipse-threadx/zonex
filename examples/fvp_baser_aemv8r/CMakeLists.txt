@@ -63,6 +63,7 @@ function(zx_add_fvp_probe target_name)
     add_executable(${target_name} EXCLUDE_FROM_ALL
         ${ZX_COMMON_DIR}/zx_probe_main.c
         ${ZX_COMMON_DIR}/zx_partitions.c
+        ${ZX_COMMON_DIR}/zx_report.c
         ${ZX_COMMON_DIR}/zx_payload.S
         ${ZX_FVP_DIR}/zx_board.c
     )
@@ -152,6 +153,158 @@ zx_add_fvp_probe(zx_probe_badattr.elf)
 target_compile_definitions(zx_probe_badattr.elf PRIVATE ZX_PROBE_BAD_ATTR)
 
 ###############################################################################
+# The ThreadX guest, and the image that launches it
+###############################################################################
+#
+# THE GUEST IS BUILT BY A SEPARATE CMAKE INVOCATION, as an ExternalProject.
+# Not an add_subdirectory, and the reasons are in guest_a/CMakeLists.txt --
+# briefly: the guest is ThreadX and stays C99 with ThreadX's own settings
+# while ZoneX is C17 with -Wpedantic, the guest is configured with THREADX's
+# toolchain file so that it is built the way ThreadX's own CI builds it, and a
+# guest ELF must never be able to enter the hypervisor's link.
+#
+# What crosses back is one file: guest_a.bin, which zx_guest_image.S pulls in
+# with .incbin.  guest_a.elf and guest_a.map stay in the guest's own build
+# directory beside it, because a fault report names a guest PC and the map
+# file is the only way to turn that back into a function.
+
+if(ZX_THREADX_SOURCE_DIR)
+    include(ExternalProject)
+
+    set(ZX_GUEST_A_BUILD ${CMAKE_CURRENT_BINARY_DIR}/guest_a)
+    set(ZX_GUEST_A_BLOB  ${ZX_GUEST_A_BUILD}/guest_a.bin)
+
+    # ThreadX's own toolchain file, not ZoneX's.  They select the same
+    # compiler and the same -mcpu, deliberately, but ZoneX's sets ZX_ARCH and
+    # C17 while ThreadX's sets THREADX_ARCH -- and the guest's build needs the
+    # second.
+    #
+    # AND IT FOLLOWS THE LANE.  ZoneX builds with arm-none-eabi-gcc and with
+    # ATfE clang, and the guest support under examples/guest_common is ZoneX's
+    # own code even though it is compiled into a ThreadX image -- so it has to
+    # face both compilers like everything else here.  Pinning the guest to GCC
+    # would leave those files compiled by one toolchain only, which is exactly
+    # the gap that lets a GNU-only construct through.
+    if(CMAKE_C_COMPILER_ID STREQUAL "Clang")
+        set(ZX_GUEST_TOOLCHAIN
+            ${ZX_THREADX_SOURCE_DIR}/cmake/cortex_r52_clang.cmake)
+    else()
+        set(ZX_GUEST_TOOLCHAIN
+            ${ZX_THREADX_SOURCE_DIR}/cmake/cortex_r52.cmake)
+    endif()
+
+    ExternalProject_Add(zx_guest_a
+        SOURCE_DIR      ${ZX_FVP_DIR}/guest_a
+        BINARY_DIR      ${ZX_GUEST_A_BUILD}
+        CMAKE_GENERATOR ${CMAKE_GENERATOR}
+        CMAKE_ARGS
+            -DCMAKE_TOOLCHAIN_FILE=${ZX_GUEST_TOOLCHAIN}
+            -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
+            -DZX_THREADX_SOURCE_DIR=${ZX_THREADX_SOURCE_DIR}
+            -DZX_GUEST_COMMON_DIR=${ZX_COMMON_DIR}
+        BUILD_BYPRODUCTS ${ZX_GUEST_A_BLOB}
+        # BUILD_ALWAYS, because the sub-build has its own dependency graph and
+        # this one cannot see into it.  Without it, editing the guest's
+        # application would leave a stale blob embedded in an image that
+        # relinked happily -- which is the same class of failure as a linker
+        # pattern that matches nothing, and just as quiet.
+        BUILD_ALWAYS    TRUE
+        INSTALL_COMMAND ""
+        USES_TERMINAL_CONFIGURE FALSE
+        USES_TERMINAL_BUILD     FALSE
+    )
+
+    # One function, because the three probe variants are the same image with
+    # one definition changed.  Building them from a shared function is what
+    # keeps them honest: a negative build that had drifted from the positive
+    # one would prove nothing about it.
+    function(zx_add_one_partition target_name)
+        add_executable(${target_name} EXCLUDE_FROM_ALL
+            ${ZX_COMMON_DIR}/zx_one_partition.c
+            ${ZX_COMMON_DIR}/zx_report.c
+            ${ZX_COMMON_DIR}/zx_guest_image.S
+            ${ZX_FVP_DIR}/zx_board.c
+        )
+
+        add_dependencies(${target_name} zx_guest_a)
+
+        target_include_directories(${target_name} PRIVATE
+            ${ZX_FVP_DIR}
+            ${ZX_COMMON_DIR}
+        )
+
+        # .incbin SEARCHES THE ASSEMBLER'S INCLUDE PATH, NOT THE COMPILER'S.
+        # -I on the compiler command line does not reach the assembler; it
+        # needs -Wa,-I.  Getting this wrong fails the assembly with "file not
+        # found", which is the good outcome -- the neighbouring mistake, a
+        # LINKER input pattern that matches nothing, produces an empty section
+        # and an image that builds and contains no guest.
+        #
+        # OBJECT_DEPENDS is what makes the blob a dependency of the object.
+        # add_dependencies orders the guest build before this target but says
+        # nothing about which of this target's outputs are stale when the blob
+        # changes, so without it a rebuilt guest would not be re-embedded.
+        set_source_files_properties(${ZX_COMMON_DIR}/zx_guest_image.S
+            PROPERTIES
+                COMPILE_OPTIONS "-Wa,-I${ZX_GUEST_A_BUILD}"
+                OBJECT_DEPENDS  "${ZX_GUEST_A_BLOB}"
+        )
+
+        target_link_libraries(${target_name} PRIVATE
+            eclipse-threadx::zonex
+            zonex::warnings
+        )
+
+        target_link_options(${target_name} PRIVATE
+            -T${ZX_FVP_DIR}/zx_one_partition.lds
+            -nostartfiles
+            -Wl,-Map=${target_name}.map
+            ${ZX_LINK_QUIET_RWX}
+        )
+
+        set_target_properties(${target_name} PROPERTIES
+            LINK_DEPENDS ${ZX_FVP_DIR}/zx_one_partition.lds
+        )
+    endfunction()
+
+    # The image the suite runs: a real ThreadX kernel booting, scheduling and
+    # printing inside one stage-2 confined partition.
+    zx_add_one_partition(zx_one_partition.elf)
+
+    # A REAL KERNEL STOPPED AT ITS BOUNDARY.  The guest grants itself the
+    # granule immediately after its window -- its own MPU then says it owns
+    # memory the manifest never gave it -- and writes to it.  Stage 2 refuses,
+    # which is what "the stricter of the two stages wins" means when the two
+    # disagree.  Expected to PASS: the violation is detected and named.
+    zx_add_one_partition(zx_one_partition_outside.elf)
+    target_compile_definitions(zx_one_partition_outside.elf PRIVATE
+                               ZX_ONE_PROBE_OUTSIDE)
+
+    # A STAGE-1 FAULT, which EL2 never sees.  The guest writes to its own
+    # code: stage 2 permits it and the guest's own MPU does not.  The abort is
+    # taken to EL1 and reaches the hypervisor only because the guest's own
+    # vector records it -- which is precisely what makes the two stages
+    # distinguishable.  Expected to PASS.
+    zx_add_one_partition(zx_one_partition_stage1.elf)
+    target_compile_definitions(zx_one_partition_stage1.elf PRIVATE
+                               ZX_ONE_PROBE_STAGE1)
+
+    # THE NEGATIVE VERIFICATION.  The same probe aimed at an address the guest
+    # IS granted, so it must SUCCEED and this run must report FAILED.  A check
+    # whose pass condition is the absence of something has to be seen to fail,
+    # and this is kept as a BUILD rather than a temporary edit so that the
+    # demonstration stays reproducible.
+    zx_add_one_partition(zx_one_partition_granted.elf)
+    target_compile_definitions(zx_one_partition_granted.elf PRIVATE
+                               ZX_ONE_PROBE_GRANTED)
+else()
+    message(STATUS
+        "ZoneX: ZX_THREADX_SOURCE_DIR is empty, so the ThreadX guest images "
+        "are unavailable. Configure with -DZX_THREADX_SOURCE_DIR=<path to a "
+        "ThreadX checkout> to build them.")
+endif()
+
+###############################################################################
 # Running on the model
 ###############################################################################
 
@@ -203,6 +356,44 @@ if(ZX_FVP_BASER_AEMV8R)
                              --fvp ${ZX_FVP_BASER_AEMV8R}
                              --expect fail)
         endforeach()
+
+        # THE ONE-PARTITION IMAGES.  Three that must pass and one that must
+        # fail, and the one that must fail is what makes the other three
+        # evidence: without it, a green run of the boundary test shows only
+        # that the probe address faults, not that the check can tell the
+        # difference.
+        if(TARGET zx_one_partition.elf)
+            add_test(NAME zx-fvp-one-partition
+                     COMMAND ${Python3_EXECUTABLE} ${ZX_FVP_RUNNER}
+                             --elf $<TARGET_FILE:zx_one_partition.elf>
+                             --fvp ${ZX_FVP_BASER_AEMV8R})
+
+            foreach(zx_positive outside stage1)
+                add_test(NAME zx-fvp-one-partition-${zx_positive}
+                         COMMAND ${Python3_EXECUTABLE} ${ZX_FVP_RUNNER}
+                                 --elf $<TARGET_FILE:zx_one_partition_${zx_positive}.elf>
+                                 --fvp ${ZX_FVP_BASER_AEMV8R})
+            endforeach()
+
+            add_test(NAME zx-fvp-one-partition-granted
+                     COMMAND ${Python3_EXECUTABLE} ${ZX_FVP_RUNNER}
+                             --elf $<TARGET_FILE:zx_one_partition_granted.elf>
+                             --fvp ${ZX_FVP_BASER_AEMV8R}
+                             --expect fail)
+
+            add_custom_target(zx-run-one-partition
+                COMMAND ${ZX_FVP_BASER_AEMV8R}
+                        -C cluster0.NUM_CORES=1
+                        -C bp.vis.disable_visualisation=1
+                        -C bp.terminal_0.start_telnet=0
+                        -C bp.pl011_uart0.out_file=-
+                        -C bp.pl011_uart0.unbuffered_output=1
+                        -a $<TARGET_FILE:zx_one_partition.elf>
+                DEPENDS zx_one_partition.elf
+                USES_TERMINAL
+                COMMENT "Running the ZoneX one-partition image on FVP_BaseR_AEMv8R..."
+            )
+        endif()
 
         add_custom_target(zx-run-probe
             COMMAND ${ZX_FVP_BASER_AEMV8R}

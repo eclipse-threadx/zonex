@@ -50,6 +50,7 @@ function(zx_add_s32z_probe target_name)
     add_executable(${target_name} EXCLUDE_FROM_ALL
         ${ZX_COMMON_DIR}/zx_probe_main.c
         ${ZX_COMMON_DIR}/zx_partitions.c
+        ${ZX_COMMON_DIR}/zx_report.c
         ${ZX_COMMON_DIR}/zx_payload.S
         ${ZX_S32Z_DIR}/zx_board.c
     )
@@ -99,6 +100,119 @@ target_compile_definitions(zx_probe_el2_fault.elf PRIVATE
 # reproducible.
 zx_add_s32z_probe(zx_probe_starved.elf)
 target_compile_definitions(zx_probe_starved.elf PRIVATE ZX_PROBE_STARVE_REGIONS)
+
+###############################################################################
+# The ThreadX guest, and the image that launches it
+###############################################################################
+#
+# Built exactly as the model's is -- a separate CMake invocation with
+# ThreadX's own toolchain file, producing one raw binary the hypervisor
+# embeds with .incbin.  The reasoning is in
+# examples/fvp_baser_aemv8r/guest_a/CMakeLists.txt and is not repeated.
+#
+# WHAT DIFFERS ON THIS BOARD is the window: 64 KB in data SRAM rather than
+# 256 KB in flat DRAM, because the hypervisor's own data comes out of the
+# same 512 KB and because a partition's code and data must be CONTIGUOUS --
+# objcopy -O binary would otherwise pad the blob out to the 1.2 GB between
+# this part's two memories.  See guest_a/link_partition_a.lds.
+#
+# AND ONE THING THE MODEL CANNOT SHOW: the guest's reset path here needs the
+# port's TX_R52_BOOT_AT_EL1 bracket, which the S32Z280 entry.S gained for
+# this work.  Its EL2 block is considerably larger than the model's -- TCMs,
+# HSCTLR.TE, HMPUIR, the low-latency peripheral port -- and the register list
+# that becomes the hypervisor's responsibility is enumerated at the bracket
+# itself, in the kernel, next to the code it replaces.
+
+if(ZX_THREADX_SOURCE_DIR)
+    include(ExternalProject)
+
+    set(ZX_GUEST_A_BUILD ${CMAKE_CURRENT_BINARY_DIR}/guest_a)
+    set(ZX_GUEST_A_BLOB  ${ZX_GUEST_A_BUILD}/guest_a.bin)
+
+    if(CMAKE_C_COMPILER_ID STREQUAL "Clang")
+        set(ZX_GUEST_TOOLCHAIN
+            ${ZX_THREADX_SOURCE_DIR}/cmake/cortex_r52_clang.cmake)
+    else()
+        set(ZX_GUEST_TOOLCHAIN
+            ${ZX_THREADX_SOURCE_DIR}/cmake/cortex_r52.cmake)
+    endif()
+
+    ExternalProject_Add(zx_guest_a
+        SOURCE_DIR      ${ZX_S32Z_DIR}/guest_a
+        BINARY_DIR      ${ZX_GUEST_A_BUILD}
+        CMAKE_GENERATOR ${CMAKE_GENERATOR}
+        CMAKE_ARGS
+            -DCMAKE_TOOLCHAIN_FILE=${ZX_GUEST_TOOLCHAIN}
+            -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
+            -DZX_THREADX_SOURCE_DIR=${ZX_THREADX_SOURCE_DIR}
+            -DZX_GUEST_COMMON_DIR=${ZX_COMMON_DIR}
+        BUILD_BYPRODUCTS ${ZX_GUEST_A_BLOB}
+        BUILD_ALWAYS    TRUE
+        INSTALL_COMMAND ""
+        USES_TERMINAL_CONFIGURE FALSE
+        USES_TERMINAL_BUILD     FALSE
+    )
+
+    function(zx_add_s32z_one_partition target_name)
+        add_executable(${target_name} EXCLUDE_FROM_ALL
+            ${ZX_COMMON_DIR}/zx_one_partition.c
+            ${ZX_COMMON_DIR}/zx_report.c
+            ${ZX_COMMON_DIR}/zx_guest_image.S
+            ${ZX_S32Z_DIR}/zx_board.c
+        )
+
+        add_dependencies(${target_name} zx_guest_a)
+
+        target_include_directories(${target_name} PRIVATE
+            ${ZX_S32Z_DIR}
+            ${ZX_COMMON_DIR}
+        )
+
+        # .incbin searches the ASSEMBLER's include path, which -I on the
+        # compiler command line does not reach; it needs -Wa,-I.  See the
+        # note in examples/common/zx_guest_image.S.
+        set_source_files_properties(${ZX_COMMON_DIR}/zx_guest_image.S
+            PROPERTIES
+                COMPILE_OPTIONS "-Wa,-I${ZX_GUEST_A_BUILD}"
+                OBJECT_DEPENDS  "${ZX_GUEST_A_BLOB}"
+        )
+
+        target_link_libraries(${target_name} PRIVATE
+            eclipse-threadx::zonex
+            zonex::warnings
+        )
+
+        target_link_options(${target_name} PRIVATE
+            -T${ZX_S32Z_DIR}/zx_one_partition.lds
+            -nostartfiles
+            -Wl,-Map=${target_name}.map
+            ${ZX_LINK_QUIET_RWX}
+        )
+
+        set_target_properties(${target_name} PROPERTIES
+            LINK_DEPENDS ${ZX_S32Z_DIR}/zx_one_partition.lds
+        )
+    endfunction()
+
+    zx_add_s32z_one_partition(zx_one_partition.elf)
+
+    zx_add_s32z_one_partition(zx_one_partition_outside.elf)
+    target_compile_definitions(zx_one_partition_outside.elf PRIVATE
+                               ZX_ONE_PROBE_OUTSIDE)
+
+    zx_add_s32z_one_partition(zx_one_partition_stage1.elf)
+    target_compile_definitions(zx_one_partition_stage1.elf PRIVATE
+                               ZX_ONE_PROBE_STAGE1)
+
+    zx_add_s32z_one_partition(zx_one_partition_granted.elf)
+    target_compile_definitions(zx_one_partition_granted.elf PRIVATE
+                               ZX_ONE_PROBE_GRANTED)
+else()
+    message(STATUS
+        "ZoneX: ZX_THREADX_SOURCE_DIR is empty, so the ThreadX guest images "
+        "are unavailable. Configure with -DZX_THREADX_SOURCE_DIR=<path to a "
+        "ThreadX checkout> to build them.")
+endif()
 
 # No add_test here.  A CTest entry that cannot run without a board and a
 # Windows-side debug server would fail every hosted run, and a suite that is

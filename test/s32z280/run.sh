@@ -49,11 +49,24 @@ readonly BUILD="${ROOT}/build/s32z280"
 command="${1:-build}"
 
 configure() {
+    local args=()
+
+    # The ThreadX checkout the GUEST images are built from.  ZoneX links no
+    # ThreadX -- at EL2 it is a standalone bare-metal program -- but the
+    # examples build ThreadX guests, so the dependency is real and it is taken
+    # from the environment rather than guessed at.  Leave ZX_THREADX unset and
+    # the guest images are simply not built, with a message from CMake saying
+    # so; the stage-2 probe images still build.
+    if [ -n "${ZX_THREADX:-}" ]; then
+        args+=("-DZX_THREADX_SOURCE_DIR=${ZX_THREADX}")
+    fi
+
     cmake -S "${ROOT}" -B "${BUILD}" -G Ninja \
         -DCMAKE_TOOLCHAIN_FILE="${ROOT}/cmake/cortex_r52.cmake" \
         -DCMAKE_BUILD_TYPE=Debug \
         -DZX_BUILD_FVP_EXAMPLE=OFF \
-        -DZX_BUILD_S32Z280_EXAMPLE=ON
+        -DZX_BUILD_S32Z280_EXAMPLE=ON \
+        "${args[@]}"
 }
 
 images() {
