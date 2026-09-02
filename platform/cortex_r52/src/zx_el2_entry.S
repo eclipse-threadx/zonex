@@ -150,9 +150,9 @@ zx_el2_start_a32:
     @    memory configuration a bring-up failure can be reproduced in, and
     @    it is what the Cortex-R52 port defaults to for the same reason.  It
     @    also removes one variable from the stage-2 measurements this image
-    @    exists to make.  Caches are a step-5 concern, where the timing
-    @    claims are, and they will need HMAIR and the region attributes to
-    @    be right first -- which is what this image establishes.
+    @    exists to make.  Caches belong with the timing claims, and they
+    @    will need HMAIR and the region attributes to be right first --
+    @    which is what this image establishes.
     @ ------------------------------------------------------------------
 
     mrc     p15, 4, r4, c1, c0, 0           @ HSCTLR, as reset

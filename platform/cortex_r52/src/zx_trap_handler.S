@@ -49,7 +49,7 @@
 @   handler that decides policy in the vector has no context to decide it
 @   with; a hypervisor that gets its faults back as VALUES can choose what to
 @   do about a partition -- report it, restart it, stop scheduling it -- in
-@   code that can be read.  Step 3 keeps this seam.
+@   code that can be read.  This seam is kept as partitions arrive.
 @
 @   The exception is a fault taken FROM Hyp mode.  There is nothing safe to
 @   resume there: ZoneX faulted on its own access, so whatever invariant the
@@ -220,7 +220,7 @@ zx_el2_trap_guest_violation:
 /*  Phase 0 configures no interrupt controller and routes nothing to EL2,  */
 /*  so an interrupt arriving while a payload runs would be taken by EL1    */
 /*  with no handler behind it.  Masking says that out loud rather than     */
-/*  leaving it to luck; step 4 opens them when a guest has vectors.        */
+/*  leaving it to luck; they open when a guest has vectors of its own.    */
 /**************************************************************************/
 
     .global zx_el2_run_payload

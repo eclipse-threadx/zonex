@@ -81,6 +81,12 @@ jobs:
     - name: Check for A-profile and RISC-V terminology
       run: scripts/check_terminology.sh
 
+    # Both checks run in the same job, and both run even if the first fails,
+    # so that one push reports every finding rather than one per re-run.
+    - name: Check for local paths and unreachable references
+      if: '!cancelled()'
+      run: scripts/check_references.sh
+
   host:
     runs-on: ubuntu-24.04
     steps:

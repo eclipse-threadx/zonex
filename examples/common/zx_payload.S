@@ -18,8 +18,8 @@
 @ WHAT THIS IS
 @
 @   A few dozen instructions that run at EL1 under stage 2, with no library,
-@   no stack use worth the name and no console.  It is not a guest: step 4
-@   brings a real ThreadX guest.  It is the smallest thing that can prove
+@   no stack use worth the name and no console.  It is not a guest: a real
+@   ThreadX guest comes later.  It is the smallest thing that can prove
 @   stage 2 grants what it should and denies what it should not.
 @
 @ WHY IT DOES NOT PRINT

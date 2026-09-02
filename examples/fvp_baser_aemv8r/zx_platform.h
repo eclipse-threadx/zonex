@@ -67,7 +67,8 @@
    from the counter control frame.  The stage-2 probe does not use the timer
    and deliberately does not program CNTFRQ: it REPORTS it, so that a zero
    here is visible as the model's own state rather than hidden by ZoneX
-   having written over it.  Step 5 is where the timer matters.  */
+   having written over it.  The timer matters once time partitioning
+   arrives.  */
 
 #define ZX_FVP_SYSTEM_COUNTER_HZ    100000000UL
 
