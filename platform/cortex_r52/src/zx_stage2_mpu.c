@@ -632,3 +632,80 @@ void zx_stage2_disable(void)
     __asm__ volatile("mcr p15, 4, %0, c1, c0, 0" : : "r"(hsctlr) : "memory");
     __asm__ volatile("isb");
 }
+
+
+/**************************************************************************/
+/*                          The PMU cycle counter                         */
+/*                                                                        */
+/*  Encodings, AArch32 PMU (not Hyp-banked -- opc1 = 0, reachable from     */
+/*  any privileged level):                                                 */
+/*                                                                        */
+/*    PMCR        p15, 0, c9, c12, 0    E[0] enable, C[2] reset cycles,    */
+/*                                      D[3] divide-by-64                  */
+/*    PMCNTENSET  p15, 0, c9, c12, 1    bit 31 is the cycle counter        */
+/*    PMCCNTR     p15, 0, c9, c13, 0    the counter itself                 */
+/*    PMCCFILTR   p15, 0, c14, c15, 7   which modes are counted            */
+/*                                                                        */
+/*  PMCCFILTR is under CRn = c14, NOT c9 with the rest of the PMU.  It is  */
+/*  the one PMU register that moved when the direct event-register         */
+/*  encodings arrived, and writing it at c9, c14, 7 -- which is PMUSERENR  */
+/*  territory -- is UNDEFINED.  Cost here: an undefined-instruction        */
+/*  exception at EL2 on the first PMU write, reported through the vector   */
+/*  rather than HSR because +0x04 carries no syndrome.  TRM Table 3-15.    */
+/*                                                                        */
+/*  D is left CLEAR so the counter runs 1:1.  Divide-by-64 would make a    */
+/*  partition switch measure as a handful of ticks, and a WCET number      */
+/*  quantised to 64 cycles is not a WCET number.                           */
+/**************************************************************************/
+
+void zx_pmu_enable(void)
+{
+    uint32_t value;
+
+    /* PMCCFILTR FIRST, and this is the step that is easy to miss.  The
+       cycle counter has per-mode enables and Hyp mode is NOT counted by
+       default, so a counter enabled without this reads zero forever --
+       indistinguishable from a part with no PMU.  Bit 27 (NSH) enables
+       counting in Non-secure Hyp mode, which is where every instruction
+       ZoneX measures actually executes.  */
+    value = ZX_BIT(27);
+    __asm__ volatile("mcr p15, 0, %0, c14, c15, 7" : : "r"(value) : "memory");
+
+    /* Enable the cycle counter in PMCNTENSET before PMCR.E, so that
+       enabling the unit does not briefly run with an unknown counter set.  */
+    value = ZX_BIT(31);
+    __asm__ volatile("mcr p15, 0, %0, c9, c12, 1" : : "r"(value) : "memory");
+
+    /* E and C together: enable, and reset the cycle counter to zero.  */
+    __asm__ volatile("mrc p15, 0, %0, c9, c12, 0" : "=r"(value));
+    value |= (ZX_BIT(0) | ZX_BIT(2));
+    value &= ~(uint32_t)ZX_BIT(3);
+    __asm__ volatile("mcr p15, 0, %0, c9, c12, 0" : : "r"(value) : "memory");
+
+    __asm__ volatile("isb");
+}
+
+
+uint32_t zx_pmu_cycles(void)
+{
+    uint32_t value;
+
+    /* ISB before the read, or the read can be reordered ahead of the code
+       being measured and the interval comes out short -- or negative, which
+       at least announces itself.  */
+    __asm__ volatile("isb");
+    __asm__ volatile("mrc p15, 0, %0, c9, c13, 0" : "=r"(value));
+    return value;
+}
+
+
+uint32_t zx_pmu_is_running(void)
+{
+    uint32_t first;
+    uint32_t second;
+
+    first  = zx_pmu_cycles();
+    second = zx_pmu_cycles();
+
+    return (second != first) ? 1U : 0U;
+}

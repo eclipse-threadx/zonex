@@ -117,4 +117,9 @@
 
 #define ZX_REG32(address)   (*(volatile uint32_t *)(uintptr_t)(address))
 
+
+/* How many hypervisor MMIO region descriptors the example has to be able
+   to hold.  LINFlexD_9 and the GIC.  Must match zx_board_mmio_region_count().  */
+#define ZX_BOARD_MAX_MMIO_REGIONS   2U
+
 #endif /* ZX_PLATFORM_H */

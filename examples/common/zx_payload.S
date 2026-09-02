@@ -53,6 +53,7 @@
 @   was not meant to be in.
 
 #include "zx_port.h"
+#include "zx_guest_abi.h"
 
     .syntax unified
     .arm
@@ -293,3 +294,223 @@ __zx_payload_stack_top:
 zx_high_probe_word:
     .word   0x5A5AC0DE
     .size   zx_high_probe_word, . - zx_high_probe_word
+
+/**************************************************************************/
+/*                                                                        */
+/*  THE RELOCATABLE GUEST BLOB                                            */
+/*                                                                        */
+/*  Everything above runs in ONE place, at the address it was linked for.  */
+/*  This does not: it is assembled once, kept in the hypervisor's own      */
+/*  memory, and COPIED into each partition's code window, so that two      */
+/*  partitions can run the same program in different memory.  Without      */
+/*  that, "set A denies B and set B denies A" has only one half that can   */
+/*  be demonstrated -- the other partition would have no code to run.     */
+/*                                                                        */
+/*  WHAT MAKES IT SURVIVE THE COPY                                        */
+/*                                                                        */
+/*  Not PC-relative arithmetic.  The hypervisor passes the partition's     */
+/*  DATA WINDOW BASE in r0 and every data access is an offset from it, so  */
+/*  there is nothing to relocate.  Three things could have broken and do   */
+/*  not:                                                                   */
+/*                                                                        */
+/*    branches            already PC-relative; survive untouched          */
+/*    a literal CONSTANT  loaded PC-relatively from a nearby pool, and     */
+/*                        the pool is copied with the code                 */
+/*    a literal ADDRESS   would NOT survive -- and there is not one.  That */
+/*                        is the whole discipline of this section: no      */
+/*                        "ldr rN, =symbol" anywhere below.                */
+/*                                                                        */
+/*  There is also no stack.  SP_svc is UNKNOWN out of an ERET and every    */
+/*  entry point below is straight-line code that ends in an HVC, so a      */
+/*  stack pointer would be a thing to get wrong for no benefit.  The       */
+/*  moment anything here pushes, it needs the window to hold a stack and   */
+/*  this comment needs deleting.                                          */
+/*                                                                        */
+/*  ENTRY POINTS SIT AT DECLARED OFFSETS.  The hypervisor computes them as */
+/*  window_base + constant, so a routine that outgrew its slot would        */
+/*  silently become the wrong entry point.  Each slot is padded to its      */
+/*  declared offset and the assembler ERRORS if the previous routine has    */
+/*  already passed it, which turns that into a build failure.               */
+/**************************************************************************/
+
+    .section .zx_guest_blob, "ax", %progbits
+    .balign 64
+    .global zx_guest_blob_start
+zx_guest_blob_start:
+
+/* Pad to a declared entry offset.
+ *
+ * .org and not a computed .space, and that is not a style choice: .org
+ * takes an offset from the START OF THE SECTION, which is exactly what a
+ * blob offset is, and it REFUSES to move backwards -- so a routine that
+ * outgrew its slot fails the assembly instead of quietly displacing the
+ * next entry point.  Both properties for free.
+ *
+ * The obvious alternative, guarding a .space with
+ * ".if (. - zx_guest_blob_start) > offset", assembles under GNU as and is
+ * rejected by LLVM's assembler, which will not treat the difference of two
+ * labels as an absolute expression before layout.  ZoneX builds with both.
+ */
+    .macro  ZX_GUEST_SLOT offset, name
+    .org    \offset
+    .endm
+
+/**************************************************************************/
+/*  The guest's own EL1 vector table, at offset 0 of the blob.             */
+/*                                                                        */
+/*  At offset 0 so that VBAR is simply the partition's code-window base --  */
+/*  one fewer computed address in the hypervisor, and one fewer thing to    */
+/*  get wrong per partition.  Each entry issues a distinct HVC immediate    */
+/*  so that an exception taken AT EL1, rather than routed to EL2, arrives   */
+/*  at EL2 saying which vector it came from instead of hanging.            */
+/**************************************************************************/
+
+    ZX_GUEST_SLOT ZX_GUEST_OFF_VECTORS, vectors
+zx_guest_vectors:
+    hvc     #0x20                           @ 0x00  reset
+    hvc     #0x21                           @ 0x04  undefined instruction
+    hvc     #0x22                           @ 0x08  SVC
+    hvc     #0x23                           @ 0x0C  prefetch abort
+    hvc     #0x24                           @ 0x10  data abort
+    hvc     #0x25                           @ 0x14  reserved
+    hvc     #0x26                           @ 0x18  IRQ
+    hvc     #0x27                           @ 0x1C  FIQ
+
+/**************************************************************************/
+/*  grant -- can this partition reach its OWN data?                        */
+/*                                                                        */
+/*  The positive half of the isolation claim, and it has to come first: a   */
+/*  run in which every access fails would satisfy every "must fault" check  */
+/*  in this image and prove nothing at all.                                */
+/*                                                                        */
+/*  r0 = the partition's data window.  The sentinel is passed in rather     */
+/*  than hard-coded, so that each partition writes a DIFFERENT one and EL2  */
+/*  reading both back cannot mistake one partition's success for the        */
+/*  other's.                                                               */
+/**************************************************************************/
+
+    ZX_GUEST_SLOT ZX_GUEST_OFF_GRANT, grant
+    .global zx_guest_grant
+    .type   zx_guest_grant, %function
+zx_guest_grant:
+    ldr     r3, [r0, #ZX_GD_PROGRESS]
+    orr     r3, r3, #ZX_GP_ENTERED
+    str     r3, [r0, #ZX_GD_PROGRESS]
+
+    ldr     r1, [r0, #ZX_GD_PUBLISH_VALUE]  @ this partition's sentinel
+    str     r1, [r0, #ZX_GD_SCRATCH]
+    dsb
+    ldr     r2, [r0, #ZX_GD_SCRATCH]
+    cmp     r2, r1
+    bne     1f
+
+    ldr     r3, [r0, #ZX_GD_PROGRESS]
+    orr     r3, r3, #ZX_GP_OWN_DATA_OK
+    str     r3, [r0, #ZX_GD_PROGRESS]
+1:
+    dsb
+    hvc     #ZX_ASM_HVC_IMM_YIELD
+    .size   zx_guest_grant, . - zx_guest_grant
+
+/**************************************************************************/
+/*  probe -- read the address EL2 left in the mailbox.                     */
+/*                                                                        */
+/*  The load may take a stage-2 fault, and when it does this routine never */
+/*  reaches its next instruction: the fault goes to EL2, which resumes the */
+/*  hypervisor rather than the guest.  So SURVIVED being CLEAR afterwards  */
+/*  is the evidence that the access was stopped.                           */
+/*                                                                        */
+/*  The bit is cleared on entry rather than assumed clear, because this    */
+/*  entry point is called more than once per partition -- at the other      */
+/*  partition's data, and at the ungranted granule next to its own -- and   */
+/*  a second call inheriting the first call's success would report the      */
+/*  opposite of the truth.                                                 */
+/**************************************************************************/
+
+    ZX_GUEST_SLOT ZX_GUEST_OFF_PROBE, probe
+    .global zx_guest_probe
+    .type   zx_guest_probe, %function
+zx_guest_probe:
+    ldr     r3, [r0, #ZX_GD_PROGRESS]
+    orr     r3, r3, #ZX_GP_ENTERED
+    bic     r3, r3, #ZX_GP_PROBE_SURVIVED
+    str     r3, [r0, #ZX_GD_PROGRESS]
+    dsb
+
+    ldr     r1, [r0, #ZX_GD_TARGET]
+    ldr     r2, [r1]                        @ may take a stage-2 fault
+
+    str     r2, [r0, #ZX_GD_PROBED]
+    ldr     r3, [r0, #ZX_GD_PROGRESS]
+    orr     r3, r3, #ZX_GP_PROBE_SURVIVED
+    str     r3, [r0, #ZX_GD_PROGRESS]
+    dsb
+    hvc     #ZX_ASM_HVC_IMM_YIELD
+    .size   zx_guest_probe, . - zx_guest_probe
+
+/**************************************************************************/
+/*  publish -- write the heartbeat into the shared granule.                */
+/*                                                                        */
+/*  Only the publishing partition can do this.  A reader running the same  */
+/*  entry point takes a stage-2 PERMISSION fault rather than a region       */
+/*  miss -- DFSC 0x0C rather than 0x04 -- and telling those two apart is    */
+/*  how the run shows that the shared granule is read-only to a reader      */
+/*  rather than simply absent from its map.                                */
+/**************************************************************************/
+
+    ZX_GUEST_SLOT ZX_GUEST_OFF_PUBLISH, publish
+    .global zx_guest_publish
+    .type   zx_guest_publish, %function
+zx_guest_publish:
+    ldr     r3, [r0, #ZX_GD_PROGRESS]
+    orr     r3, r3, #ZX_GP_ENTERED
+    str     r3, [r0, #ZX_GD_PROGRESS]
+
+    ldr     r1, [r0, #ZX_GD_SHARED]
+    ldr     r2, [r0, #ZX_GD_PUBLISH_VALUE]
+    str     r2, [r1]                        @ may take a permission fault
+    dsb
+
+    ldr     r3, [r0, #ZX_GD_PROGRESS]
+    orr     r3, r3, #ZX_GP_PUBLISHED
+    str     r3, [r0, #ZX_GD_PROGRESS]
+    dsb
+    hvc     #ZX_ASM_HVC_IMM_YIELD
+    .size   zx_guest_publish, . - zx_guest_publish
+
+/**************************************************************************/
+/*  consume -- read the shared granule.                                    */
+/*                                                                        */
+/*  Every partition may.  What it read is reported through the mailbox so   */
+/*  that EL2 can check the VALUE, not merely that the read completed: a     */
+/*  read succeeding against the wrong granule looks identical to one        */
+/*  succeeding against the right one.                                      */
+/**************************************************************************/
+
+    ZX_GUEST_SLOT ZX_GUEST_OFF_CONSUME, consume
+    .global zx_guest_consume
+    .type   zx_guest_consume, %function
+zx_guest_consume:
+    ldr     r3, [r0, #ZX_GD_PROGRESS]
+    orr     r3, r3, #ZX_GP_ENTERED
+    str     r3, [r0, #ZX_GD_PROGRESS]
+
+    ldr     r1, [r0, #ZX_GD_SHARED]
+    ldr     r2, [r1]                        @ may take a stage-2 fault
+
+    str     r2, [r0, #ZX_GD_PROBED]
+    ldr     r3, [r0, #ZX_GD_PROGRESS]
+    orr     r3, r3, #ZX_GP_CONSUMED
+    str     r3, [r0, #ZX_GD_PROGRESS]
+    dsb
+    hvc     #ZX_ASM_HVC_IMM_YIELD
+    .size   zx_guest_consume, . - zx_guest_consume
+
+/* The blob's declared size, checked rather than assumed: the hypervisor
+   copies exactly this many bytes and the manifest declares an image of
+   exactly this length, so a blob that outgrew it would be copied
+   truncated -- which presents as a guest that runs partway.  */
+
+    ZX_GUEST_SLOT ZX_GUEST_BLOB_SIZE, end
+    .global zx_guest_blob_end
+zx_guest_blob_end:

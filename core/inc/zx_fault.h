@@ -93,6 +93,16 @@ extern "C" {
    decoded fields for exactly that reason.  See docs/armv8r-el2-reference.md.  */
 
 #define ZX_ISS_DFSC_MASK            0x3FU       /* [5:0]  fault status code */
+
+/* The two DFSC values a stage-2 MPU produces, both measured on the FVP and
+   on S32Z280 silicon.  Telling them apart is the difference between two
+   distinct claims: MISS says no enabled region covered the address, while
+   PERMISSION says one did and its AP refused the access.  A check that
+   accepted either would call a read-only region and an absent one the same
+   thing, which is exactly the confusion a shared read-only granule has to
+   be able to rule out.  */
+#define ZX_DFSC_MPU_MISS            0x04U
+#define ZX_DFSC_MPU_PERMISSION      0x0CU
 #define ZX_ISS_WNR_MASK             0x00000040U /* [6]    1 = write         */
 #define ZX_ISS_S1PTW_MASK           0x00000080U /* [7]    stage-1 walk      */
 #define ZX_ISS_CM_MASK              0x00000100U /* [8]    cache maintenance */

@@ -67,6 +67,13 @@ ENTRY(_start)
 
 __zx_hyp_stack_size = 0x1000;
 
+/* One partition window each.  The code window has to hold the guest blob
+   with room to grow; the data window holds the hypervisor-to-guest mailbox
+   and nothing else, so one granule would do and four give it slack.  Both
+   are whole granules because both are MPU regions.  */
+__zx_window_code_size = 0x400;
+__zx_window_data_size = 0x100;
+
 MEMORY
 {
     DRAM (rwx) : ORIGIN = 0x00000000, LENGTH = 0x08000000    /* 128 MB */
@@ -171,6 +178,81 @@ SECTIONS
         __zx_high_probe_end = .;
     } > DRAM
 
+
+    /* ------------------------------------------------------------------
+       THE TWO PARTITION WINDOWS.
+
+       .zx_guest_blob is the copy SOURCE: it lives in the hypervisor's own
+       memory, covered by no region, and is copied into each partition's
+       code window at boot.  That is the path a real guest image takes, and
+       it is why a partition's code window is NOLOAD -- there is nothing in
+       the ELF to load there, the contents arrive at run time.
+
+       The ORDER of what follows is load-bearing in one place: the ungranted
+       granule sits IMMEDIATELY AFTER partition 0's data window, adjacent by
+       construction.  An ungranted address far from every grant proves only
+       that unmapped memory faults; the defect worth catching is a region
+       whose limit is out by one granule, and only an adjacent hole catches
+       it.  The ASSERT below is what keeps a later edit from separating
+       them.
+       ------------------------------------------------------------------ */
+
+    .zx_guest_blob : ALIGN(64)
+    {
+        __zx_guest_blob_start = .;
+        KEEP(*(.zx_guest_blob))
+        . = ALIGN(64);
+        __zx_guest_blob_end = .;
+    } > DRAM
+
+    .zx_p0_code (NOLOAD) : ALIGN(64)
+    {
+        __zx_p0_code_start = .;
+        . = . + __zx_window_code_size;
+        __zx_p0_code_end = .;
+    } > DRAM
+
+    .zx_p0_data (NOLOAD) : ALIGN(64)
+    {
+        __zx_p0_data_start = .;
+        . = . + __zx_window_data_size;
+        __zx_p0_data_end = .;
+    } > DRAM
+
+    /* One granule, granted to nobody.  Adjacent to partition 0's data.  */
+
+    .zx_p0_hole (NOLOAD) : ALIGN(64)
+    {
+        __zx_p0_hole_start = .;
+        . = . + 64;
+        __zx_p0_hole_end = .;
+    } > DRAM
+
+    .zx_p1_code (NOLOAD) : ALIGN(64)
+    {
+        __zx_p1_code_start = .;
+        . = . + __zx_window_code_size;
+        __zx_p1_code_end = .;
+    } > DRAM
+
+    .zx_p1_data (NOLOAD) : ALIGN(64)
+    {
+        __zx_p1_data_start = .;
+        . = . + __zx_window_data_size;
+        __zx_p1_data_end = .;
+    } > DRAM
+
+    /* The one granule both partitions can see: written by the publisher,
+       read-only to everyone else.  Its own section so that the two regions
+       covering it -- one per partition -- describe exactly the same range,
+       which is what the validator's shared-range rule requires.  */
+
+    .zx_shared (NOLOAD) : ALIGN(64)
+    {
+        __zx_shared_start = .;
+        . = . + 64;
+        __zx_shared_end = .;
+    } > DRAM
     . = ALIGN(8);
     _end = .;
     PROVIDE(end = .);
@@ -195,4 +277,34 @@ SECTIONS
            "the high-probe region base is not 64-byte aligned")
     ASSERT(__zx_high_probe_start >= __zx_forbidden_end,
            "the high-probe region overlaps the ungranted granule")
+
+    /* The two-partition geometry.  Each of these would otherwise be a
+       run-time mystery: an under-aligned window base does not fault, it
+       lands on SH, AP and XN and silently changes the region's
+       attributes.  */
+
+    ASSERT((__zx_guest_blob_start & 63) == 0,
+           "the guest blob is not 64-byte aligned")
+    ASSERT((__zx_p0_code_start & 63) == 0,
+           "partition 0's code window base is not 64-byte aligned")
+    ASSERT((__zx_p0_data_start & 63) == 0,
+           "partition 0's data window base is not 64-byte aligned")
+    ASSERT((__zx_p1_code_start & 63) == 0,
+           "partition 1's code window base is not 64-byte aligned")
+    ASSERT((__zx_p1_data_start & 63) == 0,
+           "partition 1's data window base is not 64-byte aligned")
+    ASSERT((__zx_shared_start & 63) == 0,
+           "the shared granule is not 64-byte aligned")
+    ASSERT((__zx_shared_end - __zx_shared_start) == 64,
+           "the shared area is not exactly one granule")
+
+    ASSERT(__zx_p0_hole_start == __zx_p0_data_end,
+           "the ungranted granule is NOT adjacent to partition 0's data window")
+    ASSERT(__zx_p1_code_start == __zx_p0_hole_end,
+           "something was placed between the ungranted granule and partition 1")
+
+    ASSERT((__zx_guest_blob_end - __zx_guest_blob_start) <= __zx_window_code_size,
+           "the guest blob does not fit a partition's code window")
+    ASSERT(__zx_window_data_size >= 64,
+           "a partition data window must be at least one granule")
 }

@@ -49,6 +49,7 @@ endif()
 function(zx_add_s32z_probe target_name)
     add_executable(${target_name} EXCLUDE_FROM_ALL
         ${ZX_COMMON_DIR}/zx_probe_main.c
+        ${ZX_COMMON_DIR}/zx_partitions.c
         ${ZX_COMMON_DIR}/zx_payload.S
         ${ZX_S32Z_DIR}/zx_board.c
     )

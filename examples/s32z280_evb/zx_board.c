@@ -343,3 +343,39 @@ void zx_board_report(void)
         "           costs a Device-attributed EL2 region out of this part's\n"
         "           20 -- the constraint the FVP cannot show you.\n");
 }
+
+
+/**************************************************************************/
+/*  zx_board_describe_mmio_regions                                        */
+/*                                                                        */
+/*  The same two regions zx_board_program_mmio_regions writes, described   */
+/*  so the validator can see them.  The duplication is deliberate and      */
+/*  bounded: the programmer runs before the console exists and cannot      */
+/*  report anything, while the validator runs later and needs the          */
+/*  geometry as data.  Both read the same ZX_S32Z_* constants, so the one  */
+/*  thing that could drift -- the addresses -- cannot.                     */
+/**************************************************************************/
+
+void zx_board_describe_mmio_regions(ZX_REGION *region_ptr)
+{
+    if (region_ptr == (ZX_REGION *)0)
+    {
+        return;
+    }
+
+    region_ptr[0].zx_region_base       = (zx_addr_t)ZX_S32Z_LINFLEX_9_BASE;
+    region_ptr[0].zx_region_limit      = (zx_addr_t)((ZX_S32Z_LINFLEX_9_BASE
+                                          + ZX_S32Z_LINFLEX_9_SIZE) - 1UL);
+    region_ptr[0].zx_region_ap         = ZX_AP_EL2_RW_GUEST_NONE;
+    region_ptr[0].zx_region_xn         = ZX_XN_NEVER;
+    region_ptr[0].zx_region_sh         = ZX_SH_NON_SHAREABLE;
+    region_ptr[0].zx_region_attr_index = (UCHAR)ZX_ATTR_DEVICE;
+
+    region_ptr[1].zx_region_base       = (zx_addr_t)ZX_S32Z_GIC_BASE;
+    region_ptr[1].zx_region_limit      = (zx_addr_t)((ZX_S32Z_GIC_BASE
+                                          + ZX_S32Z_GIC_SIZE) - 1UL);
+    region_ptr[1].zx_region_ap         = ZX_AP_EL2_RW_GUEST_NONE;
+    region_ptr[1].zx_region_xn         = ZX_XN_NEVER;
+    region_ptr[1].zx_region_sh         = ZX_SH_NON_SHAREABLE;
+    region_ptr[1].zx_region_attr_index = (UCHAR)ZX_ATTR_DEVICE;
+}

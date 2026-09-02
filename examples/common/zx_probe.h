@@ -77,6 +77,22 @@ extern "C" {
    on the model, where semihosting needs no peripheral; the console on
    silicon.  */
 
+/* The shared reporting helpers.  Not static, because the two-partition
+   experiment lives in its own translation unit: a single example main
+   carrying both the stage-2 bring-up and the partition proof would be the
+   longest file in the repository and the least readable.  */
+
+void zx_check(const char *label, uint32_t passed);
+void zx_note(const char *label, uint32_t value);
+ZX_NODISCARD zx_addr_t zx_symbol_address(const char *symbol);
+ZX_NODISCARD uint32_t zx_probe_failures(void);
+void zx_probe_fail(void);
+
+/* The two-partition experiment.  Runs after the single-payload phases and
+   reprograms the region set from a manifest, so it must come last.  */
+
+void zx_phase_two_partitions(uint32_t board_regions, uint32_t el2_regions);
+
 void zx_board_init(void);
 
 /* How many EL2 regions the hypervisor's own MMIO needs on this board, and
@@ -94,6 +110,15 @@ void zx_board_init(void);
 
 ZX_NODISCARD uint32_t zx_board_mmio_region_count(void);
 void zx_board_program_mmio_regions(uint32_t first_index);
+
+/* The SAME geometry, described rather than programmed, so the manifest
+   validator can reject a partition window that overlaps the hypervisor's own
+   console or interrupt controller.  Those regions stay enabled while a
+   partition runs, so an overlap there is two enabled regions on one address
+   -- CONSTRAINED UNPREDICTABLE, and an abort on the S32Z280.  Writes exactly
+   zx_board_mmio_region_count() entries.  */
+
+void zx_board_describe_mmio_regions(ZX_REGION *region_ptr);
 
 /* Print whatever the board knows about itself that the architecture cannot
    report -- which peripheral the console is, which memory the image is in.
@@ -120,6 +145,25 @@ extern char __zx_high_probe_start[];
 extern char __zx_high_probe_end[];
 
 /* Payload entry points and the words it reports through, from zx_payload.S. */
+
+/* The two-partition experiment's windows.  NOLOAD sections: a partition's
+   code window has nothing in the ELF to load, because its contents arrive
+   at run time when the hypervisor copies the guest blob in.  */
+
+extern char __zx_guest_blob_start[];
+extern char __zx_guest_blob_end[];
+extern char __zx_p0_code_start[];
+extern char __zx_p0_code_end[];
+extern char __zx_p0_data_start[];
+extern char __zx_p0_data_end[];
+extern char __zx_p0_hole_start[];
+extern char __zx_p0_hole_end[];
+extern char __zx_p1_code_start[];
+extern char __zx_p1_code_end[];
+extern char __zx_p1_data_start[];
+extern char __zx_p1_data_end[];
+extern char __zx_shared_start[];
+extern char __zx_shared_end[];
 
 extern char zx_payload_vectors[];
 extern char zx_payload_grant_check[];

@@ -79,4 +79,11 @@
 #define ZX_FVP_DRAM_BASE            0x00000000UL
 #define ZX_FVP_DRAM_SIZE            0x08000000UL    /* 128 MB */
 
+
+/* How many hypervisor MMIO region descriptors the example has to be able
+   to hold.  This model needs none, and a zero-length array is not valid C -- one
+   entry that nothing writes costs 12 bytes and keeps the shared example
+   code free of a board conditional.  */
+#define ZX_BOARD_MAX_MMIO_REGIONS   1U
+
 #endif /* ZX_PLATFORM_H */

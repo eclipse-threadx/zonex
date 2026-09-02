@@ -87,7 +87,7 @@ static ZX_REGION zx_high_probe_region;
 /*  zx_symbol_address -- a linker symbol's address as an MPU address.      */
 /**************************************************************************/
 
-static zx_addr_t zx_symbol_address(const char *symbol)
+zx_addr_t zx_symbol_address(const char *symbol)
 {
     return (zx_addr_t)(uintptr_t)symbol;
 }
@@ -100,7 +100,7 @@ static zx_addr_t zx_symbol_address(const char *symbol)
 /*  result is visible as a gap rather than having to be counted.          */
 /**************************************************************************/
 
-static void zx_check(const char *label, uint32_t passed)
+void zx_check(const char *label, uint32_t passed)
 {
     zx_console_puts("  [");
     zx_console_puts((passed != 0U) ? "PASS" : "FAIL");
@@ -115,7 +115,19 @@ static void zx_check(const char *label, uint32_t passed)
 }
 
 
-static void zx_note(const char *label, uint32_t value)
+uint32_t zx_probe_failures(void)
+{
+    return zx_failures;
+}
+
+
+void zx_probe_fail(void)
+{
+    zx_failures++;
+}
+
+
+void zx_note(const char *label, uint32_t value)
 {
     zx_console_puts("  ");
     zx_console_puts(label);
@@ -957,6 +969,10 @@ ZX_NORETURN void zx_el2_main(void)
     zx_phase_hypercall();
     zx_phase_hprenr(el2_regions);
     zx_phase_violation();
+
+    /* Last, because it reprograms the region set from a manifest and the
+       single-payload phases above depend on the set they were given.  */
+    zx_phase_two_partitions(board_regions, el2_regions);
 
 #ifdef ZX_PROBE_PROVOKE_EL2_FAULT
     zx_phase_provoke_el2_fault();

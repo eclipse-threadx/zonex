@@ -99,3 +99,20 @@ void zx_board_report(void)
         "           and each costs an EL2 region.  This model therefore\n"
         "           cannot show you that those regions are needed.\n");
 }
+
+
+/**************************************************************************/
+/*  zx_board_describe_mmio_regions                                        */
+/*                                                                        */
+/*  Nothing to describe: this model's console and GIC already sit in the   */
+/*  Device band of the background map, so the hypervisor spends no region  */
+/*  on them and there is no geometry a partition window could collide      */
+/*  with.  The parameter is unused for exactly that reason, and the        */
+/*  function exists anyway so that the shared example code does not need   */
+/*  to know which kind of board it is running on.                          */
+/**************************************************************************/
+
+void zx_board_describe_mmio_regions(ZX_REGION *region_ptr)
+{
+    (void)region_ptr;
+}

@@ -445,6 +445,34 @@ void zx_hprenr_disable(uint32_t index);
 
 void zx_stage2_enable_set(uint32_t mask);
 
+/**************************************************************************/
+/*                        The PMU cycle counter                           */
+/**************************************************************************/
+
+/* Turns on PMCCNTR so that a partition switch can be MEASURED rather than
+   estimated.
+ *
+ * This exists because the generic timer is not usable as a clock here:
+ * CNTFRQ reads zero on both targets, so there is no frequency to convert
+ * with and nothing has programmed one.  The PMU cycle counter needs no
+ * frequency -- the unit that matters for a WCET argument is cycles, not
+ * seconds.
+ *
+ * PMCCFILTR matters and is easy to miss: the cycle counter has per-mode
+ * enables, and code running in Hyp mode is not counted unless the Hyp bit
+ * is set.  A missing one presents as a counter that reads zero or never
+ * advances, which looks exactly like a PMU that is not implemented.  */
+
+void zx_pmu_enable(void);
+
+ZX_NODISCARD uint32_t zx_pmu_cycles(void);
+
+/* Non-zero when the counter actually advances.  Worth asking rather than
+   assuming: a measurement taken from a counter that is not running reports
+   zero cycles for everything, which is a very convincing wrong answer.  */
+
+ZX_NODISCARD uint32_t zx_pmu_is_running(void);
+
 /* Turning protection on is TWO steps, and separating them is not tidiness.
 
    zx_el2_mpu_enable sets HSCTLR.BR and HSCTLR.M: the EL2-controlled MPU,

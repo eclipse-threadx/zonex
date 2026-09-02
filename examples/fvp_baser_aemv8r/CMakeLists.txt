@@ -62,6 +62,7 @@ endif()
 function(zx_add_fvp_probe target_name)
     add_executable(${target_name} EXCLUDE_FROM_ALL
         ${ZX_COMMON_DIR}/zx_probe_main.c
+        ${ZX_COMMON_DIR}/zx_partitions.c
         ${ZX_COMMON_DIR}/zx_payload.S
         ${ZX_FVP_DIR}/zx_board.c
     )
@@ -120,6 +121,36 @@ target_compile_definitions(zx_probe_el2_fault.elf PRIVATE
 zx_add_fvp_probe(zx_probe_starved.elf)
 target_compile_definitions(zx_probe_starved.elf PRIVATE ZX_PROBE_STARVE_REGIONS)
 
+# The three negative verifications of the two-partition experiment.  Each
+# breaks exactly one thing, each must report FAILED, and each is a BUILD
+# rather than a temporary edit so that "the check has been seen to fail"
+# stays reproducible instead of being a sentence in a log.
+#
+# They are separate images rather than one because they fail at different
+# points: two are refused by the validator before a single region is
+# programmed, and the third gets all the way to a passing access that should
+# have faulted.  One image could only demonstrate whichever came first.
+
+# A region limit one granule too generous, which swallows the ungranted
+# granule next door.  The adjacent-granule probe must then SURVIVE.  This is
+# the negative verification of the BOUNDARY check: without it a green run
+# shows only that the probe address faults, not that the limit is exact.
+zx_add_fvp_probe(zx_probe_widened.elf)
+target_compile_definitions(zx_probe_widened.elf PRIVATE ZX_PROBE_WIDEN_REGION)
+
+# Two partitions whose data windows overlap.  The validator must refuse by
+# name, before anything is programmed -- two enabled regions on one address
+# is CONSTRAINED UNPREDICTABLE and aborts on the S32Z280.
+zx_add_fvp_probe(zx_probe_overlap.elf)
+target_compile_definitions(zx_probe_overlap.elf PRIVATE ZX_PROBE_MANIFEST_OVERLAP)
+
+# A region naming an HMAIR index the hypervisor never wrote.  The hardware
+# will not object: the region gets a zero MAIR byte, which is Device-nGnRnE,
+# and works slowly.  Only the validator can catch this one, which is exactly
+# why it is worth a build of its own.
+zx_add_fvp_probe(zx_probe_badattr.elf)
+target_compile_definitions(zx_probe_badattr.elf PRIVATE ZX_PROBE_BAD_ATTR)
+
 ###############################################################################
 # Running on the model
 ###############################################################################
@@ -160,6 +191,18 @@ if(ZX_FVP_BASER_AEMV8R)
                          --elf $<TARGET_FILE:zx_probe_starved.elf>
                          --fvp ${ZX_FVP_BASER_AEMV8R}
                          --expect fail)
+
+        # The two-partition experiment's three negative verifications.  Same
+        # rule as above: each must report FAILED, and each starting to PASS
+        # means the check it was built to violate has stopped detecting the
+        # violation.
+        foreach(zx_negative widened overlap badattr)
+            add_test(NAME zx-fvp-probe-${zx_negative}
+                     COMMAND ${Python3_EXECUTABLE} ${ZX_FVP_RUNNER}
+                             --elf $<TARGET_FILE:zx_probe_${zx_negative}.elf>
+                             --fvp ${ZX_FVP_BASER_AEMV8R}
+                             --expect fail)
+        endforeach()
 
         add_custom_target(zx-run-probe
             COMMAND ${ZX_FVP_BASER_AEMV8R}
