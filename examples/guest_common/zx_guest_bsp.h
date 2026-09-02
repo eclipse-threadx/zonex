@@ -87,6 +87,34 @@ void console_set_quiet(unsigned int quiet);
 void guest_yield(void);
 
 /**************************************************************************/
+/*              What the PORT calls, and the guest supplies               */
+/*                                                                        */
+/*  These four are not part of ZoneX's design; they are the Cortex-R52     */
+/*  port's board-support contract, and the guest implements them because   */
+/*  it is the board.  entry.S calls bsp_main, _tx_initialize_low_level     */
+/*  calls board_init, and the EL1 IRQ and FIQ vectors call the other two.  */
+/*                                                                        */
+/*  DECLARED HERE RATHER THAN BY INCLUDING THE PORT'S board.h, which does  */
+/*  declare all four.  The two boards' copies of that header differ --     */
+/*  one carries an identity structure, the other a set of interrupt-       */
+/*  nesting counters -- and the files that implement these are SHARED      */
+/*  between the two boards, so including it would make one source depend   */
+/*  on two different headers depending on which board it was compiled for. */
+/*                                                                        */
+/*  They are declared at all because a definition with no prototype is a   */
+/*  MISRA Rule 8.4 finding, and because a function nothing declares is a   */
+/*  function nothing checks the signature of.  The caller is assembly,     */
+/*  which cannot be checked against either -- so the declaration is worth  */
+/*  no less for that, and the port's own board files carry it for the same */
+/*  reason.                                                                */
+/**************************************************************************/
+
+void bsp_main(void);
+void board_init(void);
+void board_irq_handler(void);
+void board_fiq_handler(void);
+
+/**************************************************************************/
 /*                    The clock a partition is granted                    */
 /*                                                                        */
 /*  A partition owns no timer device.  What it has is the VIRTUAL timer    */

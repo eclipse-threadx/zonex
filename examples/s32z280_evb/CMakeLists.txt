@@ -146,6 +146,18 @@ if(ZX_THREADX_SOURCE_DIR)
             -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
             -DZX_THREADX_SOURCE_DIR=${ZX_THREADX_SOURCE_DIR}
             -DZX_GUEST_COMMON_DIR=${ZX_COMMON_DIR}
+            # ZoneX's own warning module, so that ZoneX's guest support faces
+            # ZoneX's warning set inside a ThreadX build.  The sub-project
+            # applies it to ZoneX's three files and to nothing else; see
+            # guest_a/CMakeLists.txt for why that distinction is load-bearing.
+            -DZX_CMAKE_DIR=${CMAKE_SOURCE_DIR}/cmake
+            # And whether those warnings are fatal, carried across the project
+            # boundary by hand.  CMAKE_COMPILE_WARNING_AS_ERROR does NOT
+            # propagate into an ExternalProject: the sub-build is a separate
+            # CMake invocation and inherits nothing that is not listed here.
+            # That is why the strict lanes were compiling the guest support
+            # with warnings merely printed -- when they compiled it at all.
+            -DZX_GUEST_WARNINGS_AS_ERRORS=${CMAKE_COMPILE_WARNING_AS_ERROR}
         BUILD_BYPRODUCTS ${ZX_GUEST_A_BLOB}
         BUILD_ALWAYS    TRUE
         INSTALL_COMMAND ""

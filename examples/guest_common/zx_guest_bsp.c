@@ -530,9 +530,6 @@ unsigned int guest_counter_is_moving(void)
 /*  and the run that demonstrates preemption are the same binary.          */
 /**************************************************************************/
 
-void board_init(void);
-
-
 void board_init(void)
 {
     unsigned long frequency;
@@ -607,10 +604,6 @@ void board_init(void)
 /**************************************************************************/
 
 extern void _tx_timer_interrupt(void);
-
-void board_irq_handler(void);
-void board_fiq_handler(void);
-
 
 void board_irq_handler(void)
 {

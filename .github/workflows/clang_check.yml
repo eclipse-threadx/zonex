@@ -66,6 +66,23 @@ jobs:
     - name: Check out the repository
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+    # THE GUEST IMAGES NEED A THREADX CHECKOUT, and without one the example
+    # CMakeLists SKIPS them -- with a message, which is right for a
+    # contributor who has no kernel sources to hand and wrong here.  Skipped,
+    # the ZoneX code that is compiled into a ThreadX image never faced this
+    # workflow at all: the guest support and both partition images are
+    # thousands of lines that no warnings-as-errors lane was looking at.
+    #
+    # Pinned to the same commit zx_fvp.yml pins, and for the same reason: an
+    # unpinned guest means this workflow's results change when a different
+    # repository does.  Change the two together.
+    - name: Check out ThreadX, for the guest images
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        repository: eclipse-threadx/threadx
+        ref: 8c681c188ee748c777185e229024255c054a49d9
+        path: threadx
+
     - name: Cache Arm Toolchain for Embedded
       id: cache-atfe
       uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -116,6 +133,7 @@ jobs:
           if ! cmake -S . -B "build/clang-$name" -G Ninja \
                   -DCMAKE_TOOLCHAIN_FILE=cmake/cortex_r52_clang.cmake \
                   -DZX_ATFE_TOOLCHAIN_PATH="$atfe" \
+                  -DZX_THREADX_SOURCE_DIR="$GITHUB_WORKSPACE/threadx" \
                   -DCMAKE_COMPILE_WARNING_AS_ERROR=ON "$@"; then
             echo "::error::$name: CMake configure failed"
             status=1

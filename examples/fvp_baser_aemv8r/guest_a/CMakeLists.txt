@@ -61,6 +61,39 @@ if(NOT ZX_GUEST_COMMON_DIR)
     message(FATAL_ERROR "ZX_GUEST_COMMON_DIR was not passed to the guest build.")
 endif()
 
+# ZONEX'S OWN WARNING SET, READ FROM ZONEX'S OWN MODULE.
+#
+# This project is configured by a SEPARATE CMake invocation with ThreadX's
+# toolchain file, so it cannot see zonex::warnings or any other target of the
+# hypervisor's build.  What it can do is include the module that defines the
+# list, which is why cmake/zx_warnings.cmake publishes ZX_WARNING_FLAGS as a
+# variable as well as building an interface library out of it.  Restating the
+# flags here instead would be a second source of truth that agrees until the
+# day it does not.
+#
+# Optional, and the build says so rather than failing: a contributor
+# configuring this project by hand has no reason to have passed ZX_CMAKE_DIR,
+# and the guest should still build for them.
+if(ZX_CMAKE_DIR AND EXISTS ${ZX_CMAKE_DIR}/zx_warnings.cmake)
+    include(${ZX_CMAKE_DIR}/zx_warnings.cmake)
+else()
+    set(ZX_WARNING_FLAGS)
+    message(STATUS
+        "zx_guest_a: ZX_CMAKE_DIR was not passed, so ZoneX's guest support is "
+        "compiled with ThreadX's warning settings alone.")
+endif()
+
+# -Wlogical-op is GNU-only; ATfE clang rejects the spelling outright, which is
+# merely noisy until warnings are errors.  Selected by compiler, exactly as
+# cmake/zx_warnings.cmake does it for the hypervisor.
+if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
+    list(APPEND ZX_WARNING_FLAGS -Wlogical-op)
+endif()
+
+if(ZX_GUEST_WARNINGS_AS_ERRORS)
+    list(APPEND ZX_WARNING_FLAGS -Werror)
+endif()
+
 set(GUEST_DIR ${CMAKE_CURRENT_LIST_DIR})
 
 # The port's own board support supplies the reset path and the low-level
@@ -177,6 +210,31 @@ function(zx_add_guest target_name)
     target_compile_definitions(${target_name} PRIVATE
         TX_R52_BOOT_AT_EL1
         TX_R52_USE_THREADX_IRQ
+    )
+
+    # ZONEX'S WARNING SET, ON ZONEX'S FILES, AND ON NOTHING ELSE.
+    #
+    # Applied per SOURCE rather than to the target, and that is the whole
+    # point of the exercise.  This executable is built from five files: three
+    # of ZoneX's and two of the Cortex-R52 port's.  ZoneX does not get to
+    # decide how the port is compiled -- "the hypervisor's build settings
+    # silently changed how the kernel was compiled" is not a sentence anybody
+    # wants in a defect report, and it is the same argument that makes this a
+    # separate CMake project in the first place.  A target-wide setting would
+    # put entry.S and tx_initialize_low_level.S under a policy they are not
+    # ZoneX's to set, and with -Werror it could fail this build on a warning
+    # ZoneX does not own and cannot fix here.
+    #
+    # ThreadX's own build sets no warning flags at all, so without this these
+    # three files are compiled with NONE -- which is what made a
+    # warnings-as-errors lane over them worth adding: there was nothing for it
+    # to enforce.
+    set_source_files_properties(
+        ${GUEST_DIR}/../../guest_common/zx_guest_head.S
+        ${GUEST_DIR}/../../guest_common/zx_guest_bsp.c
+        ${GUEST_DIR}/../../guest_common/zx_guest_app.c
+        TARGET_DIRECTORY ${target_name}
+        PROPERTIES COMPILE_OPTIONS "${ZX_WARNING_FLAGS}"
     )
 
     target_include_directories(${target_name} PRIVATE

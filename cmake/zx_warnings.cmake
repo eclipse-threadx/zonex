@@ -26,11 +26,22 @@
 # Warnings become errors under the ci-strict configure preset, through CMake's
 # own CMAKE_COMPILE_WARNING_AS_ERROR.  A developer build stays warning-tolerant
 # so that a half-finished change can still be compiled and looked at.
+#
+# THE FLAGS ARE A VARIABLE AS WELL AS A TARGET, and the second form is not
+# redundant.  ZoneX's guest support -- examples/guest_common -- is ZoneX's own
+# code that is compiled into a THREADX image, by a separate CMake invocation
+# with ThreadX's toolchain file, so it cannot see this project's targets at
+# all.  Restating the list over there would be a second source of truth that
+# agrees until the day it does not; including this file and reading the
+# variable is one.
+#
+# It is a variable and not just a target for exactly one consumer, and that
+# consumer applies it PER SOURCE FILE rather than per target.  The reason is in
+# examples/*/guest_a/CMakeLists.txt: the guest executable also contains two
+# files from ports/cortex_r52, and ZoneX does not get to decide how the port is
+# compiled.
 
-add_library(zx_warnings INTERFACE)
-add_library(zonex::warnings ALIAS zx_warnings)
-
-target_compile_options(zx_warnings INTERFACE
+set(ZX_WARNING_FLAGS
     -Wall
     -Wextra
     -Wpedantic
@@ -43,6 +54,11 @@ target_compile_options(zx_warnings INTERFACE
     -Waggregate-return
     -Wfloat-equal
 )
+
+add_library(zx_warnings INTERFACE)
+add_library(zonex::warnings ALIAS zx_warnings)
+
+target_compile_options(zx_warnings INTERFACE ${ZX_WARNING_FLAGS})
 
 # -Wlogical-op is a GNU extension.  Clang does not implement it: it has
 # -Wlogical-op-parentheses, which is a different check, and rejects the GNU
