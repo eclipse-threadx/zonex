@@ -350,6 +350,119 @@ void zx_stage2_region_read_direct16(uint32_t *base_ptr, uint32_t *limit_ptr)
 
 
 /**************************************************************************/
+/*  zx_stage2_region_readback -- read one region and decompose it.          */
+/*                                                                        */
+/*  The inverse of zx_region_bar and zx_region_lar, and it exists for one  */
+/*  reason: at stage 2 the alignment bugs fail in the ATTRIBUTES, not the  */
+/*  address.  A base one byte past a granule boundary does not fault --    */
+/*  its low bits ARE the SH, AP and XN fields, so the region is programmed */
+/*  successfully with permissions nobody asked for and runs.  Nothing      */
+/*  reports that, ever.  Reading the registers back and decomposing them   */
+/*  is the only way to see it, which is why this is part of the port's     */
+/*  interface rather than a debugging aid.                                 */
+/*                                                                        */
+/*  The EN bit is deliberately NOT decomposed into the descriptor.  A      */
+/*  manifest declares what a region IS; whether it is currently enabled is */
+/*  a property of the running system and lives in HPRENR.  Folding it into */
+/*  the descriptor would make a region read back unequal to the one that   */
+/*  was written purely because a different partition is running.           */
+/**************************************************************************/
+
+void zx_stage2_region_readback(uint32_t index, ZX_REGION *region_ptr)
+{
+    uint32_t bar;
+    uint32_t lar;
+
+    if (region_ptr == (ZX_REGION *)0)
+    {
+        return;
+    }
+
+    zx_stage2_region_read(index, &bar, &lar);
+
+    region_ptr->zx_region_base  = (zx_addr_t)(bar & ZX_REGION_ADDR_MASK);
+    region_ptr->zx_region_limit = (zx_addr_t)((lar & ZX_REGION_ADDR_MASK)
+                                              | (ZX_MPU_GRANULE - 1U));
+
+    region_ptr->zx_region_xn = (UCHAR)(bar & ZX_HPRBAR_XN);
+    region_ptr->zx_region_ap = (UCHAR)((bar >> ZX_HPRBAR_AP_SHIFT) & 0x3U);
+    region_ptr->zx_region_sh = (UCHAR)((bar >> ZX_HPRBAR_SH_SHIFT) & 0x3U);
+
+    region_ptr->zx_region_attr_index =
+        (UCHAR)((lar >> ZX_HPRLAR_ATTRINDX_SHIFT) & 0x7U);
+}
+
+
+/**************************************************************************/
+/*  zx_stage2_region_matches -- did the region stick, and stick right?     */
+/*                                                                        */
+/*  Compares against the granule-MASKED intent rather than the raw         */
+/*  descriptor.  The programmer masks base and limit before writing, so a  */
+/*  comparison against unmasked values would report a mismatch caused by   */
+/*  this function's own arithmetic instead of by the hardware -- and a     */
+/*  readback check that cries wolf is a readback check that gets deleted.  */
+/*                                                                        */
+/*  A descriptor whose base was under-aligned therefore does NOT fail here.*/
+/*  That is correct and it is not a gap: the validator rejects it before   */
+/*  anything is programmed, and this function answers a different question */
+/*  -- whether the write reached the register the caller believes it did.  */
+/*  An index the implementation does not have is UNPREDICTABLE and may     */
+/*  simply not stick, which is exactly what this catches.                  */
+/**************************************************************************/
+
+uint32_t zx_stage2_region_matches(uint32_t index, const ZX_REGION *region_ptr)
+{
+    ZX_REGION actual;
+    zx_addr_t expected_base;
+    zx_addr_t expected_limit;
+
+    if (region_ptr == (const ZX_REGION *)0)
+    {
+        return 0U;
+    }
+
+    zx_stage2_region_readback(index, &actual);
+
+    expected_base  = region_ptr->zx_region_base & (zx_addr_t)ZX_REGION_ADDR_MASK;
+    expected_limit = (region_ptr->zx_region_limit
+                      & (zx_addr_t)ZX_REGION_ADDR_MASK)
+                     | (zx_addr_t)(ZX_MPU_GRANULE - 1U);
+
+    if (actual.zx_region_base != expected_base)
+    {
+        return 0U;
+    }
+
+    if (actual.zx_region_limit != expected_limit)
+    {
+        return 0U;
+    }
+
+    if (actual.zx_region_ap != region_ptr->zx_region_ap)
+    {
+        return 0U;
+    }
+
+    if (actual.zx_region_xn != region_ptr->zx_region_xn)
+    {
+        return 0U;
+    }
+
+    if (actual.zx_region_sh != region_ptr->zx_region_sh)
+    {
+        return 0U;
+    }
+
+    if (actual.zx_region_attr_index != region_ptr->zx_region_attr_index)
+    {
+        return 0U;
+    }
+
+    return 1U;
+}
+
+
+/**************************************************************************/
 /*                                HPRENR                                  */
 /**************************************************************************/
 
@@ -381,6 +494,36 @@ void zx_hprenr_enable(uint32_t index)
 void zx_hprenr_disable(uint32_t index)
 {
     zx_hprenr_write(zx_hprenr_read() & ~(1U << index));
+}
+
+
+/**************************************************************************/
+/*  zx_stage2_enable_set -- THE PARTITION SWITCH.                          */
+/*                                                                        */
+/*  One write, one barrier pair.  Not one pair per region: barriers were   */
+/*  measured to be most of a per-region cost during the Cortex-R52 Modules */
+/*  port work, and a mask write needs exactly two -- a DSB so the write    */
+/*  has retired before anything depends on it, and an ISB so the next      */
+/*  instruction fetch cannot have been permitted under the old mask.       */
+/*                                                                        */
+/*  The barrier policy for the whole switch path lives HERE and nowhere    */
+/*  else, because "how long does a partition switch take" is a question    */
+/*  ZoneX has to be able to answer with a number, and an answer assembled  */
+/*  from barriers scattered across three functions is not one.             */
+/*                                                                        */
+/*  The DSB comes FIRST and that order is load-bearing.  Writing HPRENR    */
+/*  changes which regions govern EL0/EL1 accesses; issuing the ISB before  */
+/*  the write has retired would let the fetch that follows be permitted    */
+/*  under a mask that is no longer in force -- which is a partition        */
+/*  briefly running with its predecessor's memory, and the one failure     */
+/*  this function exists to prevent.                                       */
+/**************************************************************************/
+
+void zx_stage2_enable_set(uint32_t mask)
+{
+    zx_hprenr_write(mask);
+    __asm__ volatile("dsb");
+    __asm__ volatile("isb");
 }
 
 

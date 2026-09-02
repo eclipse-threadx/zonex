@@ -33,10 +33,21 @@
 /*    override parts of it -- the regions must be disjoint by             */
 /*    construction, which is a property the manifest validator enforces.  */
 /*                                                                        */
-/*  STATUS                                                                */
+/*  WHERE THE SPLIT IS                                                    */
 /*                                                                        */
-/*    Declared empty.  The EL2 bring-up work programs the first region by */
-/*    hand; driving the programming from the manifest comes after that.   */
+/*    This header PLANS; it does not program.  zx_mm_plan turns a         */
+/*    manifest into a region-index layout and a set of HPRENR masks and   */
+/*    touches no hardware at all, and the caller -- which does have       */
+/*    hardware -- walks the plan and writes the registers.                */
+/*                                                                        */
+/*    That split is not decoration.  The interesting part of this file is */
+/*    arithmetic: which index each region lands on, which bits each       */
+/*    partition's mask carries, and whether the total fits the part.  All */
+/*    of that is worth testing exhaustively on a workstation, and none of */
+/*    it can be if it is interleaved with CP15 writes.  The alternative   */
+/*    -- passing the programmer in as a function pointer -- would keep    */
+/*    one function but put an indirect call on the partition-switch path  */
+/*    of a codebase whose certification back end is funded.               */
 /*                                                                        */
 /**************************************************************************/
 
@@ -44,10 +55,95 @@
 #define ZX_MM_H
 
 #include "zx_api.h"
+#include "zx_manifest.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/**************************************************************************/
+/*                          The region-index layout                       */
+/**************************************************************************/
+
+/* Which MPU region index each thing owns.
+ *
+ * FIXED BLOCKS, NOT PACKING.  Each partition gets a contiguous run of
+ * indices reserved for it at plan time, and it keeps them whether it is
+ * running or not.  Packing the regions of whichever partition is current
+ * into the low indices would use fewer of them, and it would make a
+ * partition switch a loop whose length depends on the incoming partition --
+ * unbounded in the only sense a WCET argument cares about.  With fixed
+ * blocks the switch is one HPRENR write, always, for any manifest.
+ *
+ *   index 0 .. h-1        hypervisor MMIO: console, interrupt controller.
+ *                         Zero of them on the model, two on silicon.
+ *                         ALWAYS enabled -- they are the hypervisor's own
+ *                         console, and a partition switch must not blind it.
+ *   index h .. h+n0-1     partition 0's block
+ *   index h+n0 ..         partition 1's block, and so on
+ *
+ * The masks are computed here rather than at each switch for the same
+ * reason: a value looked up is a value whose cost does not depend on how
+ * many regions a partition happens to own.  */
+
+typedef struct zx_mm_layout_struct
+{
+    UINT        zx_layout_partitions;
+    UINT        zx_layout_mmio_count;
+    UINT        zx_layout_regions_used;
+
+    UINT        zx_layout_partition_first[ZX_MAX_PARTITIONS];
+    UINT        zx_layout_partition_count[ZX_MAX_PARTITIONS];
+
+    /* HPRENR images.  uint32_t and not ULONG deliberately: this is a
+       hardware register value whose width is 32 bits by architecture, and
+       D19 keeps a fixed width exactly where the width is the point.  */
+    uint32_t    zx_layout_always_mask;
+    uint32_t    zx_layout_partition_mask[ZX_MAX_PARTITIONS];
+} ZX_MM_LAYOUT;
+
+/**************************************************************************/
+/*                                The plan                                */
+/**************************************************************************/
+
+/* Assigns region indices and builds the enable masks.  Pure: no hardware,
+   no static state, no allocation.
+ *
+ * Returns ZX_MANIFEST_SUCCESS, or the same error codes zx_manifest_verify
+ * uses -- one vocabulary rather than two, so a boot message means the same
+ * thing wherever it came from.  Callers should verify a manifest before
+ * planning it; the checks repeated here are the ones whose failure would
+ * make the plan itself nonsense.
+ *
+ * The region budget is rechecked against the real count because this is the
+ * last point before indices become register writes, and a region programmed
+ * at an index the implementation does not have is UNPREDICTABLE rather than
+ * an error -- the model reports 32 EL2 regions, which is not an
+ * architecturally legal Cortex-R52 value, so a plan that fits the model
+ * proves nothing about a real part.  */
+
+ZX_NODISCARD UINT zx_mm_plan(const ZX_MANIFEST *manifest_ptr,
+                             UINT mmio_region_count,
+                             UINT region_budget,
+                             ZX_MM_LAYOUT *layout_ptr);
+
+/* The HPRENR image that must be in force while a partition runs: its own
+   block plus the always-on hypervisor MMIO.  Returns zero for an index the
+   plan does not cover, which disables every region -- the conservative
+   answer, since at EL0/EL1 a miss faults regardless of HSCTLR.BR.  */
+
+ZX_NODISCARD uint32_t zx_mm_partition_mask(const ZX_MM_LAYOUT *layout_ptr,
+                                           UINT partition_index);
+
+/* Prints the layout once, at boot.
+ *
+ * Worth its space in the image: every later fault report names a region
+ * INDEX, and without this the reader has no way to turn index 7 back into
+ * "partition 1's data window".  A hypervisor whose diagnostics cannot be
+ * mapped back to the manifest is one debugged by guesswork.  */
+
+void zx_mm_report(const ZX_MM_LAYOUT *layout_ptr,
+                  const ZX_MANIFEST *manifest_ptr);
 
 #ifdef __cplusplus
 }

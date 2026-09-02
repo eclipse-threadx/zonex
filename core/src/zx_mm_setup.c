@@ -25,11 +25,277 @@
 /*    declarations into MPU region descriptors, and enabling the set      */
 /*    belonging to the partition about to run.                            */
 /*                                                                        */
-/*    This translation unit is deliberately empty of implementation.      */
-/*    The change that founded this repository builds the repository, not  */
-/*    the hypervisor; the unit exists so that the change which writes the */
-/*    code opens a tree that already configures, compiles and links.      */
+/*    Planning only.  Nothing here touches CP15 or a memory-mapped        */
+/*    register: it decides which MPU region index each thing owns and     */
+/*    what HPRENR must hold while each partition runs, and the caller     */
+/*    walks the result and does the writing.  See the note in zx_mm.h on  */
+/*    why the split is there.                                            */
 /*                                                                        */
 /**************************************************************************/
 
 #include "zx_mm.h"
+#include "zx_console.h"
+
+
+/**************************************************************************/
+/*                                                                        */
+/*  FUNCTION                                               RELEASE        */
+/*                                                                        */
+/*    zx_mm_plan                                           PORTABLE C     */
+/*                                                                        */
+/*  DESCRIPTION                                                           */
+/*                                                                        */
+/*    Assigns a fixed block of region indices to each partition and       */
+/*    builds the HPRENR image that must be in force while it runs.        */
+/*                                                                        */
+/*    The MMIO block comes FIRST, at index 0, and that is deliberate      */
+/*    rather than arbitrary.  Those regions are the hypervisor's own      */
+/*    console and interrupt controller, they are enabled in every mask,   */
+/*    and there are zero of them on the model against two on silicon.     */
+/*    Putting them at the bottom means a partition's block starts at the  */
+/*    same index on both targets only when the counts agree -- which is   */
+/*    exactly the difference a boot-time printout should make visible     */
+/*    rather than hide.                                                   */
+/*                                                                        */
+/**************************************************************************/
+
+UINT zx_mm_plan(const ZX_MANIFEST *manifest_ptr,
+                UINT mmio_region_count,
+                UINT region_budget,
+                ZX_MM_LAYOUT *layout_ptr)
+{
+    UINT next_index;
+    UINT partition_index;
+    UINT bit_index;
+
+    if (manifest_ptr == (const ZX_MANIFEST *)0)
+    {
+        return ZX_MANIFEST_NULL_POINTER;
+    }
+
+    if (layout_ptr == (ZX_MM_LAYOUT *)0)
+    {
+        return ZX_MANIFEST_NULL_POINTER;
+    }
+
+    if (manifest_ptr->zx_manifest_partitions == (const ZX_PARTITION *)0)
+    {
+        return ZX_MANIFEST_NULL_POINTER;
+    }
+
+    if (manifest_ptr->zx_manifest_partition_count == 0U)
+    {
+        return ZX_MANIFEST_NO_PARTITIONS;
+    }
+
+    if (manifest_ptr->zx_manifest_partition_count > ZX_MAX_PARTITIONS)
+    {
+        return ZX_MANIFEST_TOO_MANY_PARTITIONS;
+    }
+
+    /* Cleared in full before anything is assigned.  A layout is read by a
+       switch path that indexes it by partition, so a half-written one whose
+       unused entries hold whatever was on the stack would enable an
+       arbitrary set of regions -- the single worst failure available here.  */
+    layout_ptr->zx_layout_partitions     = 0U;
+    layout_ptr->zx_layout_mmio_count     = 0U;
+    layout_ptr->zx_layout_regions_used   = 0U;
+    layout_ptr->zx_layout_always_mask    = 0U;
+
+    for (partition_index = 0U; partition_index < ZX_MAX_PARTITIONS;
+         partition_index++)
+    {
+        layout_ptr->zx_layout_partition_first[partition_index] = 0U;
+        layout_ptr->zx_layout_partition_count[partition_index] = 0U;
+        layout_ptr->zx_layout_partition_mask[partition_index]  = 0U;
+    }
+
+    /* HPRENR has one bit per region, so an index past bit 31 has no bit to
+       set.  Rejected here rather than silently dropped: a region with no
+       enable bit is a region that never takes effect, and the partition
+       would run with a hole in its memory map and no diagnostic.  */
+    if (mmio_region_count > 32U)
+    {
+        return ZX_MANIFEST_REGION_BUDGET;
+    }
+
+    for (bit_index = 0U; bit_index < mmio_region_count; bit_index++)
+    {
+        layout_ptr->zx_layout_always_mask |= (uint32_t)1U << bit_index;
+    }
+
+    layout_ptr->zx_layout_mmio_count = mmio_region_count;
+    next_index = mmio_region_count;
+
+    for (partition_index = 0U;
+         partition_index < manifest_ptr->zx_manifest_partition_count;
+         partition_index++)
+    {
+        const ZX_PARTITION *partition_ptr =
+            &manifest_ptr->zx_manifest_partitions[partition_index];
+        uint32_t mask = layout_ptr->zx_layout_always_mask;
+        UINT region_index;
+
+        if (partition_ptr->zx_partition_region_count == 0U)
+        {
+            return ZX_MANIFEST_NO_REGIONS;
+        }
+
+        if (partition_ptr->zx_partition_region_count
+                > ZX_MAX_REGIONS_PER_PARTITION)
+        {
+            return ZX_MANIFEST_TOO_MANY_REGIONS;
+        }
+
+        if ((next_index + partition_ptr->zx_partition_region_count) > 32U)
+        {
+            return ZX_MANIFEST_REGION_BUDGET;
+        }
+
+        for (region_index = 0U;
+             region_index < partition_ptr->zx_partition_region_count;
+             region_index++)
+        {
+            mask |= (uint32_t)1U << (next_index + region_index);
+        }
+
+        layout_ptr->zx_layout_partition_first[partition_index] = next_index;
+        layout_ptr->zx_layout_partition_count[partition_index] =
+            partition_ptr->zx_partition_region_count;
+        layout_ptr->zx_layout_partition_mask[partition_index] = mask;
+
+        next_index += partition_ptr->zx_partition_region_count;
+    }
+
+    layout_ptr->zx_layout_partitions   =
+        manifest_ptr->zx_manifest_partition_count;
+    layout_ptr->zx_layout_regions_used = next_index;
+
+    /* Last, against the real count.  Checked after the layout is built so
+       that the printout below can say how many were needed as well as how
+       many exist -- "needs 9, has 8" is a fixable message and "does not
+       fit" is not.  */
+    if (next_index > region_budget)
+    {
+        return ZX_MANIFEST_REGION_BUDGET;
+    }
+
+    return ZX_MANIFEST_SUCCESS;
+}
+
+
+/**************************************************************************/
+/*                                                                        */
+/*  FUNCTION                                               RELEASE        */
+/*                                                                        */
+/*    zx_mm_partition_mask                                 PORTABLE C     */
+/*                                                                        */
+/*  DESCRIPTION                                                           */
+/*                                                                        */
+/*    The HPRENR image for one partition: a lookup, not a computation.    */
+/*                                                                        */
+/*    Zero for an index the plan does not cover, which disables every     */
+/*    region.  That is the conservative answer and not merely a           */
+/*    convenient one: at EL0 and EL1 a region miss faults regardless of   */
+/*    HSCTLR.BR, so an out-of-range partition index stops the guest       */
+/*    rather than handing it whatever the previous mask allowed.          */
+/*                                                                        */
+/**************************************************************************/
+
+uint32_t zx_mm_partition_mask(const ZX_MM_LAYOUT *layout_ptr,
+                              UINT partition_index)
+{
+    if (layout_ptr == (const ZX_MM_LAYOUT *)0)
+    {
+        return 0U;
+    }
+
+    if (partition_index >= layout_ptr->zx_layout_partitions)
+    {
+        return 0U;
+    }
+
+    return layout_ptr->zx_layout_partition_mask[partition_index];
+}
+
+
+/**************************************************************************/
+/*                                                                        */
+/*  FUNCTION                                               RELEASE        */
+/*                                                                        */
+/*    zx_mm_report                                         PORTABLE C     */
+/*                                                                        */
+/*  DESCRIPTION                                                           */
+/*                                                                        */
+/*    Prints the region-index layout once, at boot.                      */
+/*                                                                        */
+/*    This is the key to every later diagnostic.  A stage-2 fault report  */
+/*    names a region INDEX, and an index means nothing on its own -- the  */
+/*    same number is a different window on the model and on silicon,      */
+/*    because the hypervisor's own MMIO takes none of them on one and two */
+/*    on the other.  Printing the map once turns every later "region 7"   */
+/*    into "partition 1's data window" for whoever reads the log.         */
+/*                                                                        */
+/**************************************************************************/
+
+void zx_mm_report(const ZX_MM_LAYOUT *layout_ptr,
+                  const ZX_MANIFEST *manifest_ptr)
+{
+    UINT partition_index;
+
+    if (layout_ptr == (const ZX_MM_LAYOUT *)0)
+    {
+        return;
+    }
+
+    if (manifest_ptr == (const ZX_MANIFEST *)0)
+    {
+        return;
+    }
+
+    zx_console_puts("  region layout:\n");
+
+    if (layout_ptr->zx_layout_mmio_count == 0U)
+    {
+        zx_console_puts("    (no hypervisor MMIO regions on this board)\n");
+    }
+    else
+    {
+        zx_console_puts("    0..");
+        zx_console_putdec(layout_ptr->zx_layout_mmio_count - 1U);
+        zx_console_puts("  hypervisor MMIO, always enabled\n");
+    }
+
+    for (partition_index = 0U;
+         partition_index < layout_ptr->zx_layout_partitions;
+         partition_index++)
+    {
+        UINT first = layout_ptr->zx_layout_partition_first[partition_index];
+        UINT count = layout_ptr->zx_layout_partition_count[partition_index];
+
+        zx_console_puts("    ");
+        zx_console_putdec(first);
+        zx_console_puts("..");
+        zx_console_putdec((first + count) - 1U);
+        zx_console_puts("  ");
+
+        if (manifest_ptr->zx_manifest_partitions[partition_index]
+                .zx_partition_name != (const CHAR *)0)
+        {
+            zx_console_puts(manifest_ptr->zx_manifest_partitions[partition_index]
+                                .zx_partition_name);
+        }
+        else
+        {
+            zx_console_puts("(unnamed)");
+        }
+
+        zx_console_puts(", HPRENR ");
+        zx_console_puthex(layout_ptr->zx_layout_partition_mask[partition_index]);
+        zx_console_puts("\n");
+    }
+
+    zx_console_puts("    regions used ");
+    zx_console_putdec(layout_ptr->zx_layout_regions_used);
+    zx_console_puts("\n");
+}

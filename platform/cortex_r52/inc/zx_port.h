@@ -392,6 +392,27 @@ void zx_stage2_region_read(uint32_t index, uint32_t *base_ptr,
 void zx_stage2_region_program_direct16(const ZX_REGION *region_ptr);
 void zx_stage2_region_read_direct16(uint32_t *base_ptr, uint32_t *limit_ptr);
 
+/* Read one region back and DECOMPOSE it into the descriptor a manifest would
+   have declared, so that a caller can compare what the hardware holds against
+   what it asked for.
+
+   This exists because the whole class of alignment bug at stage 2 fails in the
+   ATTRIBUTES and not in the address: an under-aligned base does not fault, its
+   low bits land on SH, AP and XN, and the partition runs with permissions
+   nobody asked for.  Nothing will ever report that.  The only defence is to
+   read the registers back and look, which is what this and
+   zx_stage2_region_matches are for.  */
+
+void zx_stage2_region_readback(uint32_t index, ZX_REGION *region_ptr);
+
+/* Non-zero when a region reads back as the descriptor asked for.  Compares
+   the granule-masked base and limit, because the programmer masks before
+   writing and a caller comparing raw values would fail on its own rounding
+   rather than on a real mismatch.  */
+
+ZX_NODISCARD uint32_t zx_stage2_region_matches(uint32_t index,
+                                               const ZX_REGION *region_ptr);
+
 /* HPRENR: one enable bit per region, and the register whose width the TRM
    contradicts itself about.  */
 
@@ -399,6 +420,30 @@ ZX_NODISCARD uint32_t zx_hprenr_read(void);
 void zx_hprenr_write(uint32_t value);
 void zx_hprenr_enable(uint32_t index);
 void zx_hprenr_disable(uint32_t index);
+
+/* THE PARTITION SWITCH.  Replaces the whole enable mask in one write, with
+   ONE barrier pair at the end rather than one per region.
+ *
+ * This is the function a safety customer's question resolves to -- "how long
+ * does a partition switch take" is mostly this -- so the barrier policy lives
+ * here and nowhere else.  Per-region barriers were measured to be most of a
+ * per-region cost during the Cortex-R52 Modules port work; a mask write needs
+ * exactly one DSB to retire and one ISB before the next instruction fetch can
+ * depend on the new permissions.
+ *
+ * WHY A MASK AND NOT A BLOCK REWRITE.  Region descriptors are programmed once
+ * at boot and never again: each partition owns a fixed block of indices, and
+ * switching partitions changes which blocks are ENABLED.  That is what makes
+ * the switch one register write of bounded cost instead of a loop whose
+ * length depends on how many regions the incoming partition has.  It is also
+ * why the direct region encodings above index 15, though proven to work, are
+ * not generalised: they would speed up an operation that happens once.
+ *
+ * The cost of a block rewrite is the alternative worth measuring only if two
+ * partitions ever need different ATTRIBUTES on one address, which no manifest
+ * the validator accepts can ask for today.  See docs/decisions.md D4.  */
+
+void zx_stage2_enable_set(uint32_t mask);
 
 /* Turning protection on is TWO steps, and separating them is not tidiness.
 

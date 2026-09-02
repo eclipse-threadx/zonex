@@ -102,21 +102,28 @@ case "${command}" in
         # "no worse than when somebody set it" and not one thing about the
         # code.
         #
-        # So the floor is set where a real number is defensible: the manifest
-        # validator, which is a pure function with no hardware in it and no
-        # excuse for an unreached line.  100% is not aspirational -- it is
-        # what it measures, on lines and on branches both.  A rule added
-        # without a case that fails it will drop this and fail the build,
-        # which is the entire point: a validator rule nothing has ever seen
-        # reject anything is not a rule, it is a comment.
+        # So the floor covers the files where a real number is defensible:
+        # the manifest validator and the region-layout planner.  Both are
+        # pure functions with no hardware in them, both are reachable in
+        # full from a workstation, and neither has an excuse for an
+        # unreached line.  100% is not aspirational -- it is what they
+        # measure, on lines and on branches both.  A rule added without a
+        # case that fails it drops this and fails the build, which is the
+        # entire point: a validator rule nothing has ever seen reject
+        # anything is not a rule, it is a comment.
+        #
+        # A file joins this list when it becomes reachable in full, not
+        # when it is written.  Adding one that cannot be is how a floor
+        # ends up lowered to whatever passes.
         #
         # Reported separately from the report above so that the number being
         # enforced is visible next to the failure, rather than the build
         # dying with a threshold the reader has to go and look up.
         echo ""
-        echo "Enforcing the coverage floor on the manifest validator:"
+        echo "Enforcing the coverage floor on the fully reachable core:"
         gcovr --root "${ROOT}" \
               --filter "${ROOT}/core/src/zx_manifest_verify.c" \
+              --filter "${ROOT}/core/src/zx_mm_setup.c" \
               --txt - \
               --fail-under-line 100 \
               --fail-under-branch 100
