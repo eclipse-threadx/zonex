@@ -1890,9 +1890,31 @@ region on its own memory and is protected by not being covered by any enabled
 region (D2), so the fault record and the depth counter cannot be denied to it
 by any region set a manifest can produce.
 
-**⚠ Neither guard has been provoked.** They are defence, and by the standard
-this suite holds itself to — *a branch nothing has ever taken is not evidence
-that it works* — that is a gap and not a completed item. Provoking one needs an
-image whose second fault lands in the C report rather than in the capture, which
-on the board means denying the console's own MMIO after the first fault. It is
-recorded here as not done rather than left to look finished.
+**Both are provoked, on silicon, by a build that exists for it.** They were
+recorded here as unprovoked first, because *a branch nothing has ever taken is
+not evidence that it works* and writing them down as finished would have been
+the claim this suite does not make. The build closes that.
+
+It makes the region covering the board's **own console** read-only to EL2 and
+then prints one character. The store to the data register takes a data abort
+from Hyp mode; the vector captures, resets `SP_hyp` and calls the report at
+depth one; the report's first console write faults for the same reason; the
+vector captures again, resets the stack again, and the depth guard stops it —
+no printing, verdict stored, parked.
+
+**The run has no console at all after the banner, so it is judged from
+memory**, which is what the third exit code was invented for and this is the
+first build to need it: `zx_run_failures = 0x5C`, read over the debug
+connection, with the harness stopping cleanly on the park rather than timing
+out. Without the depth guard that sequence has no end and does not even
+overflow the stack — each fault resets it — so it spins silently for ever,
+which is precisely the failure this entry exists to prevent.
+
+⚠ **And provoking it found a defect in the harness rather than in the guards.**
+The gdb script read `zx_run_failures` as a count of failing checks, so it
+reported `0x5C` as *"92 failing check(s) — the console log is where they are
+named"*: wrong about the number, and wrong about there being a log, for the one
+build that denies itself a console on purpose. The three fault-path exit codes
+are now named there. That is worth recording because the harness had been
+misreporting `0x5A` the same way for as long as the EL2-fault build has
+existed, and nobody noticed until a build arrived whose console was gone.

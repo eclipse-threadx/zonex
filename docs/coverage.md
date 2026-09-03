@@ -90,6 +90,7 @@ partition switch's cost is not a small objection.
 | the time freeze | the `no_freeze` build, which must fail and does |
 | the boundary's own tick | the `no_tick` build, which must refuse rather than hang |
 | halt-on-fault, the shipping policy | the `halt` build, run on both targets |
+| the unresumable vectors' stack reset and depth guard | the `refault` build, which makes the fault report fault on its own console write and is judged from memory because it has none |
 
 **Every one of those is a build that must FAIL, or a build that must pass with
 a named check.** That is the substitute for structural coverage here, and it is

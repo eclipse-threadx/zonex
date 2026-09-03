@@ -115,6 +115,18 @@ zx_add_fvp_probe(zx_probe_el2_fault.elf)
 target_compile_definitions(zx_probe_el2_fault.elf PRIVATE
                            ZX_PROBE_PROVOKE_EL2_FAULT)
 
+# A FAULT INSIDE THE FAULT REPORT -- see the S32Z280 example for what it does.
+#
+# BUILT HERE AND UNPROVOKABLE HERE, deliberately.  This console is semihosting,
+# so no EL2 region covers it and no access permission can refuse a write to it;
+# the build says so and reports FAILED rather than passing.  It is registered
+# anyway so that the model compiles the same code path silicon runs, which is
+# the same reason zx_board_mmio_region_count exists on a board with no MMIO
+# regions.  Not in CTest.
+zx_add_fvp_probe(zx_probe_refault.elf)
+target_compile_definitions(zx_probe_refault.elf PRIVATE
+                           ZX_PROBE_PROVOKE_REFAULT)
+
 # Claims to need more EL2 regions than any Armv8-R implementation can have, so
 # that the REFUSAL path is exercised.  Like the negative build, it must FAIL,
 # and it is a build rather than a temporary edit so the demonstration stays

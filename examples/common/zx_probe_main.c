@@ -919,6 +919,92 @@ static void zx_phase_provoke_el2_fault(void)
 
 
 /**************************************************************************/
+/*  zx_phase_provoke_refault                                              */
+/*                                                                        */
+/*  MAKES THE FAULT REPORT ITSELF FAULT, so that the two guards on the     */
+/*  unresumable vectors are a path something has TAKEN rather than a path  */
+/*  somebody wrote.  docs/decisions.md D30 named them and recorded that    */
+/*  neither had been provoked; this build is the answer to that.           */
+/*                                                                        */
+/*  WHAT IT DOES.  The region covering the hypervisor's own console is     */
+/*  made read-only to EL2, and then one character is printed.  The store   */
+/*  to the data register takes a data abort FROM Hyp mode, which is the    */
+/*  vector that reports and stops:                                        */
+/*                                                                        */
+/*    the vector captures the record, resets SP_hyp, and calls C;         */
+/*    the C side counts depth 0 -> 1 and starts printing the report;      */
+/*    the report's FIRST console write faults for the same reason;        */
+/*    the vector captures again, resets SP_hyp again, and calls C again;  */
+/*    the C side sees a non-zero depth and PRINTS NOTHING -- it stores     */
+/*    the verdict and parks.                                              */
+/*                                                                        */
+/*  Without the depth guard that sequence has no end: each fault resets    */
+/*  the stack and calls the same function, so it does not even overflow -- */
+/*  it spins for ever, silently, which is the exact failure mode the       */
+/*  fault path exists to prevent.                                          */
+/*                                                                        */
+/*  HOW IT IS JUDGED, AND IT CANNOT BE JUDGED FROM THE CONSOLE.  After the */
+/*  region changes, this board has no console: nothing printed arrives,    */
+/*  including the report.  The verdict is ZX_EXIT_FAULT_WHILE_FAULTING in  */
+/*  zx_run_failures, read out of memory by the debug harness -- which is   */
+/*  precisely the case that exit code was invented for, and the first      */
+/*  build to need it.                                                      */
+/*                                                                        */
+/*  It is LAST, it is behind a build option, and it is not in CTest: the   */
+/*  run's expected outcome is a failure with no console at all, and a      */
+/*  suite that judges runs by their printed verdict must not be taught to  */
+/*  accept one that prints nothing.                                        */
+/**************************************************************************/
+
+#ifdef ZX_PROBE_PROVOKE_REFAULT
+static void zx_phase_provoke_refault(void)
+{
+    zx_console_puts("\n=========================================================\n"
+                    " PROVOKING A FAULT INSIDE THE FAULT REPORT\n"
+                    "\n"
+                    " The region covering THIS CONSOLE is about to be made\n"
+                    " read-only at EL2.  The next character printed then takes\n"
+                    " a data abort from Hyp mode, and the report of THAT fault\n"
+                    " faults again on its own first write.\n"
+                    "\n"
+                    " EVERYTHING BELOW THIS LINE IS SILENCE, and that is the\n"
+                    " expected result.  The run is judged from memory: the\n"
+                    " harness must find zx_run_failures = 0x5C, which means\n"
+                    " ZoneX faulted at EL2 WHILE REPORTING a fault at EL2 --\n"
+                    " a different value from 0x5A, which is the first fault\n"
+                    " reported normally, and from 0x00, which is a pass.\n"
+                    "\n"
+                    " If the guard is absent the board spins here for ever and\n"
+                    " the harness times out with no verdict at all.\n"
+                    "=========================================================\n");
+
+    if (zx_board_deny_console_writes(ZX_REGION_BOARD_FIRST) == 0U)
+    {
+        zx_console_puts("\n  SKIPPED.  This target reaches its console without an\n"
+                        "  EL2 region -- it is semihosting -- so there is no\n"
+                        "  access permission that can refuse a write to it and\n"
+                        "  nothing here can be provoked.  This build proves\n"
+                        "  nothing on this target and says so rather than\n"
+                        "  passing.\n");
+        zx_probe_fail();
+
+        return;
+    }
+
+    /* From here the console is gone.  This write is the first fault.  */
+
+    zx_console_puts("x");
+
+    /* Not reached.  If it is, a store to a region marked read-only at EL2
+       did not fault, which is the same finding zx_phase_provoke_el2_fault
+       exists to catch and is worth reporting rather than passing over.  */
+
+    zx_probe_fail();
+}
+#endif
+
+
+/**************************************************************************/
 /*  zx_el2_main -- entered from zx_el2_entry.S at EL2.  Does not return.  */
 /**************************************************************************/
 
@@ -1069,6 +1155,10 @@ ZX_NORETURN void zx_el2_main(void)
     /* Last, because it reprograms the region set from a manifest and the
        single-payload phases above depend on the set they were given.  */
     zx_phase_two_partitions(board_regions, el2_regions);
+
+#ifdef ZX_PROBE_PROVOKE_REFAULT
+    zx_phase_provoke_refault();
+#endif
 
 #ifdef ZX_PROBE_PROVOKE_EL2_FAULT
     zx_phase_provoke_el2_fault();

@@ -178,10 +178,28 @@ failures = 0
 # Read as well as trusted: zx_console_exit sets it from its argument, so this
 # is the same number the console printed.  Reading it here is what makes a run
 # whose console capture failed still judgeable.
+#
+# AND THE FAULT PATH PUTS AN EXIT CODE IN THE SAME WORD, not a count.  An
+# image that reaches its own verdict stores how many checks failed; one that
+# dies on an EL2 fault stores a code from zx_el2_fault_path.c.  Reported as a
+# count, 0x5C read as "92 failing check(s), named in the console log" -- which
+# is wrong about the number and, for the build that denies itself a console to
+# provoke that code, wrong about there being a log at all.
+ZX_FAULT_EXIT_CODES = {
+    0x5A: "ZoneX FAULTED AT EL2 -- a hypervisor bug, not a guest one",
+    0x5B: "an UNEXPECTED EL2 VECTOR -- an assumption in the reset path is false",
+    0x5C: "ZoneX faulted at EL2 WHILE REPORTING a fault at EL2.  The report's "
+          "own console write faulted; the depth guard stopped it recursing",
+}
+
 verdict = val("zx_run_failures")
-print("  zx_run_failures      = %d" % verdict)
+print("  zx_run_failures      = %d (0x%02X)" % (verdict, verdict))
 if verdict == 0xFFFFFFFF:
     print("  *** FAIL: the image never reached its verdict.")
+    failures += 1
+elif verdict in ZX_FAULT_EXIT_CODES:
+    print("  *** FAIL: %s." % ZX_FAULT_EXIT_CODES[verdict])
+    print("            This is an EXIT CODE and not a count of checks.")
     failures += 1
 elif verdict != 0:
     print("  *** FAIL: the image reported %d failing check(s)." % verdict)

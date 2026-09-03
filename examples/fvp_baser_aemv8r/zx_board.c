@@ -75,6 +75,24 @@ void zx_board_program_mmio_regions(uint32_t first_index)
 
 
 /**************************************************************************/
+/*  zx_board_deny_console_writes                                          */
+/**************************************************************************/
+
+uint32_t zx_board_deny_console_writes(uint32_t first_index)
+{
+    (void) first_index;
+
+    /* NOTHING TO DENY.  This console is semihosting -- an HLT that the model
+       interprets -- so it is not memory, no EL2 region covers it, and no
+       access permission can be made to refuse it.  Returning zero is the
+       honest answer and the caller reports the build as unprovokable here
+       rather than as passing.  */
+
+    return 0U;
+}
+
+
+/**************************************************************************/
 /*  zx_board_report                                                       */
 /**************************************************************************/
 

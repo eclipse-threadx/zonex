@@ -94,6 +94,19 @@ zx_add_s32z_probe(zx_probe_el2_fault.elf)
 target_compile_definitions(zx_probe_el2_fault.elf PRIVATE
                            ZX_PROBE_PROVOKE_EL2_FAULT)
 
+# A FAULT INSIDE THE FAULT REPORT.  Makes the region covering this board's own
+# console read-only at EL2, so that the report of the resulting abort faults on
+# its own first write -- which is the only way to reach the depth guard on the
+# unresumable vectors (docs/decisions.md D30).
+#
+# IT PRINTS NOTHING AFTER THE BANNER, by construction, so it is judged from
+# MEMORY: the harness must find zx_run_failures = 0x5C.  Not in CTest for the
+# same reason the EL2-fault build is not -- a suite that judges a run by its
+# printed verdict cannot judge one that has no console.
+zx_add_s32z_probe(zx_probe_refault.elf)
+target_compile_definitions(zx_probe_refault.elf PRIVATE
+                           ZX_PROBE_PROVOKE_REFAULT)
+
 # Claims to need more EL2 regions than any Armv8-R implementation can have, so
 # that the REFUSAL path is exercised.  Like the negative build, it must FAIL,
 # and it is a build rather than a temporary edit so the demonstration stays

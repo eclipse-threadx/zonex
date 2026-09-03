@@ -33,7 +33,7 @@ Two notices were swept:
 
 ## The part
 
-`MIDR_EL1` reads **`0x411FD133`** on the S32Z280-594EVB's RTU0 core 0, which is
+`MIDR` reads **`0x411FD133`** on the S32Z280-594EVB's RTU0 core 0, which is
 **Cortex-R52 r1p3**. Every applicability judgement below is against r1p3; the
 value is printed by the probe image's identity block on every run, so a board
 with a different revision reports it rather than inheriting this conclusion.

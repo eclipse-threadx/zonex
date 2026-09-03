@@ -329,6 +329,47 @@ void zx_board_program_mmio_regions(uint32_t first_index)
 
 
 /**************************************************************************/
+/*  zx_board_deny_console_writes                                          */
+/*                                                                        */
+/*  THE CONSOLE'S OWN REGION, MADE READ-ONLY TO EL2.  Everything else in   */
+/*  it is exactly what zx_board_program_mmio_regions wrote; only the       */
+/*  access permission changes, so the attributes stay Device and the       */
+/*  address range stays the console's.                                    */
+/*                                                                        */
+/*  AP 0b10 CAN DO THIS, and it is the same mechanism the deliberate       */
+/*  EL2-fault build already uses on a spare region.  At EL2 the access     */
+/*  permissions cannot deny EL2 outright -- 0b00 denies EL0 and EL1 and    */
+/*  grants EL2 read/write -- but they can make a region read-only to it,   */
+/*  and a console write is a store to the data register.  Reads of the     */
+/*  status register keep working, which does not matter: the store comes   */
+/*  first.                                                                */
+/*                                                                        */
+/*  AFTER THIS RETURNS, THIS BOARD HAS NO CONSOLE.  Nothing printed will   */
+/*  arrive, including the fault report for the fault this causes.  That is */
+/*  the point of the one build that calls it, and it is why the verdict    */
+/*  has to be read out of memory by the debug harness rather than off the  */
+/*  wire.                                                                 */
+/**************************************************************************/
+
+uint32_t zx_board_deny_console_writes(uint32_t first_index)
+{
+    ZX_REGION region;
+
+    region.zx_region_base     = (zx_addr_t)ZX_S32Z_LINFLEX_9_BASE;
+    region.zx_region_limit    = (zx_addr_t)((ZX_S32Z_LINFLEX_9_BASE
+                                             + ZX_S32Z_LINFLEX_9_SIZE) - 1UL);
+    region.zx_region_ap       = ZX_AP_EL2_RO_GUEST_NONE;
+    region.zx_region_xn       = ZX_XN_NEVER;
+    region.zx_region_sh       = ZX_SH_NON_SHAREABLE;
+    region.zx_region_attr_index = ZX_ATTR_DEVICE;
+
+    zx_stage2_region_program(first_index, &region);
+
+    return 1U;
+}
+
+
+/**************************************************************************/
 /*  zx_board_report                                                       */
 /**************************************************************************/
 

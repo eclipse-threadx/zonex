@@ -116,6 +116,26 @@ void zx_phase_two_partitions(uint32_t board_regions, uint32_t el2_regions);
 ZX_NODISCARD uint32_t zx_board_mmio_region_count(void);
 void zx_board_program_mmio_regions(uint32_t first_index);
 
+/* Reprogram the region covering the hypervisor's OWN CONSOLE so that EL2 may
+   read it and not write it, and return non-zero if that was possible.
+
+   IT EXISTS FOR EXACTLY ONE BUILD, and that build's purpose is to make the
+   fault report itself fault -- so that the guards on the unresumable vectors
+   are a path something has taken rather than a path somebody wrote.  See
+   docs/decisions.md D30.
+
+   Returns zero on a target whose console is not reached through an EL2 MPU
+   region at all, which is the model: its console is semihosting and no
+   region covers it, so there is nothing to deny and the build says so
+   rather than reporting a success it did not achieve.
+
+   AP can do this and cannot do the opposite.  At EL2 the access permissions
+   cannot deny EL2 outright, but they can make a region READ-ONLY to it --
+   which is enough, because a console write is a store to the data register.
+   The same mechanism is what zx_phase_provoke_el2_fault uses.  */
+
+ZX_NODISCARD uint32_t zx_board_deny_console_writes(uint32_t first_index);
+
 /* The SAME geometry, described rather than programmed, so the manifest
    validator can reject a partition window that overlaps the hypervisor's own
    console or interrupt controller.  Those regions stay enabled while a
