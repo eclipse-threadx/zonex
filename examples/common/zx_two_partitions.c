@@ -762,9 +762,79 @@ static void zx_report_partition(UINT index)
 /*  zx_report_switch_cost                                                 */
 /**************************************************************************/
 
-static void zx_report_switch_cost(void)
+static void zx_report_switch_cost(uint32_t core_hz)
 {
     zx_console_puts("\n--- what a partition switch costs, by group ---\n");
+
+    /* THE CONDITIONS COME FIRST, ABOVE THE NUMBERS, and they are printed on
+       every run rather than kept in a document.
+     *
+       A cycle count is quoted back at people.  It travels out of this log
+       into a slide, and the four facts that decide what it MEANS do not
+       travel with it unless they are attached to it: what the core is
+       clocked at, whether the caches were on, what optimisation the image
+       was built at, and how many samples the spread came from.  A reader
+       who has all four can argue with the number, and a reader who has to
+       ask for them is entitled to assume the answer was inconvenient.  */
+
+    zx_console_puts("  the conditions these were measured under:\n");
+    zx_console_puts("    core clock, measured against the system counter = ");
+    zx_console_putdec(core_hz / 1000000U);
+    zx_console_puts(" MHz\n");
+    zx_console_puts("    EL2 caches: OFF.  HSCTLR.C and .I are cleared in\n"
+                    "      the reset path, so every figure below is a\n"
+                    "      CACHE-COLD cost and a warm switch can only be\n"
+                    "      faster.  Conservative.\n");
+    zx_console_puts("    optimisation: -Og, not -O2.  Conservative again.\n");
+    zx_console_puts("    one board, one part, one run.  Reproducible on this\n"
+                    "      bench is not the same claim as characterised\n"
+                    "      across a population, and nothing here supports\n"
+                    "      the second.\n");
+
+    /* AND THE ONE THAT CUTS THE OTHER WAY, which is the reason this block
+       exists at all.
+
+       It would be easy to list only the conditions that make the figure
+       conservative and let a reader conclude it is an upper bound.  It is
+       not.  ZoneX configures no clock tree, so the core runs on the part's
+       power-up default -- the internal RC oscillator, which the reference
+       manual gives as 48 MHz and names as the default clock for the entire
+       system at power-up.  At that clock the memory this switch touches is
+       CHEAP in core cycles.  Raise the core clock without raising the
+       memory's and the same code costs MORE cycles, not fewer.
+
+       So: cache-cold and unoptimised make this an over-estimate, and a
+       backup-clocked core makes it an under-estimate, and nobody should
+       quote it as a worst case in either direction until it has been
+       measured again with the clock tree configured.  Saying so here is
+       cheaper than having it pointed out.  */
+
+    zx_console_puts("\n"
+                    "    AND ONE CONDITION THAT CUTS THE OTHER WAY.  ZoneX\n"
+                    "      configures no clock tree, so the core runs on\n"
+                    "      this part's POWER-UP DEFAULT -- the internal RC\n"
+                    "      oscillator, 48 MHz nominal, which the reference\n"
+                    "      manual names as the default clock for the whole\n"
+                    "      system at power-up.  At that clock the memory this\n"
+                    "      switch touches is cheap in CORE CYCLES; raise the\n"
+                    "      core clock without raising the memory's and the\n"
+                    "      same code costs MORE cycles, not fewer.\n"
+                    "\n"
+                    "      So this figure is an over-estimate for two reasons\n"
+                    "      and an under-estimate for a third.  It is a real\n"
+                    "      measurement of a real switch on real silicon, and\n"
+                    "      it is NOT a worst case in either direction until\n"
+                    "      it has been taken again with the clock tree\n"
+                    "      configured.\n");
+
+    if (core_hz != 0U)
+    {
+        zx_console_puts("    at that clock, one thousand cycles is about ");
+        zx_console_putdec(1000000000U / (core_hz / 1000U));
+        zx_console_puts(" ns\n");
+    }
+
+    zx_console_puts("\n");
 
     if (zx_pmu_is_running() == 0U)
     {
@@ -785,6 +855,29 @@ static void zx_report_switch_cost(void)
     zx_note("stage-2 region set, HPRENR", zx_cost.zx_cost_region_mask);
     zx_note("the time freeze, CNTVOFF  ", zx_cost.zx_cost_time_freeze);
     zx_note("arming the next boundary  ", zx_cost.zx_cost_deadline);
+
+    zx_console_puts(
+        "\n"
+        "  AND WHAT IS DELIBERATELY NOT IN THE TOTAL, said here rather than\n"
+        "  somewhere a reader has to go and look for it.  Two things are\n"
+        "  excluded from the per-switch figures, and both would inflate them\n"
+        "  for reasons that are not a partition switch:\n"
+        "\n"
+        "    the guest CONSOLE.  Handing the console back closes a partial\n"
+        "    line, which on this board is characters through a polled UART.\n"
+        "    A product switch has no console in it; leaving it in made the\n"
+        "    published figure describe what a guest had been printing, and\n"
+        "    it showed up as a spread of 9,562 cycles against the 190 below.\n"
+        "\n"
+        "    BURNING A STOPPED PARTITION'S WINDOW.  A boundary that has to\n"
+        "    wait out a dead neighbour's slot is a switch plus a wait of up\n"
+        "    to a whole window.  Such boundaries are COUNTED and not timed;\n"
+        "    the two counts are printed above and are equal in any run where\n"
+        "    both partitions live to the end.\n"
+        "\n"
+        "  Nothing else is excluded.  The groups above sum to the whole\n"
+        "  switch, and the per-boundary figures are taken around the real\n"
+        "  thing rather than around a reconstruction of it.\n");
 
     zx_console_puts(
         "\n"
@@ -869,6 +962,7 @@ ZX_NORETURN void zx_el2_main(void)
     uint32_t probe_b;
     uint32_t ticks_a;
     uint32_t ticks_b;
+    uint32_t core_hz;
     ZX_MANIFEST_FAULT fault;
 
     /* ---------------------------------------------------------------- */
@@ -1148,6 +1242,24 @@ ZX_NORETURN void zx_el2_main(void)
 
     zx_pmu_enable();
 
+    /* WHAT THE CORE IS CLOCKED AT, measured against the system counter --
+       whose own frequency is the one number in this system that has
+       actually been established.  Every switch figure below is in core
+       CYCLES, and a cycle count nobody can convert into a duration is a
+       number nobody can argue with, which is not the same as one they
+       should accept.  */
+
+    core_hz = zx_pmu_core_hz(zx_board_counter_hz(), zx_board_counter_hz()
+                                                        / 1000U);
+
+    zx_note("core clock, Hz, measured", core_hz);
+    zx_check("the core clock could be measured against the system counter,\n"
+             "         so every cycle figure in this run converts to a\n"
+             "         duration.  It is measured rather than read out of a\n"
+             "         clock-tree register, which would report what somebody\n"
+             "         programmed rather than what the core is doing",
+             (core_hz > 0U) ? 1U : 0U);
+
     /* PARTITION A IS QUIET AND PARTITION B IS LOUD, and the asymmetry is
        the demonstration rather than a saving.  A guest's console is one
        hypercall PER CHARACTER through a polled UART, which on silicon is
@@ -1351,7 +1463,7 @@ ZX_NORETURN void zx_el2_main(void)
     /* ---------------------------------------------------------------- */
 
     zx_report_frame(outcome);
-    zx_report_switch_cost();
+    zx_report_switch_cost(core_hz);
 
     zx_report_partition(ZX_PART_A);
     zx_report_partition(ZX_PART_B);

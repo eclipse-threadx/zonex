@@ -1067,6 +1067,14 @@ exercised on a machine with no board attached. **Quote the silicon column.**
 | the time freeze, `CNTVOFF` | 75 | **404** |
 | arming the next boundary, `CNTHP_CVAL` | 24 | **90** |
 | counter-read overhead, subtracted from every row | 8 | **122** |
+| core clock the cycles were counted at | (model) | **48 MHz, measured** |
+
+⚠ **Read the conditions above the table before quoting anything in it.** The
+S32Z280 column was taken with the EL2 caches OFF, at `-Og`, on one board, and
+with the core on the part's 48 MHz power-up RC oscillator because ZoneX
+configures no clock tree — which makes the figure an over-estimate for the
+first two reasons and an under-estimate for the third. See the section on the
+core clock below.
 
 **The EL1 MPU is 85% of each direction on BOTH targets**, and that proportion
 holding across a 32-region model and a 20-region part is the more useful half
@@ -1093,6 +1101,48 @@ decision is unaffected either way, because it rests on a region write's cost
 GROWING with the incoming partition's region count while a mask's does not, and
 both readings agree the mask is much cheaper. Settling it belongs with the
 hardening work and should start by running both measurements in one image.
+
+### ⚠ The core runs at 48 MHz — the RC oscillator — because nothing sets a clock tree
+
+**Measured against the system counter, 48,050,135 Hz on the S32Z280-594EVB**,
+by timing the PMU cycle counter across one millisecond of counter time. The
+counter's own frequency is the one in this system that has been established
+independently, three ways, which is what makes it the right thing to measure
+against; reading a clock-tree register instead would report what somebody
+programmed rather than what the core is doing.
+
+The S32Z27 reference manual accounts for it exactly: **FIRC is 48 MHz** and
+*"FIRC_CLK is the default clock for the entire system at power-up. All system
+clock dividers are set to their default or reset values."* ZoneX configures no
+clock tree, so the core is on the part's backup oscillator for the whole run.
+
+**This qualifies every cycle figure this project publishes, and it qualifies
+them in the OPPOSITE direction from the other conditions.** Two of those make a
+measured switch an over-estimate:
+
+| Condition | Direction |
+|---|---|
+| EL2 caches OFF (`HSCTLR.C`, `.I` cleared at reset) | over-estimate — a warm switch can only be faster |
+| built `-Og`, not `-O2` | over-estimate |
+| **core on the 48 MHz RC oscillator** | **UNDER-estimate** — at that clock the memory a switch touches is cheap in CORE cycles, so raising the core clock without raising the memory's makes the same code cost MORE cycles |
+
+So a switch figure from this bench is an over-estimate for two reasons and an
+under-estimate for a third, and **it is not a worst case in either direction**
+until it is taken again with the clock tree configured. Anybody quoting it as
+a WCET is quoting something this project has not measured.
+
+Two consequences worth carrying:
+
+* **Cycles remain the right unit** — they are what a WCET argument is made in,
+  and `CNTFRQ` reads zero on both targets so there is no frequency to convert
+  with anyway. What changed is that the conversion is now *possible*: the
+  two-partition image measures the core clock on every run and prints it above
+  its own figures, so a cycle count published from this suite can always be
+  turned into a duration by the reader who wants one.
+* **Configuring the clock tree is board bring-up and is not done**, on purpose.
+  Running at the reset default is legitimate and reproducible as long as it is
+  stated; what would not be legitimate is publishing a duration derived from it
+  without saying which clock it came from.
 
 ### ⚠ The floating-point traps block the debugger's register read, on silicon
 

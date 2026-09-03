@@ -895,3 +895,83 @@ void zx_el2_allow_guest_fp(void)
     __asm__ volatile("mcr p15, 4, %0, c1, c1, 2" : : "r"(hcptr) : "memory");
     __asm__ volatile("isb" ::: "memory");
 }
+
+
+/**************************************************************************/
+/*                                                                        */
+/*  FUNCTION                                               RELEASE        */
+/*                                                                        */
+/*    zx_pmu_core_hz                                       Cortex-R52     */
+/*                                                                        */
+/*  DESCRIPTION                                                           */
+/*                                                                        */
+/*    What the CORE clock runs at, measured against the system counter.   */
+/*                                                                        */
+/*    WHY A CYCLE COUNT NEEDS THIS TO MEAN ANYTHING TO A READER.  Every    */
+/*    figure this suite publishes about a partition switch is in CORE     */
+/*    CYCLES, because cycles are the unit a worst-case-execution-time     */
+/*    argument is made in and because CNTFRQ reads zero out of reset on   */
+/*    both targets.  That is the right unit and it is not a self-         */
+/*    contained one: "5,715 cycles" cannot be turned into a duration by   */
+/*    anybody who does not know what the core is clocked at, and this     */
+/*    part reports that nowhere.  A number a reader cannot convert is a   */
+/*    number they cannot argue with, which is not the same as one they    */
+/*    should accept.                                                      */
+/*                                                                        */
+/*    MEASURED, NOT LOOKED UP, and measured against the one frequency in  */
+/*    this system that IS established: the counter's, which on the        */
+/*    S32Z280 was pinned three independent ways -- against host wall      */
+/*    clock over thirty-two seconds, from the RTU divider, and from the   */
+/*    crystal the boot ROM's baud divisors confirm.  Reading a clock-tree */
+/*    register instead would be reporting what somebody programmed rather */
+/*    than what the core is doing.                                        */
+/*                                                                        */
+/*    ONE MILLISECOND OF COUNTER TIME by default, which is short enough   */
+/*    that PMCCNTR cannot wrap -- it is 32 bits, so a core would have to  */
+/*    exceed four terahertz -- and long enough that the two counter reads */
+/*    at each end, which cost about 93 counts on this part, are a         */
+/*    thousandth of the interval rather than a part of it.                */
+/*                                                                        */
+/*    Returns zero when the counter did not move or the cycle counter did */
+/*    not advance, which are the two ways this can be asked of a machine  */
+/*    that cannot answer -- and a zero a caller must check, because a     */
+/*    frequency of zero would otherwise divide.                           */
+/*                                                                        */
+/**************************************************************************/
+
+uint32_t zx_pmu_core_hz(uint32_t counter_hz, uint32_t counts)
+{
+    uint64_t started;
+    uint64_t ended;
+    uint32_t cycles_at_start;
+    uint32_t cycles;
+    uint64_t elapsed;
+
+    if ((counter_hz == 0U) || (counts == 0U))
+    {
+        return 0U;
+    }
+
+    started         = zx_read_cntpct();
+    cycles_at_start = zx_pmu_cycles();
+
+    zx_el2_dwell_until(started + (uint64_t)counts);
+
+    cycles = zx_pmu_cycles() - cycles_at_start;
+    ended  = zx_read_cntpct();
+
+    if (ended <= started)
+    {
+        return 0U;
+    }
+
+    elapsed = ended - started;
+
+    /* cycles / elapsed x counter_hz, with the multiplication FIRST so that
+       an integer division does not throw the ratio away before it is
+       scaled.  In 64-bit throughout: the product reaches 10^13 on this
+       part, which a 32-bit intermediate would wrap without any sign that
+       it had.  */
+
+    return (uint32_t)(((uint64_t)cycles * (uint64_t)counter_hz) / elapsed);
+}

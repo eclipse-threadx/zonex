@@ -1120,6 +1120,7 @@ no unexplained interrupts on either target.
 | the time freeze, `CNTVOFF` | 75 | **404** |
 | arming the next boundary, `CNTHP_CVAL` | 24 | **90** |
 | counter-read overhead, subtracted from every row | 8 | **122** |
+| core clock the cycles were counted at | (model) | **48 MHz, measured** |
 
 **The guest's EL1 MPU is 85% of each direction on both targets**, and that
 proportion holding across a 32-region model and a 20-region part is the more
@@ -1128,6 +1129,20 @@ asks, and it is the opposite of the intuitive one: a partition switch is not
 expensive because the hypervisor does much — its own per-partition state is
 three register writes — but because a **guest** has a lot of registers, and
 most of them are its memory protection unit.
+
+⚠ **AND THE CONDITIONS ARE PART OF THE FIGURE.** Two of them make it an
+over-estimate — the EL2 caches are OFF and the image is built `-Og`, so a
+warm, optimised switch can only be faster. **One makes it an under-estimate,
+and it is the one that would otherwise be found by somebody else:** ZoneX
+configures no clock tree, so the core runs on this part's power-up RC
+oscillator at 48 MHz, measured. At that clock the memory a switch touches is
+cheap in CORE cycles; raise the core clock without raising the memory's and
+the same code costs MORE cycles, not fewer.
+
+So the figure is a real measurement of a real switch on real silicon and it
+is **not a worst case in either direction** until it is taken again with the
+clock tree configured. The image prints all four conditions above its own
+numbers on every run, so a figure quoted out of a log carries them with it.
 
 **Report the maximum.** A schedule has to be built to survive the worst switch
 it will ever take, so a mean quoted alone hides the excursion a reviewer is

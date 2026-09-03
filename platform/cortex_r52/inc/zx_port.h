@@ -811,6 +811,19 @@ ZX_NODISCARD uint32_t zx_pmu_cycles(void);
 
 ZX_NODISCARD uint32_t zx_pmu_is_running(void);
 
+/* What the CORE clock runs at, measured against the system counter over a
+   short bounded interval.
+ *
+ * Every switch figure this suite publishes is in core CYCLES, which is the
+ * right unit for a worst-case-execution-time argument and is not a
+ * self-contained one: nobody can turn a cycle count into a duration without
+ * knowing the core clock, and this part reports it nowhere.  Measured
+ * against the counter because the counter's frequency is the one in this
+ * system that has actually been established.  Returns zero when the counter
+ * or the cycle counter did not move.  */
+
+ZX_NODISCARD uint32_t zx_pmu_core_hz(uint32_t counter_hz, uint32_t counts);
+
 /* Turning protection on is TWO steps, and separating them is not tidiness.
 
    zx_el2_mpu_enable sets HSCTLR.BR and HSCTLR.M: the EL2-controlled MPU,
