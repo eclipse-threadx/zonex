@@ -282,6 +282,62 @@ Phase-0 demonstrator exists to show. `0x25` means the hypervisor faulted on
 itself — a ZoneX bug — and must be reported as one rather than folded in with
 `0x24`.
 
+### Which classes have actually been PROVOKED, and how
+
+A table of exception classes says what a part can report. It says nothing about
+whether the hypervisor's decode of them has ever run. These have been taken
+deliberately, on both targets:
+
+| `EC` | provoked by | outcome asserted |
+|---|---|---|
+| `0x03` | `HCR.TID1` set, then an EL1 read of `MPUIR` | classified as an unexpected trap, named by the decoder, and **the run carries on** |
+| `0x12` | `HVC #0`, the empty vector | returns to the guest with its registers intact |
+| `0x20` | a guest branching into its neighbour's code | the partition is stopped, or resumed at an address it published |
+| `0x24` | a guest writing outside its window | the partition is stopped; `HDFAR` is exactly the address touched |
+| `0x25` | an EL2 region made read-only at EL2 and then written from EL2 | reported as a **hypervisor** bug, with its own vector and its own exit code |
+
+**`HCR.TID1` is the route to an unhandled class, and the choice matters.** It
+traps EL1 reads of `TCMTR`, `AIDR`, `MPUIR`, `TLBTR` and `REVIDR` to EL2 (TRM
+Table 3-65) with `EC 0x03`. ZoneX handles neither the class nor the register, so
+it is a genuine unhandled exception rather than a simulated one — and `MPUIR`
+is the register a later phase would trap in earnest, to virtualise the region
+count a partition sees. **It also cannot hang or go undefined in either
+direction**, which is what makes it fit for an unattended bench: if the trap
+fires EL2 gets the exception, and if it does not the `MRC` simply reads `MPUIR`.
+
+Two routes were tried first and rejected, and both are worth recording:
+
+* **`WFI` under `HCR.TWI`** hangs the run if the trap is absent.
+* **A floating-point instruction under `HCPTR.TCP10`/`TCP11`** is UNDEFINED AT
+  EL1 on the Armv8-R AEM FVP — see below.
+
+### ⚠ The Armv8-R AEM FVP implements no FPU
+
+*Measured 3 September 2026.*
+
+`VMOV s0, r0` executed at EL1 on the model is **UNDEFINED** — with
+`HCPTR.TCP10`/`TCP11` set, with them clear, and with `CPACR.cp10`/`cp11`
+enabled by the payload first. It never reaches EL2 in any of those states: the
+payload's own undefined-instruction vector takes it.
+
+Three things follow.
+
+* **A floating-point trap to EL2 cannot be demonstrated on the model at all.**
+  Any test of `HCPTR`-based FPU denial is silicon-only.
+* **The check order matters, and it is NOT measured here.** The architecture
+  checks `CPACR` before `HCPTR` before `FPEXC`, so on a part that *has* an FPU
+  a guest which has not enabled coprocessor access for itself should take an
+  undefined-instruction exception at **EL1** and the hypervisor should never
+  see it. ⚠ **That is read from the architecture manual and not verified on
+  silicon** — it could not be, because the attempt to verify it is what found
+  the model has no FPU. It is stated here as the thing to check first on the
+  board, not as a measured fact, and this sheet's convention is that anything
+  unmarked *was* measured.
+* **`-mfloat-abi=soft` is the default for both toolchain files**, so ZoneX
+  itself emits no VFP instruction at EL2 on either target. The hard-float
+  option exists and selecting it would put floating point in the hypervisor;
+  see `docs/errata.md` for what that implies on this part.
+
 ---
 
 ## Timers and the GIC

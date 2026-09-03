@@ -239,6 +239,56 @@ The one case that would reopen the mechanism is two partitions needing
 different *attributes* on one address, which no manifest the validator accepts
 can ask for today.
 
+### ⚠ The per-component figures were understated, and by how much
+
+*Amended 3 September 2026, during the hardening pass.*
+
+**Two images measured the same `HPRENR` mask write and disagreed by a factor of
+two — 235 cycles against 117 on the S32Z280, 13 against 9 on the model.** The
+disagreement was carried as unexplained through two rounds of work. It was
+arithmetic, in the hypervisor's own measurement helper and not in the thing
+being measured.
+
+Each row brackets a loop of *n* operations between two counter reads, so the
+span holds *n* operations and **one** extra read — the closing one. The helper
+divided the span by *n* and then subtracted a whole counter read, which
+subtracts one read from every **iteration** where only one is paid per **loop**.
+It over-subtracted by very nearly one counter read from every row. The probe
+image, which subtracts from the span before dividing, was right all along.
+
+The two differences were each almost exactly the helper's own
+`zx_cost_counter_read`: 118 cycles on the board and 4 on the model. Same bench,
+same session, after the fix: **217 cycles** from the probe's synthetic loop and
+**219** from the helper. The question is closed.
+
+**The corrected component figures**, S32Z280-594EVB, cycles at 48.19 MHz:
+
+| | cycles |
+|---|---|
+| counter read, subtracted | 110 |
+| save, everything | 2,109 — of which the EL1 MPU 1,838 |
+| restore, everything | 2,251 — of which the EL1 MPU 1,916 |
+| stage-2 region set, `HPRENR` | 219 |
+| the time freeze, `CNTVOFF` | 531 |
+| arming the next boundary | 198 |
+
+Against an end-to-end switch of 6,046 / 6,069 / 6,262. The components now sum
+to 5,308 and the 761-cycle remainder is the GIC acknowledge and end-of-interrupt,
+the frame bookkeeping and the vector entry — real work the rows do not bracket.
+Before the fix they summed to about 4,758 and the gap was 1,311.
+
+**Nothing that rests on this decision changes.** The end-to-end figure is taken
+around the real boundary with two reads and no loop and was never affected. The
+ratio the mechanism was chosen on — a block rewrite growing with the incoming
+partition's region count, where a mask does not — is a property of the design
+and not of a measurement. What changes is that **every per-component figure
+published before this was too small by about one counter read**, and anyone
+quoting them should use the table above.
+
+*The general lesson, which is why this is written down at length: subtract an
+overhead from the SPAN, before dividing, or state in the code which one you
+meant. Both images were readable and only one was right.*
+
 ---
 
 ## D5 — How an address is spelled in the manifest · **settled**
@@ -914,6 +964,47 @@ The same list, written from the kernel's side, is at the `#ifndef` in the
 S32Z280 `entry.S` — next to the code it replaces, which is where somebody
 adding a third board will be looking.
 
+### ⚠ The FPU denial cannot be demonstrated on the model
+
+*Added 3 September 2026, by measurement.*
+
+The argument for **denying** the FPU to a time-partitioned system rather than
+saving it is that a guest touching floating point then takes an exception at EL2
+**with a syndrome naming the cause**, instead of silently reading its
+neighbour's registers. That half of the argument had never been run, and an
+attempt to run it during the hardening pass found that it cannot be run on the
+Armv8-R AEM FVP at all.
+
+**Measured on the model:** a `VMOV s0, r0` executed at EL1 is UNDEFINED — with
+`HCPTR.TCP10`/`TCP11` set, with them clear, and with `CPACR.cp10`/`cp11`
+enabled first. It never reaches EL2. The payload's own undefined-instruction
+vector took it and reported the exception, so what the run saw was
+`EC 0x12` from the guest's own handler rather than `EC 0x07` from `HCPTR`.
+**The model as ZoneX configures it implements no FPU.**
+
+Two consequences, and the second is the one that matters for the decision:
+
+* The claim is **silicon-only**. Any test of it belongs on the board, and the
+  suite's unexpected-exception case is provoked another way — see
+  `docs/armv8r-el2-reference.md`.
+* On a part with an FPU the trap is still the right mechanism, but the
+  behaviour a guest sees **may depend on its own `CPACR`**: the architecture
+  checks `CPACR` before `HCPTR`, so a guest that has not enabled coprocessor
+  access for itself would get an undefined-instruction exception at EL1, which
+  its own kernel handles and the hypervisor never sees. That is safe — the
+  register bank is not shared either way — but it is not diagnosable at EL2.
+  ⚠ **Read from the architecture manual and not verified**, because the
+  attempt to verify it is what found the model has no FPU. If it holds, the
+  sentence "a guest touching floating point takes an exception at EL2 naming
+  the cause" is true of a guest whose kernel uses floating point and not of one
+  that does not — and that is worth knowing before the claim is made in front
+  of anybody.
+
+The decision does not change. Denying is still right and saving is still the
+later-phase option. What changes is that the argument's evidence is a bench
+result that has not been taken yet, and saying so is better than leaving a
+claim that reads as tested.
+
 ---
 
 ## D24 — Who owns the GIC, and how a partition's interrupt is delivered · **settled, and measured on both targets**
@@ -1586,7 +1677,8 @@ silicon is cheap and ten minutes of a functional model on every pull request is
 not.
 
 Jitter in counter counts, S32Z280-594EVB, ten frames per phase against a
-hundred:
+hundred. **These are the figures BEFORE the console was taken off the boundary
+path** — see the amendment below for what the console row measures now:
 
 | the untrusted partition is… | 60 frames | 600 frames |
 |---|---|---|
@@ -1599,7 +1691,9 @@ hundred:
 The quiet phases roughly double and stay in the tens of counts. The fault phase
 grows fourfold — 117,000 violations in the short run, over a million in the long
 one, so the tail had more chances to appear. The console phase is stable to
-0.7%, which is what a bound set by a UART's character rate should look like.
+0.7% — which looked like a bound set by a UART's character rate and was in fact
+**the hypervisor closing a partial line on the switch path**. See the amendment
+below.
 
 Every one of them stays two to three orders of magnitude inside the bound
 asserted against it. So the short run is sound for the claim it makes, and
@@ -1650,3 +1744,155 @@ An amendment to the linker script's own placement, or `-ffunction-sections`
 with an ordering file, would make the figure repeatable across code changes.
 That is worth doing before anybody characterises this across a population, and
 it is not worth doing to make a demonstrator's number look tidier.
+
+### ⚠ The console phase was measuring a defect, and half of it is now fixed
+
+*Amended 3 September 2026, during the hardening pass.*
+
+The console row above is not a property of partitioning. It was **the
+hypervisor's own console driver perturbing its own switch**, and the fix and
+the residual are both worth recording because the residual is what the temporal
+claim now has to be written around.
+
+**What it was.** A guest's console is one hypercall per character through a
+polled UART. A window that ended with a partial line outstanding had that line
+closed by the **boundary handler** — `CR` and `LF`, at EL2, with FIQ masked, on
+the switch path, back to back, which is the exact case the board driver's
+write-one-to-clear guard exists for. The trip count was decided by what the
+outgoing guest had been printing.
+
+**What was done.** A release now records that a line is owed and writes
+nothing; the newline is emitted by whoever speaks next, inside a window that
+party owns. **The character stream is identical** — only the moment of the
+write moves — which is what made it safe, and the host suite asserts it against
+the text rather than against a flag. See D29.
+
+**What it measures now**, S32Z280-594EVB, jitter in counter counts:
+
+| | before | after |
+|---|---|---|
+| 60 frames | 24,420, every run | 999 · 1,159 · 1,196 |
+| 600 frames | 24,584 | 1,169 · 1,169 · 1,204 · 1,236 — **and** 30,615 · 30,639 · 30,689 |
+
+A sixty-frame run no longer sees it. A six-hundred-frame run does, in roughly
+**two runs in five**: one long period and one short correction of about 15,300
+counts each. It is **not** the boundary handler, which now writes nothing. It
+is somewhere on the hypercall path, where every character is still written at
+EL2 with FIQ masked, and **the mechanism is not confirmed** — the board
+driver's guard spin is the leading suspect and naming it before measuring it
+would be inventing a cause to go with a number.
+
+**⚠ Four consecutive clean long runs said it had gone; the fifth said it had
+not.** That is recorded because it nearly went into this document the other way
+round. Nothing here should be concluded from fewer than six or seven long runs.
+
+**The bound therefore stays at half a window for this phase**, and it is
+deliberately not tightened to what a sixty-frame run measures: a bound that
+passes in CTest and fails on the bench two runs in five is worse than no bound.
+Every other phase is held to one eighth of a window.
+
+**What this costs the claim.** A partition's window period is unaffected by a
+neighbour that computes, that masks its own interrupts, or that violates its
+boundary ten thousand times a run — those move it by tens of counts. It is
+**not** unaffected by a neighbour that **prints**. That sentence needs the
+console off the hypercall path as well, and the work is scoped separately.
+
+### ⚠ And one thing that is not explained
+
+The negative build whose stage-2 limit for one partition is deliberately **one
+granule too generous** measures **19,094 · 19,188 · 19,284** counts in the
+console phase on three consecutive sixty-frame runs, where the correct build
+measures about twelve hundred and never more. The two builds differ by one
+number in a region descriptor and print the same characters.
+
+A wrong region limit perturbing the **timing** as well as the memory would be a
+useful thing to be true. It is recorded and **not claimed**, because a
+mechanism nobody has found is not a result.
+
+---
+
+## D29 — The guest console closes a line LAZILY · **settled 3 Sep 2026, by measurement**
+
+**A window boundary hands the console over without writing anything. The
+newline that closes the outgoing partition's partial line is emitted by
+whoever speaks next — the incoming partition's first character, or the
+hypervisor — inside a window that party owns.**
+
+The eager alternative is what was there first and it is the obvious one: close
+the line when the console changes hands, so that no two partitions can ever
+share a physical line. It is correct and it is in the wrong place. Closing a
+line is `CR` and `LF` into a polled UART, and at a window boundary that is at
+EL2, with FIQ masked, on the switch path, with a trip count decided by what a
+guest had been printing. Measured cost to the critical partition's window
+period: **24,420 counts of an 8 MHz counter**, against 69 counts for that same
+neighbour violating its boundary a hundred thousand times. See D28.
+
+**The character stream is unchanged, and that is the whole safety argument.**
+The newline still appears in exactly the same place relative to every other
+character, because the only things that can follow it are a tag or a hypervisor
+message and both go through code that settles the debt first. What moves is
+*when* it is written, not *where* it appears. The host suite asserts the
+resulting text, and asserts separately that a release emits nothing at all.
+
+**Two functions, not one, and the distinction is which side of the switch the
+two characters are charged to.** A *release* is what a window boundary calls
+and it writes nothing. A *detach* is what everything else calls — a partition
+that left its window early, a frame that has ended — and it is eager, because
+in both cases the hypervisor is about to print anyway and the characters are on
+nobody's switch.
+
+The rejected alternative was to buffer each partition's output and flush it off
+the boundary path entirely. That is the better answer and it is a larger one:
+it needs a bound on the buffer, an answer for what happens when it fills that
+is not "the guest blocks", and it changes the line-tagging contract rather than
+preserving it. The lazy close was chosen because it removes the boundary cost
+**without moving a single character**, which is a change that can be reviewed
+by reading one file. The buffer remains the option for the phase that needs the
+console off the hypercall path as well.
+
+---
+
+## D30 — The vectors that cannot resume get a known stack and refuse to recurse · **settled 3 Sep 2026**
+
+**The EL2 vectors that report and stop — a fault taken from Hyp mode, and every
+vector nothing should reach — reset `SP_hyp` to the top of the EL2 stack before
+calling C, and the C side counts its own depth and stops reporting on a second
+entry.**
+
+Both are defence on a path that only runs after ZoneX has already failed once,
+and both close a way for a diagnosable bug to become a hang.
+
+**The stack.** The reporting path is C and C needs a stack. Until this it ran
+on whatever `SP_hyp` held when the exception was taken — which, for the one
+class of fault these vectors exist to report, may be the *reason* for the
+fault. A hypervisor whose stack has run away then faults again inside its own
+fault report and the run ends with nothing said. Resetting is safe precisely
+because nothing below is coming back: there is nothing to resume, so the stack
+the exception arrived on is not needed. This is the vector-bracket rule from
+the other side — a handler may not assume the state it was entered with is
+usable, and here the caller is ZoneX itself.
+
+**The depth.** Resetting the stack does not make the path re-entrant: a second
+fault taken inside the report would arrive at the same vector, reset the same
+stack and call the same function, for ever. So the depth is counted in `.bss`
+and the **second entry does not print at all**. It stores a verdict and parks,
+which is the one action left that cannot itself fault — the console is the most
+likely thing to have failed and is certainly the most likely thing to fail
+again. It carries its own exit code, so that a silicon harness reading the
+verdict word with no console at all can tell *"ZoneX faulted at EL2"* from
+*"ZoneX faulted at EL2 while reporting a fault at EL2"*. Those are different
+bugs and they point at different code.
+
+**What this does not cover, said plainly.** A fault taken inside the vector's
+own capture macro — before any C runs — would recurse with nothing to count it.
+That is closed by architecture rather than by code: ZoneX spends no EL2 MPU
+region on its own memory and is protected by not being covered by any enabled
+region (D2), so the fault record and the depth counter cannot be denied to it
+by any region set a manifest can produce.
+
+**⚠ Neither guard has been provoked.** They are defence, and by the standard
+this suite holds itself to — *a branch nothing has ever taken is not evidence
+that it works* — that is a gap and not a completed item. Provoking one needs an
+image whose second fault lands in the C report rather than in the capture, which
+on the board means denying the console's own MMIO after the first fault. It is
+recorded here as not done rather than left to look finished.
