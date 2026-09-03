@@ -19,7 +19,10 @@
 target_sources(zonex_port PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/src/zx_el2_entry.S
     ${CMAKE_CURRENT_LIST_DIR}/src/zx_trap_handler.S
+    ${CMAKE_CURRENT_LIST_DIR}/src/zx_context.S
     ${CMAKE_CURRENT_LIST_DIR}/src/zx_cache.c
+    ${CMAKE_CURRENT_LIST_DIR}/src/zx_context.c
+    ${CMAKE_CURRENT_LIST_DIR}/src/zx_frame.c
     ${CMAKE_CURRENT_LIST_DIR}/src/zx_console.c
     ${CMAKE_CURRENT_LIST_DIR}/src/zx_el2_cpu.c
     ${CMAKE_CURRENT_LIST_DIR}/src/zx_el2_fault_path.c

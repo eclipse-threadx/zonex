@@ -37,14 +37,21 @@
 /*                                partition's clock FROZEN rather than     */
 /*                                merely unread.                          */
 /*                                                                        */
-/*    The partition tick -- the hypervisor's OWN timer, on PPI 26, which  */
-/*    ends a window -- is not here yet.  It does NOT need HCR.IMO: that   */
-/*    would route every guest IRQ to EL2 as well.  Routing is by          */
-/*    exception TYPE, so the tick goes in GROUP 0, arrives as an FIQ, and */
-/*    HCR.FMO alone brings it to EL2 while guest IRQs stay with EL1.      */
-/*    With FMO set, PSTATE.F is ignored at EL1, so a partition cannot     */
-/*    mask the interrupt that ends its own window.                        */
-/*    See docs/decisions.md D24.                                          */
+/*    THE PARTITION TICK IS NOW HERE TOO: CNTHP, the hypervisor's own      */
+/*    timer on PPI 26, armed with an ABSOLUTE deadline in CNTHP_CVAL.      */
+/*    It does NOT need HCR.IMO, which would route every guest IRQ to EL2   */
+/*    as well.  Routing is by exception TYPE, so the tick goes in GROUP 0, */
+/*    arrives as an FIQ, and HCR.FMO alone brings it to EL2 while guest    */
+/*    IRQs stay with EL1.  With FMO set, PSTATE.F is IGNORED at EL1, so a  */
+/*    partition cannot mask the interrupt that ends its own window.        */
+/*    See docs/decisions.md D24 and D25.                                   */
+/*                                                                        */
+/*    THE PER-PARTITION HALF OF THE CNTVOFF BOOKKEEPING MOVED OUT.  The    */
+/*    statics below are one partition's worth and serve the images that    */
+/*    launch a single guest.  Once there is more than one partition, "when */
+/*    did this partition stop" is partition state and belongs in its       */
+/*    context block; zx_context.c holds that version, using the same       */
+/*    arithmetic against the same register.                                */
 /*                                                                        */
 /*  MISRA C:2012 deviations (justified)                                   */
 /*                                                                        */
@@ -67,6 +74,14 @@
 
 #define ZX_CNTV_CTL_ENABLE  ZX_BIT(0)
 #define ZX_CNTV_CTL_IMASK   ZX_BIT(1)
+
+/* CNTHP_CTL, the HYPERVISOR timer's control register, whose three bits sit
+   in the same places as the virtual timer's.  ISTATUS is READ-ONLY and says
+   whether the comparator has been reached: it is the difference between "the
+   window boundary has arrived" and "some other FIQ did", which is worth
+   asking rather than assuming when a single vector serves both.  */
+
+#define ZX_CNTHP_CTL_ISTATUS    ZX_BIT(2)
 
 /* How long to spin looking for the physical counter to move.  The counter
    runs at 8 MHz on one target and 100 MHz on the other, so a counter that is
@@ -565,5 +580,318 @@ void zx_el2_guest_timer_stop(void)
     control &= ~(uint32_t)(ZX_CNTV_CTL_ENABLE | ZX_CNTV_CTL_IMASK);
     __asm__ volatile("mcr p15, 0, %0, c14, c3, 1"
                      : : "r"(control) : "memory");
+    __asm__ volatile("isb" ::: "memory");
+}
+
+
+/**************************************************************************/
+/*                                                                        */
+/*  FUNCTION                                               RELEASE        */
+/*                                                                        */
+/*    zx_el2_hyp_timer_arm                                 Cortex-R52     */
+/*    zx_el2_hyp_timer_stop                                              */
+/*    zx_el2_hyp_timer_fired                                             */
+/*    zx_el2_hyp_timer_deadline                                          */
+/*                                                                        */
+/*  DESCRIPTION                                                           */
+/*                                                                        */
+/*    CNTHP, the hypervisor's own timer, and the interrupt that ends a    */
+/*    partition's window.                                                 */
+/*                                                                        */
+/*    CNTHP_CVAL AND NOT CNTHP_TVAL, and the difference is the whole       */
+/*    determinism claim.  TVAL is a 32-bit DOWN-COUNT loaded relative to   */
+/*    now: re-arming it inside the handler adds the handler's own latency  */
+/*    to every window, so a frame declared as 10 ms becomes 10 ms plus     */
+/*    the switch, cumulatively, for the life of the run.  The schedule     */
+/*    still looks fixed, the windows stay in the right proportion, and     */
+/*    the frame slowly stops being the length it was declared to be.       */
+/*    CVAL is a 64-bit ABSOLUTE comparison against the physical counter,   */
+/*    so the switch's own cost comes out of the window it happens in.      */
+/*                                                                        */
+/*    The one place TVAL would have been simpler is the reason it is       */
+/*    worth naming: re-arming a guest's virtual timer inside its own       */
+/*    handler IS one TVAL write with no counter read and no 64-bit         */
+/*    arithmetic, which is why the guest side of this suite uses it.  The  */
+/*    hypervisor's frame is the opposite case and needs the opposite       */
+/*    register.                                                           */
+/*                                                                        */
+/*    AGAINST THE PHYSICAL COUNTER, which is what makes the frame          */
+/*    something no partition can move.  A partition can be given any       */
+/*    virtual time the hypervisor likes; it cannot touch CNTPCT, and       */
+/*    CNTHCTL.PL1PCTEN is left clear so it cannot even read it.            */
+/*                                                                        */
+/*    THE RETURN VALUE IS NOT DECORATION.  Arming a comparator with a      */
+/*    count already in the past leaves the interrupt permanently pending:  */
+/*    the window was shorter than its own partition switch.  Nothing       */
+/*    breaks -- the schedule keeps turning and every frame takes longer    */
+/*    than declared -- which is exactly why it has to be reported rather   */
+/*    than absorbed.  The caller decides what to do about it, because the  */
+/*    caller is the one holding the schedule that has to record it.        */
+/*                                                                        */
+/*    THE COUNTER IS READ ONCE, AFTER THE WRITE.  On the S32Z280 a CNTPCT  */
+/*    read crosses into an 8 MHz clock domain and costs about 93 counts of */
+/*    real time, so reading it twice to "check" the arming would report a  */
+/*    miss that the checking itself caused.  One read, taken after the     */
+/*    comparator is set, is both the cheapest and the only honest answer.  */
+/*                                                                        */
+/*  MISRA C:2012 deviations (justified)                                   */
+/*                                                                        */
+/*    Directive 4.3 -- CNTHP_CVAL is reachable only through a 64-bit       */
+/*      coprocessor transfer, encapsulated here.                           */
+/*                                                                        */
+/**************************************************************************/
+
+static uint64_t zx_hyp_timer_armed_for;
+
+
+uint32_t zx_el2_hyp_timer_arm(uint64_t deadline)
+{
+    uint32_t low  = (uint32_t)(deadline & 0xFFFFFFFFU);
+    uint32_t high = (uint32_t)(deadline >> 32);
+    uint32_t control;
+
+    /* The comparator FIRST, then the enable.  Written the other way round
+       the timer is enabled for the few cycles it takes to write CVAL while
+       the comparator still holds the PREVIOUS deadline -- which has already
+       passed, so the level asserts and the interrupt is taken again
+       immediately.  On a level-triggered PPI that is a storm rather than a
+       glitch.  */
+
+    __asm__ volatile("mcrr p15, 6, %0, %1, c14"
+                     : : "r"(low), "r"(high) : "memory");     /* CNTHP_CVAL */
+
+    control = ZX_CNTV_CTL_ENABLE;
+    __asm__ volatile("mcr p15, 4, %0, c14, c2, 1"
+                     : : "r"(control) : "memory");            /* CNTHP_CTL  */
+    __asm__ volatile("isb" ::: "memory");
+
+    zx_hyp_timer_armed_for = deadline;
+
+    return (zx_read_cntpct() < deadline) ? 1U : 0U;
+}
+
+
+void zx_el2_hyp_timer_stop(void)
+{
+    uint32_t control;
+
+    /* BOTH bits, for the same reason a guest's timer is stopped with both:
+       masking alone leaves the comparator running with ISTATUS set, so the
+       next thing to enable it finds a deadline it never chose already
+       expired.  */
+
+    __asm__ volatile("mrc p15, 4, %0, c14, c2, 1" : "=r"(control));
+    control &= ~(uint32_t)(ZX_CNTV_CTL_ENABLE | ZX_CNTV_CTL_IMASK);
+    __asm__ volatile("mcr p15, 4, %0, c14, c2, 1"
+                     : : "r"(control) : "memory");
+    __asm__ volatile("isb" ::: "memory");
+}
+
+
+uint32_t zx_el2_hyp_timer_fired(void)
+{
+    uint32_t control;
+
+    __asm__ volatile("mrc p15, 4, %0, c14, c2, 1" : "=r"(control));
+
+    return ((control & (uint32_t)ZX_CNTHP_CTL_ISTATUS) != 0U) ? 1U : 0U;
+}
+
+
+uint64_t zx_el2_hyp_timer_deadline(void)
+{
+    return zx_hyp_timer_armed_for;
+}
+
+
+/**************************************************************************/
+/*                                                                        */
+/*  FUNCTION                                               RELEASE        */
+/*                                                                        */
+/*    zx_el2_route_fiq                                     Cortex-R52     */
+/*                                                                        */
+/*  DESCRIPTION                                                           */
+/*                                                                        */
+/*    HCR.FMO: physical FIQ to EL2, physical IRQ left with EL1.           */
+/*                                                                        */
+/*    THE ONE BIT THE WHOLE OF TIME PARTITIONING RESTS ON.  With FMO set,  */
+/*    PSTATE.F is IGNORED at EL0 and EL1 -- a partition cannot mask the    */
+/*    interrupt that ends its own window, whatever its kernel does with    */
+/*    its own masks and however tight a loop it is in.  A tick delivered   */
+/*    as an IRQ could be deferred by any guest that disabled interrupts,   */
+/*    which is precisely the property temporal partitioning is bought to   */
+/*    have.                                                               */
+/*                                                                        */
+/*    ROUTING IS BY EXCEPTION TYPE AND NOT BY INTID, which is what makes   */
+/*    this two register writes rather than a rewrite.  The hypervisor's    */
+/*    own timer goes in GIC Group 0, which the GIC delivers as an FIQ, and */
+/*    arrives here; every partition interrupt stays Group 1, stays an IRQ, */
+/*    and is still delivered STRAIGHT to EL1 with no injection and no List */
+/*    Register.  The guest side of the arrangement needed no change        */
+/*    whatever.  See docs/decisions.md D24 and D25.                        */
+/*                                                                        */
+/*    HCR.IMO STAYS CLEAR, deliberately, and HCR.AMO with it.  AMO would   */
+/*    route asynchronous aborts to EL2 -- where they arrive at the vector  */
+/*    that today means "ZoneX faulted on its own access", so setting it    */
+/*    without reworking that vector would report a guest's abort as a      */
+/*    hypervisor bug.  Neither is needed for a window to end.              */
+/*                                                                        */
+/**************************************************************************/
+
+void zx_el2_route_fiq(void)
+{
+    uint32_t hcr;
+
+    __asm__ volatile("mrc p15, 4, %0, c1, c1, 0" : "=r"(hcr));
+    hcr |= (uint32_t)ZX_HCR_FMO;
+    __asm__ volatile("mcr p15, 4, %0, c1, c1, 0" : : "r"(hcr) : "memory");
+    __asm__ volatile("isb" ::: "memory");
+}
+
+
+/**************************************************************************/
+/*                                                                        */
+/*  FUNCTION                                               RELEASE        */
+/*                                                                        */
+/*    zx_el2_deny_guest_fp                                 Cortex-R52     */
+/*                                                                        */
+/*  DESCRIPTION                                                           */
+/*                                                                        */
+/*    HCPTR.TCP10/TCP11 SET, so a guest's floating-point access traps.    */
+/*                                                                        */
+/*    THE EXACT OPPOSITE OF WHAT zx_el2_prepare_guest_el1 DOES, and the    */
+/*    reason is that the two functions serve systems with different        */
+/*    numbers of partitions.                                              */
+/*                                                                        */
+/*    D23 recorded the consequence of opening the FPU before there was a   */
+/*    second partition to make it matter: nothing in ZoneX saves or        */
+/*    restores FPEXC, FPSCR or the D-registers across a switch.  With one  */
+/*    partition that is exactly correct -- there is nobody to share the    */
+/*    bank with.  With two it is two guests reading each other's           */
+/*    registers, and the failure mode is a WRONG ANSWER rather than a      */
+/*    fault: no exception, no log line, and a number that is somebody      */
+/*    else's.                                                             */
+/*                                                                        */
+/*    ZoneX therefore DENIES the FPU to a time-partitioned system rather   */
+/*    than saving it.  A guest that touches floating point takes an        */
+/*    exception to EL2 with a syndrome naming the cause, which is a        */
+/*    diagnosis; sharing the bank silently is not.  Saving the bank is a   */
+/*    later-phase option and it is a real one -- sixteen double registers  */
+/*    are two instructions -- but it needs the register file's width read  */
+/*    from MVFR0 rather than assumed, and a partition switch is not the    */
+/*    place to add an assumption about how many registers a part has.      */
+/*                                                                        */
+/*    Both bits, not one.  TCP10 and TCP11 gate the two coprocessor        */
+/*    numbers the VFP and Advanced SIMD are reached through, and a guest   */
+/*    that found one open would use it.                                    */
+/*                                                                        */
+/**************************************************************************/
+
+void zx_el2_deny_guest_fp(void)
+{
+    uint32_t hcptr;
+
+    __asm__ volatile("mrc p15, 4, %0, c1, c1, 2" : "=r"(hcptr));
+    hcptr |= (uint32_t)ZX_HCPTR_TCP;
+    __asm__ volatile("mcr p15, 4, %0, c1, c1, 2" : : "r"(hcptr) : "memory");
+    __asm__ volatile("isb" ::: "memory");
+}
+
+
+/**************************************************************************/
+/*                                                                        */
+/*  FUNCTION                                               RELEASE        */
+/*                                                                        */
+/*    zx_el2_dwell_until                                   Cortex-R52     */
+/*                                                                        */
+/*  DESCRIPTION                                                           */
+/*                                                                        */
+/*    Spend counter counts at EL2 until an ABSOLUTE deadline.             */
+/*                                                                        */
+/*    The sibling of zx_el2_dwell, and the difference between them is the */
+/*    difference between a measurement and a schedule.  zx_el2_dwell waits */
+/*    for a DURATION, because a check of the freeze needs a gap of a known */
+/*    size.  This one waits for an INSTANT, because a window that a        */
+/*    partition handed back early has to end exactly where it would have   */
+/*    ended -- at the boundary the frame's epoch already decided, not at   */
+/*    "however long is left" computed from a counter read taken somewhere  */
+/*    in the middle of a switch.                                          */
+/*                                                                        */
+/*    THIS IS WHAT AN IDLE PARTITION COSTS, and it is deliberate.  A       */
+/*    static frame does not give a yielding partition's remaining time to  */
+/*    its neighbour: doing so would make one partition's start time depend */
+/*    on another's behaviour, which is the coupling temporal partitioning  */
+/*    is bought to remove.  Trapping WFI to reclaim it is a later-phase    */
+/*    option that trades determinism for throughput, and Phase 0 declines  */
+/*    it.                                                                  */
+/*                                                                        */
+/*    Bounded twice over: by the deadline, and by an iteration count, so   */
+/*    that a counter which stopped cannot turn a burned window into a      */
+/*    hang.  A deadline already in the past returns immediately, which is  */
+/*    the right answer -- there is nothing left of that window to spend.   */
+/*                                                                        */
+/**************************************************************************/
+
+void zx_el2_dwell_until(uint64_t deadline)
+{
+    uint32_t guard;
+
+    for (guard = 0U; guard < ZX_DWELL_GUARD; guard++)
+    {
+        if (zx_read_cntpct() >= deadline)
+        {
+            break;
+        }
+    }
+}
+
+
+/**************************************************************************/
+/*                                                                        */
+/*  FUNCTION                                               RELEASE        */
+/*                                                                        */
+/*    zx_el2_allow_guest_fp                                Cortex-R52     */
+/*                                                                        */
+/*  DESCRIPTION                                                           */
+/*                                                                        */
+/*    HCPTR.TCP10/TCP11 cleared again, once no partition is running.      */
+/*                                                                        */
+/*    THIS EXISTS BECAUSE OF A MEASURED PROPERTY OF THE DEBUG CONNECTION,  */
+/*    and it is worth the paragraph because the symptom names nothing.     */
+/*                                                                        */
+/*    With the floating-point traps SET, the S32Z280's debug probe cannot  */
+/*    read the core's register file: gdb reports "Could not read           */
+/*    registers; remote failure reply '01'" and the harness around it      */
+/*    exits non-zero on a run whose own console said ALL CHECKS PASSED.    */
+/*    Measured by comparison, on the board: an image that stops BEFORE the */
+/*    traps are set produces no such error, and the same image stopping    */
+/*    AFTER produces two.  The debugger reads the VFP registers as part of */
+/*    the register file, and a trapped coprocessor is a coprocessor it     */
+/*    cannot reach.                                                        */
+/*                                                                        */
+/*    THE ANSWER IS NOT TO STOP DENYING THE FPU.  The traps exist because  */
+/*    nothing saves the register bank across a partition switch, so two    */
+/*    guests would share it and the failure mode would be a wrong ANSWER   */
+/*    rather than a fault.  What they protect is the interval in which     */
+/*    PARTITIONS RUN, and that interval ends when the frame does.  So the  */
+/*    traps are lifted once the last window has closed and before the      */
+/*    hypervisor parks -- no partition can be sharing anything by then,    */
+/*    and the machine is handed to whoever is reading it in the state they */
+/*    can read.                                                            */
+/*                                                                        */
+/*    A harness that reports a passing run as a failure is the one         */
+/*    outcome a regression must never have, in either direction: the same  */
+/*    argument that put the verdict check inside the gdb script rather     */
+/*    than in the shell around it.                                         */
+/*                                                                        */
+/**************************************************************************/
+
+void zx_el2_allow_guest_fp(void)
+{
+    uint32_t hcptr;
+
+    __asm__ volatile("mrc p15, 4, %0, c1, c1, 2" : "=r"(hcptr));
+    hcptr &= ~(uint32_t)ZX_HCPTR_TCP;
+    __asm__ volatile("mcr p15, 4, %0, c1, c1, 2" : : "r"(hcptr) : "memory");
     __asm__ volatile("isb" ::: "memory");
 }

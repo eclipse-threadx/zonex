@@ -111,9 +111,32 @@
 /**************************************************************************/
 
 #define ZX_HCR_VM               ZX_BIT(0)       /* stage-2 MPU enable       */
-#define ZX_HCR_AMO              ZX_BIT(3)       /* route aborts to EL2      */
+#define ZX_HCR_FMO              ZX_BIT(3)       /* route FIQ to EL2         */
 #define ZX_HCR_IMO              ZX_BIT(4)       /* route IRQ to EL2         */
-#define ZX_HCR_FMO              ZX_BIT(5)       /* route FIQ to EL2         */
+#define ZX_HCR_AMO              ZX_BIT(5)       /* route aborts to EL2      */
+
+/* ⚠ FMO IS BIT 3 AND AMO IS BIT 5, AND THIS FILE HAD THEM THE OTHER WAY
+   ROUND until the first image that SET one of them.
+ *
+ * The order in the register is FMO, IMO, AMO going up from bit 3 -- TRM
+ * Table 3-70 and the architecture agree -- and the mnemonic order somebody
+ * reaches for is the alphabetical one, AMO first.  IMO is bit 4 either way,
+ * which is exactly why the mistake survived: every use of these three until
+ * now was a single BIC of all three at once, where a swap between two of
+ * them changes nothing at all.
+ *
+ * What it cost when it finally mattered: zx_el2_route_fiq set bit 5, which
+ * is AMO, so physical FIQ was never routed to EL2 and a partition's window
+ * never ended.  Every other check passed -- the comparator expired, the GIC
+ * made the interrupt pending, and the guest's PSTATE.F then masked it as an
+ * ordinary EL1 FIQ.  The run printed a perfect setup and then went quiet.
+ *
+ * Two things now make it hard to repeat.  The positions are asserted, in
+ * platform/cortex_r52/src/zx_context.c rather than here -- everything above
+ * the __ASSEMBLER__ guard in this file is read by the assembler as well, and
+ * an assembler cannot read a _Static_assert.  And the image that sets one of
+ * them now CHECKS THE BIT rather than the name it used to set it, which is
+ * the only form of that check a swapped definition cannot satisfy.  */
 #define ZX_HCR_DC               ZX_BIT(12)      /* default cacheable        */
 #define ZX_HCR_TGE              ZX_BIT(27)      /* trap general exceptions  */
 #define ZX_HCR_HCD              ZX_BIT(29)      /* HVC disable -- keep CLEAR */
@@ -295,6 +318,25 @@
 #define ZX_RUN_FAULTED          ZX_C32(0x1)  /* stage-2 fault, EC 0x24/0x20  */
 #define ZX_RUN_TRAPPED          ZX_C32(0x2)  /* something else reached EL2   */
 
+/* AND THE TWO A TIME-PARTITIONED RUN ADDS.  A window boundary does NOT come
+   back here: the boundary handler switches partitions and ERETs into the
+   next one without ever leaving EL2's exception path, which is what makes
+   the switch a bounded operation rather than a return through C.  These two
+   are the ways a FRAME ends.
+
+     ZX_RUN_FRAME_DONE   the schedule reached its frame limit.  A bounded
+                         run, which is what a regression can assert a total
+                         against -- "the harness timed out" is not a result.
+     ZX_RUN_OVERRUN      too many window boundaries had already passed by
+                         the time they were computed, so at least one window
+                         is shorter than its own partition switch.  The
+                         schedule would keep turning and every frame would
+                         be longer than declared; stopping and saying so is
+                         the only way that becomes visible.  */
+
+#define ZX_RUN_FRAME_DONE       ZX_C32(0x3)  /* the frame limit was reached  */
+#define ZX_RUN_OVERRUN          ZX_C32(0x4)  /* windows shorter than a switch */
+
 /**************************************************************************/
 /*         Constants the assembly needs, mirrored -- and asserted          */
 /**************************************************************************/
@@ -348,6 +390,33 @@
 #define ZX_ASM_RESUME_OFF_R4        8
 #define ZX_ASM_RESUME_WORDS         10
 
+/* THE PART OF A PARTITION'S CONTEXT THAT ASSEMBLY TOUCHES, and it is
+   deliberately the smallest part.
+ *
+ * Hyp mode banks only SP, LR and SPSR, so while the hypervisor runs, almost
+ * all of a guest's state is STILL IN THE MACHINE: its banked SPs and LRs,
+ * its EL1 system registers, its whole EL1 MPU region set.  Every one of
+ * those can be read and written from C at EL2 exactly as it stands.
+ *
+ * What cannot wait is r0-r12, which Hyp mode SHARES with EL1 and which the
+ * first C instruction would destroy, and ELR_hyp/SPSR_hyp, which say where
+ * the guest was and in what state.  Those fifteen words are captured in the
+ * vector, before anything else runs, and they are why this block starts
+ * with them: the offsets below are what the assembly indexes by, so they are
+ * kept at the front where they are constants a reader can check by counting.
+ *
+ * The rest of the structure is C's and has no offsets here.  That split is
+ * the whole reason the largest and most error-prone half of a partition
+ * switch -- twenty MPU regions, two registers each -- is a readable loop
+ * rather than a page of MCR/MRC pairs.  Every one of these offsets is
+ * checked against offsetof by a _Static_assert in
+ * platform/cortex_r52/src/zx_context.c.  */
+
+#define ZX_ASM_CTX_OFF_R0           0
+#define ZX_ASM_CTX_OFF_R12          48
+#define ZX_ASM_CTX_OFF_ELR          52
+#define ZX_ASM_CTX_OFF_SPSR         56
+
 #ifndef __ASSEMBLER__
 
 #include "zx_api.h"
@@ -359,6 +428,8 @@
    belongs to the manifest and not to this port: the host-side validator has
    to build and check the same objects with no Cortex-R52 header in reach.  */
 #include "zx_manifest.h"
+#include "zx_mm.h"
+#include "zx_schedule.h"
 
 /**************************************************************************/
 /*                 Where a board's GICv3 frames actually are              */
@@ -558,6 +629,16 @@ ZX_NODISCARD uint32_t zx_gic_ppi_is_group1(const ZX_GIC_LAYOUT *gic_ptr,
                                            uint32_t intid);
 ZX_NODISCARD uint32_t zx_gic_ppi_priority(const ZX_GIC_LAYOUT *gic_ptr,
                                           uint32_t intid);
+
+/* And whether the GIC has one PENDING, which is the middle of the three
+   questions a window that never ends raises: the comparator may not have
+   expired, the GIC may not have been told, or the core may not have taken
+   the exception.  All three present identically -- a hypervisor that starts
+   a frame and is never heard from again -- and only this one distinguishes
+   the first from the third.  */
+
+ZX_NODISCARD uint32_t zx_gic_ppi_is_pending(const ZX_GIC_LAYOUT *gic_ptr,
+                                            uint32_t intid);
 
 /* How many priority bits this GIC actually implements, discovered by writing
    all ones to one INTID's priority byte and reading back what stuck.  The low
@@ -817,6 +898,502 @@ extern uint32_t zx_hprenr_implemented_bits;
    run that never reached its verdict at all.  */
 
 extern uint32_t zx_run_failures;
+
+/**************************************************************************/
+/*                  A PARTITION'S CONTEXT, AND THE SWITCH                 */
+/**************************************************************************/
+
+/* How many EL1 MPU regions a context block can hold.
+ *
+ * TWENTY-FOUR IS THE ARCHITECTURAL MAXIMUM AND THE MODEL REPORTS
+ * THIRTY-TWO.  MPUIR[15:8] gives the EL1 count and TRM Table 3-79 permits
+ * 0, 16, 20 and 24; the Armv8-R AEM FVP reports 32, which is not a legal
+ * Cortex-R52 value and is one of the reasons a green model run says nothing
+ * about a real part's region budget.  The array is sized for what the model
+ * reports rather than for what the architecture permits, because a save
+ * that stopped at 24 on a part claiming 32 would silently drop the
+ * outgoing partition's last regions and hand them to its successor.
+ *
+ * The count actually saved is read from MPUIR once at boot and clamped to
+ * this; zx_context_el1_regions reports it, and the two-partition image
+ * checks that nothing was clamped away.  */
+
+#define ZX_MAX_EL1_REGIONS      32U
+
+/* EVERYTHING THAT MAKES ONE PARTITION DIFFERENT FROM ANOTHER, in one
+ * statically allocated block per partition.  No allocation, no list, no
+ * pointer chasing: a switch indexes an array.
+ *
+ * THE ORDER OF THE FIRST FIFTEEN WORDS IS A CONTRACT WITH ASSEMBLY.  They
+ * are what the FIQ vector captures before any C can run, at the
+ * ZX_ASM_CTX_OFF_* offsets above, and every one of those offsets is
+ * asserted against offsetof in zx_context.c.  Everything after them is
+ * saved and restored by C, because at EL2 it is all still sitting in the
+ * machine: Hyp mode banks only SP, LR and SPSR, so a guest's banked
+ * registers, its EL1 system registers and its entire EL1 MPU can be read
+ * and written from ordinary C while the hypervisor runs.
+ *
+ * That is what keeps the largest and least reviewable part of a partition
+ * switch -- twenty regions, two registers each, selected through PRSELR --
+ * a readable loop instead of a page of coprocessor moves.  It costs
+ * nothing: the registers are the same registers whichever language reaches
+ * them.
+ *
+ * WHAT IS NOT HERE, AND WHY IT IS NOT A HOLE.  The FPU.  D23 recorded that
+ * clearing HCPTR.TCP10/TCP11 lets a guest use floating point while nothing
+ * saves FPEXC, FPSCR or the D-registers -- exactly correct with one
+ * partition and a shared register bank with two.  ZoneX does not save them;
+ * it DENIES them.  zx_el2_deny_guest_fp leaves the traps SET for a
+ * time-partitioned system, so a guest that touches floating point takes an
+ * exception to EL2 and is named, rather than quietly reading whatever its
+ * neighbour left.  A later phase either saves the bank or keeps refusing
+ * it, and both are defensible; sharing it silently is not.  */
+
+typedef struct ZX_GUEST_CONTEXT_STRUCT
+{
+    /* ---- captured in the vector, before anything else runs ---- */
+    uint32_t    zx_ctx_r[13];           /* r0-r12, SHARED with EL1        */
+    uint32_t    zx_ctx_elr;             /* ELR_hyp: where EL1 was         */
+    uint32_t    zx_ctx_spsr;            /* SPSR_hyp: mode, flags, masks   */
+
+    /* ---- banked at EL1, still live while the hypervisor runs ---- */
+    uint32_t    zx_ctx_sp_usr;          /* User AND System share these    */
+    uint32_t    zx_ctx_lr_usr;
+    uint32_t    zx_ctx_sp_svc;
+    uint32_t    zx_ctx_lr_svc;
+    uint32_t    zx_ctx_spsr_svc;
+    uint32_t    zx_ctx_sp_irq;
+    uint32_t    zx_ctx_lr_irq;
+    uint32_t    zx_ctx_spsr_irq;
+    uint32_t    zx_ctx_sp_abt;
+    uint32_t    zx_ctx_lr_abt;
+    uint32_t    zx_ctx_spsr_abt;
+    uint32_t    zx_ctx_sp_und;
+    uint32_t    zx_ctx_lr_und;
+    uint32_t    zx_ctx_spsr_und;
+    uint32_t    zx_ctx_sp_fiq;
+    uint32_t    zx_ctx_lr_fiq;
+    uint32_t    zx_ctx_spsr_fiq;
+    uint32_t    zx_ctx_r_fiq[5];        /* r8_fiq to r12_fiq              */
+
+    /* ---- EL1 system registers ---- */
+    uint32_t    zx_ctx_sctlr;
+    uint32_t    zx_ctx_vbar;
+    uint32_t    zx_ctx_cpacr;
+    uint32_t    zx_ctx_contextidr;
+    uint32_t    zx_ctx_tpidrurw;
+    uint32_t    zx_ctx_tpidruro;
+    uint32_t    zx_ctx_tpidrprw;
+    uint32_t    zx_ctx_mair0;
+    uint32_t    zx_ctx_mair1;
+    uint32_t    zx_ctx_amair0;
+    uint32_t    zx_ctx_amair1;
+
+    /* ---- the guest's own virtual timer ---- */
+    uint32_t    zx_ctx_cntv_ctl;
+    uint64_t    zx_ctx_cntv_cval;
+
+    /* ---- the hypervisor's per-partition time, which is what freezes ----
+       CNTVOFF is EL2's, one value per partition, and the two instants
+       beside it are what a check of the freeze is measured against.  They
+       are here rather than in a file-scope array in zx_timer.c because
+       with more than one partition they ARE partition state, and the one
+       place a partition's state belongs is its context block.  */
+    uint64_t    zx_ctx_cntvoff;
+    uint64_t    zx_ctx_suspended_at;    /* physical count when it stopped */
+    uint64_t    zx_ctx_resumed_at;      /* and when it was given the core */
+    uint64_t    zx_ctx_virtual_at_stop; /* its OWN clock at that instant  */
+    uint64_t    zx_ctx_time_on_core;    /* counts it has actually run for */
+
+    /* ---- the EL1 MPU: the dominant cost of the whole switch ---- */
+    uint32_t    zx_ctx_prbar[ZX_MAX_EL1_REGIONS];
+    uint32_t    zx_ctx_prlar[ZX_MAX_EL1_REGIONS];
+    uint32_t    zx_ctx_prselr;
+
+    /* ---- bookkeeping, not machine state ---- */
+    uint32_t    zx_ctx_entries;         /* times this context was entered */
+    uint32_t    zx_ctx_preemptions;     /* times a boundary took the core */
+    uint32_t    zx_ctx_started;         /* zero until its first entry     */
+} ZX_GUEST_CONTEXT;
+
+/* How many EL1 MPU regions this part actually has, clamped to the array
+   above, and whether anything had to be clamped away.  Read once at boot:
+   the count is fixed for the life of the run, and reading MPUIR inside the
+   switch would put a coprocessor read on a path whose cost is the number
+   this step exists to measure.  */
+
+void zx_context_probe_el1_regions(void);
+ZX_NODISCARD uint32_t zx_context_el1_regions(void);
+ZX_NODISCARD uint32_t zx_context_el1_regions_clamped(void);
+
+/* Prepare a never-run partition: its entry point, and the state a fresh
+   guest is entered with.  Everything else is zero, which is the right
+   starting value for every banked register a reset path is about to set.  */
+
+void zx_context_init(ZX_GUEST_CONTEXT *context_ptr, zx_addr_t entry);
+
+/* SAVE AND RESTORE THE HALF THAT C CAN REACH: banked registers, EL1 system
+   registers, the guest's virtual timer, and the whole EL1 MPU set.  Called
+   from the boundary handler between the vector's capture and its ERET, and
+   from nowhere else.
+
+   Both are straight-line apart from one loop whose trip count is the part's
+   region count, read at boot.  Nothing in either depends on anything a
+   guest did, which is what makes a partition switch one number rather than
+   a distribution.  */
+
+void zx_context_save(ZX_GUEST_CONTEXT *context_ptr);
+void zx_context_restore(const ZX_GUEST_CONTEXT *context_ptr);
+
+/* The EL1 MPU half of each, separately, because the measurement needs them
+   separately: "how much of a partition switch is the guest's MPU set" is
+   one of the numbers this work exists to produce, and the honest way to
+   produce it is to time the code the switch actually runs rather than a
+   copy written for the occasion.  A second loop kept beside the first
+   agrees until the day it does not, and that is the day the published
+   figure stops describing the shipped switch.  The cost of the split --
+   one call each way -- is inside every figure this suite prints, because
+   it is inside every switch it performs.  */
+
+void zx_context_save_mpu(ZX_GUEST_CONTEXT *context_ptr);
+void zx_context_restore_mpu(const ZX_GUEST_CONTEXT *context_ptr);
+
+/* THE TIME HALF, WHICH IS WHAT THE DETERMINISM CLAIM RESTS ON.
+ *
+ * suspend records where the physical counter was and what the partition's
+ * own clock read there; resume advances that partition's CNTVOFF by
+ * everything that elapsed and puts it back in the register.  Between the
+ * two the partition's virtual counter does not move, because the offset
+ * moved by exactly as much as the counter did.
+ *
+ * Per CONTEXT rather than per hypervisor, which is the difference between
+ * one partition and several: with two partitions the interval being
+ * credited is the OTHER partition's window, and each has its own offset to
+ * be credited into.  See docs/decisions.md D7.  */
+
+void zx_context_time_suspend(ZX_GUEST_CONTEXT *context_ptr);
+void zx_context_time_resume(ZX_GUEST_CONTEXT *context_ptr);
+void zx_context_time_reset(ZX_GUEST_CONTEXT *context_ptr);
+
+/* Print one partition's context: what it cost, where it was, and how much
+   of its own clock it has been given.  */
+
+void zx_context_report(const ZX_GUEST_CONTEXT *context_ptr,
+                       const char *name_ptr);
+
+/**************************************************************************/
+/*                     Entering a time-partitioned frame                  */
+/**************************************************************************/
+
+/* Hand the core to a partition and do not come back until the FRAME ends.
+ *
+ * This is zx_el2_run_payload's shape one level up: it saves EL2's own
+ * resume context, restores the given partition's, and ERETs.  It does not
+ * return through that ERET.  Window boundaries are handled entirely inside
+ * EL2's exception path -- the FIQ vector saves the outgoing partition,
+ * restores the incoming one and ERETs again -- so C sees none of them.
+ *
+ * It returns, through the same resume path a fault takes, when a guest
+ * yields or faults, when the schedule reaches its frame limit, or when the
+ * frame has overrun.  The value is one of the ZX_RUN_* codes above.
+ *
+ * WHY BOUNDARIES DO NOT COME BACK HERE.  A switch that returned to C and
+ * was re-entered would pay for a return, a dispatch and a call on the path
+ * whose cost is the whole subject of this step -- and it would make the
+ * hypervisor's stack depth depend on how a guest left, which is the one
+ * thing a bounded switch cannot have.  */
+
+ZX_NODISCARD uint32_t zx_el2_enter_partition(ZX_GUEST_CONTEXT *context_ptr);
+
+/* The context the boundary handler is currently saving into, and the
+   schedule it consults.  Set by the caller before the frame starts.
+ *
+   File-scope because the FIQ vector reaches them with no argument to be
+   passed one in: an exception arrives with nothing but the machine.  They
+   are declared here rather than hidden because zx_context.S names the
+   first of them directly.  */
+
+extern ZX_GUEST_CONTEXT *zx_el2_current_context;
+
+/**************************************************************************/
+/*                             THE MAJOR FRAME                            */
+/**************************************************************************/
+
+/* Everything the boundary handler needs, in one object it can reach with no
+ * argument -- because an exception arrives with nothing but the machine.
+ *
+ * The counters are not decoration.  A switch cost quoted as a MEAN is a
+ * number a safety audience will not accept: what they read is the MAXIMUM,
+ * because that is what a schedule has to be built to survive.  Min, max,
+ * total and count are kept so that the run can print all four and let a
+ * reader see the spread rather than a summary of it.
+ *
+ * PMCCNTR IS 32-BIT AND WRAPS, which is why the per-switch figures are
+ * uint32_t and the total is not: a switch is a few thousand cycles so one
+ * difference cannot wrap, and ten thousand of them summed comfortably can.  */
+
+typedef struct ZX_FRAME_STRUCT
+{
+    ZX_SCHEDULE        *zx_frame_schedule;
+    ZX_GUEST_CONTEXT   *zx_frame_contexts;      /* one per partition       */
+    const ZX_MM_LAYOUT *zx_frame_layout;
+
+    /* WHOSE LINE IS THIS?  The manifest, so that the switch can hand the
+       guest console the identity of the partition it has just SCHEDULED.
+       The tag on a forwarded character has to come from the hypervisor and
+       never from the guest, or a partition could claim to be its neighbour
+       and every line of a captured log would be evidence of nothing.  With
+       one partition that was a single attach around the whole excursion;
+       with a frame it has to follow the frame, because the partition that
+       owns the console changes several times a second.
+
+       A null pointer means no console tagging, which is what an image that
+       runs no guest console wants.  */
+    const ZX_MANIFEST  *zx_frame_manifest;
+
+    UINT                zx_frame_partitions;
+
+    /* A bit per partition that has left its window early -- yielded, or
+       been taken from by a fault.  Such a partition is NOT entered again,
+       and its windows are still SPENT: that is what a static frame means,
+       and giving its time to a neighbour would make one partition's
+       schedule depend on another's behaviour.  */
+    uint32_t            zx_frame_stopped_mask;
+
+    /* What ended the frame, left where zx_context.S can pick it up: the
+       boundary handler is a vector and has no caller to return a value to. */
+    uint32_t            zx_frame_result;
+
+    uint32_t            zx_frame_switches;
+
+    /* How many of those boundaries were TIMED, which is not the same
+       number.  A boundary that had to burn a stopped partition's window is
+       a switch plus a wait of up to a whole window, and averaging the two
+       together describes neither -- so it is counted as a boundary and left
+       out of the cost.  In a healthy run the two are equal.  */
+    uint32_t            zx_frame_timed;
+
+    uint32_t            zx_frame_switch_min;
+    uint32_t            zx_frame_switch_max;
+    uint32_t            zx_frame_switch_last;
+    uint64_t            zx_frame_switch_total;
+
+    /* An FIQ that arrived at a boundary with the hypervisor's own timer NOT
+       expired.  Nothing else is routed to EL2, so this should be zero for
+       the life of a run; it is counted because a non-zero value means the
+       vector was reached by something nobody has identified, and a switch
+       performed on that basis would be a switch performed for no reason.  */
+    uint32_t            zx_frame_spurious;
+
+    /* WHICH partition left its window early, and what took it.  A frame
+       that ran to its limit with one partition stopped in the middle is a
+       different system from one where both ran throughout, and "the frame
+       completed" says the same thing about both.  ZX_MANIFEST_NO_INDEX and
+       ZX_RUN_FRAME_DONE when nobody left early.  */
+    UINT                zx_frame_stopped_index;
+    uint32_t            zx_frame_stop_outcome;
+} ZX_FRAME;
+
+/* Wire the frame up.  Nothing is entered and no timer is armed: this only
+   records what the boundary handler will need, so that a caller can build
+   the whole system before committing to run it.  */
+
+void zx_frame_configure(ZX_FRAME *frame_ptr,
+                        ZX_SCHEDULE *schedule_ptr,
+                        ZX_GUEST_CONTEXT *contexts_ptr,
+                        const ZX_MM_LAYOUT *layout_ptr,
+                        const ZX_MANIFEST *manifest_ptr,
+                        UINT partition_count);
+
+/* RUN THE FRAME.  Returns when the schedule reaches its limit, when a guest
+   leaves its window early and no partition is left to enter, or when the
+   frame has overrun.  One of the ZX_RUN_* codes.
+ *
+ * A guest that yields or faults inside its window does NOT end the run: the
+ * rest of that window is spent where it was declared to be spent, the
+ * partition is marked stopped, and the frame carries on with its
+ * neighbours.  An idle partition burning its window is not a limitation to
+ * be optimised away -- it is the property that makes each partition's
+ * timing independent of the others', which is the whole purchase.  */
+
+ZX_NODISCARD uint32_t zx_frame_run(ZX_FRAME *frame_ptr);
+
+/* What the boundary handler calls, from zx_context.S, with the outgoing
+   partition's fifteen shared words already captured.  Returns the context to
+   resume, or a null pointer when the frame is over.  Not called from C. */
+
+ZX_NODISCARD ZX_GUEST_CONTEXT *zx_el2_window_boundary(void);
+
+/* Where the boundary handler leaves the reason a frame ended, because the
+   vector it runs in has no caller to return one to.  */
+
+extern uint32_t zx_el2_frame_result;
+
+/* MEASURE THE SWITCH, BY GROUP, using the same code the switch runs.
+ *
+ * Averages `rounds` iterations of each group with the cost of reading the
+ * cycle counter measured separately and subtracted, and alternates the two
+ * contexts so that no iteration is restoring the state already in force --
+ * an implementation is entitled to make that cheap in a way a real switch
+ * is not.  Both disciplines were established when the region-set switch was
+ * first measured; they are reused here rather than reinvented because the
+ * first version of that measurement was wrong in exactly the ways they
+ * prevent.  See docs/decisions.md D4.
+ *
+ * Every figure is written into the structure the caller passes, so the
+ * reporting stays with the image and the measurement stays with the port. */
+
+typedef struct ZX_SWITCH_COST_STRUCT
+{
+    uint32_t    zx_cost_counter_read;   /* subtracted from every row below */
+    uint32_t    zx_cost_save_full;
+    uint32_t    zx_cost_restore_full;
+    uint32_t    zx_cost_save_mpu;
+    uint32_t    zx_cost_restore_mpu;
+    uint32_t    zx_cost_region_mask;    /* the stage-2 switch, one write   */
+    uint32_t    zx_cost_time_freeze;    /* suspend and resume, CNTVOFF     */
+    uint32_t    zx_cost_deadline;       /* arming CNTHP_CVAL               */
+    uint32_t    zx_cost_el1_regions;    /* how many the loops walked       */
+} ZX_SWITCH_COST;
+
+void zx_frame_measure_switch(ZX_GUEST_CONTEXT *scratch_a,
+                             ZX_GUEST_CONTEXT *scratch_b,
+                             uint32_t mask_a, uint32_t mask_b,
+                             uint32_t rounds,
+                             ZX_SWITCH_COST *cost_ptr);
+
+/* Spend counter counts at EL2 until an ABSOLUTE deadline, bounded.
+ *
+ * The hypervisor's answer to a partition that handed its window back early.
+ * A static frame does not give that time away, so it is burned here -- and
+ * burned by watching the same counter the deadline was computed against,
+ * so that the window a yielding partition leaves behind is exactly as long
+ * as the one it would have run out.  */
+
+void zx_el2_dwell_until(uint64_t deadline);
+
+/* The priority the hypervisor's tick is given, so an image can check what
+   the GIC read back against what was asked for rather than against a
+   constant it restated.  */
+
+ZX_NODISCARD uint32_t zx_frame_hyp_tick_priority(void);
+
+/**************************************************************************/
+/*                    The hypervisor's own timer, PPI 26                  */
+/**************************************************************************/
+
+/* CNTHP: the comparator that ends a partition's window.
+ *
+ * AN ABSOLUTE DEADLINE, WRITTEN TO CNTHP_CVAL, and never a countdown into
+ * CNTHP_TVAL.  A countdown re-armed inside the handler adds the handler's
+ * own latency to every window, so a frame declared as 10 ms becomes 10 ms
+ * plus the switch -- cumulatively, invisibly, for the life of the run.  The
+ * comparator is 64-bit and compares against the PHYSICAL counter, which is
+ * the one thing in the system no partition can move.
+ *
+ * arm() returns non-zero when the deadline it was given is still in the
+ * future.  A zero return means the window was shorter than its own switch,
+ * which the schedule counts and the run reports; it is the caller's answer
+ * to give, so it is returned rather than acted on here.  */
+
+ZX_NODISCARD uint32_t zx_el2_hyp_timer_arm(uint64_t deadline);
+void zx_el2_hyp_timer_stop(void);
+ZX_NODISCARD uint32_t zx_el2_hyp_timer_fired(void);
+ZX_NODISCARD uint64_t zx_el2_hyp_timer_deadline(void);
+
+/* Route physical FIQ to EL2, leaving IRQ with EL1.
+ *
+ * THE ONE BIT THE WHOLE OF TIME PARTITIONING RESTS ON.  With HCR.FMO set,
+ * PSTATE.F is IGNORED at EL0 and EL1: a partition CANNOT mask the interrupt
+ * that ends its own window, however it sets its own masks and whatever its
+ * kernel does with them.  A tick delivered as an IRQ could be deferred by
+ * any guest that disabled interrupts, which is precisely the property time
+ * partitioning must not concede.
+ *
+ * HCR.IMO stays CLEAR, so every guest interrupt is still a physical IRQ
+ * delivered straight to EL1 with no injection and no List Register -- the
+ * arrangement the single-partition work already proved end to end.  HCR.AMO
+ * stays clear too, and that omission is deliberate rather than pending: an
+ * asynchronous abort routed to EL2 arrives at the vector that today means
+ * "ZoneX faulted on its own access", so setting AMO without reworking that
+ * vector would report a guest's abort as a hypervisor bug.  See
+ * docs/decisions.md D25.  */
+
+void zx_el2_route_fiq(void);
+
+/* Leave HCPTR.TCP10/TCP11 SET, so a guest's floating-point access traps.
+ *
+ * The opposite of what zx_el2_prepare_guest_el1 does, and it exists because
+ * nothing saves the FPU across a partition switch.  With one partition an
+ * open FPU is exactly correct; with two it is two guests sharing a register
+ * bank, which is found by a wrong ANSWER rather than by a fault.  Denying it
+ * turns that into an exception at EL2 with a syndrome naming the cause.  */
+
+void zx_el2_deny_guest_fp(void);
+
+/* And lift them again once the last window has closed.
+ *
+ * MEASURED, not stylistic: with the floating-point traps set, the S32Z280's
+ * debug probe cannot read the core's register file at all, and the harness
+ * exits non-zero on a run whose own console said ALL CHECKS PASSED.  What
+ * the traps protect is the interval in which PARTITIONS run, and that
+ * interval ends when the frame does.  See zx_timer.c.  */
+
+void zx_el2_allow_guest_fp(void);
+
+/**************************************************************************/
+/*             The EL2 CPU interface, and the trap FMO sets                */
+/**************************************************************************/
+
+/* Bring up EL2's own GICv3 CPU interface: the priority mask and the Group 0
+ * enable.
+ *
+ * THIS IS NOT OPTIONAL HOUSEKEEPING, AND THE REASON IS A REDIRECTION THAT
+ * IS EASY TO MISS.  Setting HCR.FMO does more than route FIQ: it makes EL1
+ * accesses to the Group 0 CPU-interface registers, AND to the ones common
+ * to both groups, go to the VIRTUAL interface instead of the physical one
+ * (Cortex-R52 TRM 9.3.5).  ICC_PMR is one of the common ones.
+ *
+ * So the instant FMO is set, the guest's own `ICC_PMR = 0xFF` -- which
+ * every guest writes at start-up to unmask its interrupts -- lands in
+ * ICV_PMR and changes nothing about physical delivery.  The physical
+ * priority mask resets to ZERO, which masks everything, and a partition
+ * that received its timer perfectly well a moment ago stops receiving
+ * anything at all.  Nothing faults; the guest simply never ticks.
+ *
+ * The hypervisor therefore owns the physical mask and sets it wide enough
+ * for both its own tick and the partitions' timers.  Priority ORDER still
+ * does the work it always did: the tick is numerically lower and preempts.
+ *
+ * The redirection is also what makes Design A airtight rather than merely
+ * cheap.  ICC_IGRPEN0 is redirected too, so a guest cannot reach the
+ * physical Group 0 enable to switch off the interrupt that ends its window
+ * -- it writes ICV_IGRPEN0 and nothing happens.  Before FMO was set that
+ * register was genuinely shared, and D24 could only argue that a partition
+ * had no Group 0 interrupt worth enabling.  */
+
+void zx_gic_el2_cpu_interface_init(void);
+
+/* Acknowledge and complete an FIQ at EL2, through the GROUP 0 registers.
+ *
+ * ICC_IAR0 returning ZX_INTID_SPURIOUS means nothing was pending, and it
+ * must NOT be given an end-of-interrupt: the running priority was never
+ * raised, so dropping it corrupts the GIC's priority stack rather than
+ * merely being redundant.  */
+
+ZX_NODISCARD uint32_t zx_gic_el2_acknowledge(void);
+void zx_gic_el2_end_of_interrupt(uint32_t intid);
+
+ZX_NODISCARD uint32_t zx_gic_el2_priority_mask(void);
+ZX_NODISCARD uint32_t zx_gic_el2_group0_enabled(void);
+
+/* Enable one PPI in GROUP 0, which is what the GIC delivers as an FIQ, at
+   the given priority.  The hypervisor's own timer and nothing else: a
+   partition is granted no Group 0 interrupt, which is why nothing can
+   deliver an FIQ to a guest even though FIQ is now routed to EL2.  */
+
+void zx_gic_enable_hyp_ppi(const ZX_GIC_LAYOUT *gic_ptr, uint32_t intid,
+                           uint32_t priority);
 
 /**************************************************************************/
 /*                    Entry points the reset path calls                   */

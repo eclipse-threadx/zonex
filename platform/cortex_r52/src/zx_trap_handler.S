@@ -114,8 +114,19 @@
 /*                                                                        */
 /*  Offsets 0x00-0x10 are exceptions taken FROM Hyp mode itself.  Offset   */
 /*  0x14 is the Hyp Trap Entry: every exception routed to EL2 from EL1 or  */
-/*  EL0 funnels through it.  0x18 and 0x1C are unexpected here, because    */
-/*  HCR.IMO and HCR.FMO are clear and interrupts belong to EL1.            */
+/*  EL0 funnels through it.                                                */
+/*                                                                        */
+/*  0x18, IRQ, is unexpected on every ZoneX image: HCR.IMO stays CLEAR, so */
+/*  a guest interrupt is delivered straight to EL1 and the hypervisor is   */
+/*  not involved in a tick at all.                                         */
+/*                                                                        */
+/*  0x1C, FIQ, IS THE END OF A PARTITION'S WINDOW -- but only in an image  */
+/*  that sets HCR.FMO and gives itself a schedule.  The vector therefore   */
+/*  goes to zx_el2_fiq_boundary in zx_context.S, which decides between the */
+/*  two: an FIQ with a partition running is a boundary, and an FIQ with    */
+/*  none is the unexpected exception it always was, reported through       */
+/*  zx_el2_vector_fiq below.  One vector table for every image, and the    */
+/*  images that never route an FIQ are unchanged by the ones that do.      */
 /**************************************************************************/
 
     .section .vectors_el2, "ax"
@@ -129,7 +140,7 @@ zx_el2_vectors:
     b       zx_el2_vector_dabt              /* 0x10  data abort, from Hyp  */
     b       zx_el2_hyp_trap_entry           /* 0x14  from EL1/EL0          */
     b       zx_el2_vector_irq               /* 0x18  IRQ                   */
-    b       zx_el2_vector_fiq               /* 0x1C  FIQ                   */
+    b       zx_el2_fiq_boundary             /* 0x1C  FIQ -- a window ends  */
 
     .text
     .balign 4
@@ -217,13 +228,23 @@ zx_el2_trap_hvc_not_putc:
     @ "the payload came back" is evidence too, and a run that can only
     @ report the absence of a fault cannot tell a working protection
     @ failure from a broken test.
+    @
+    @ AND SO IS THE GUEST'S OWN CONTEXT, when a schedule is running.  A
+    @ partition that yields inside its window has not finished its window,
+    @ and the hypervisor has to be able to say where it was -- to report it,
+    @ and because the same fifteen words are what a resume would need.  The
+    @ capture reads the guest's r0 and r1 off this stack rather than out of
+    @ the registers, which by now hold the decoded syndrome; it does nothing
+    @ at all in an image with no schedule.
 
+    bl      zx_el2_context_capture_from_stack
     add     sp, sp, #8                          @ done with the guest's r0/r1
     ZX_CAPTURE ZX_ASM_VEC_HYP_TRAP
     mov     r0, #ZX_RUN_YIELDED
     b       zx_el2_resume
 
 zx_el2_trap_not_hypercall:
+    bl      zx_el2_context_capture_from_stack
     add     sp, sp, #8                          @ done with the guest's r0/r1
     ZX_CAPTURE ZX_ASM_VEC_HYP_TRAP
 
@@ -294,6 +315,7 @@ zx_el2_run_payload:
 /*  trap handler, because there is no frame to return through.             */
 /**************************************************************************/
 
+    .global zx_el2_resume
     .type   zx_el2_resume, %function
 zx_el2_resume:
     ldr     r2, =zx_el2_resume_context
@@ -364,6 +386,7 @@ zx_el2_vector_irq:
     bl      zx_el2_unexpected_vector
     .size   zx_el2_vector_irq, . - zx_el2_vector_irq
 
+    .global zx_el2_vector_fiq
     .type   zx_el2_vector_fiq, %function
 zx_el2_vector_fiq:
     ZX_CAPTURE ZX_ASM_VEC_FIQ
@@ -377,14 +400,23 @@ zx_el2_vector_fiq:
 /*  ONE slot, so zx_el2_run_payload CANNOT NEST.  That is a real           */
 /*  constraint and it is deliberate: a hypervisor that could be inside two */
 /*  guest excursions at once would need a stack of these, and Phase 0 has  */
-/*  no reason to be.  A time-partition scheduler calls it once per         */
-/*  partition, sequentially, and still does not nest.  If a later phase    */
-/*  needs to -- an emulated instruction that itself re-enters a guest --   */
-/*  this becomes an array indexed by depth, and the depth needs a bound.   */
+/*  no reason to be.  If a later phase needs to -- an emulated instruction */
+/*  that itself re-enters a guest -- this becomes an array indexed by       */
+/*  depth, and the depth needs a bound.                                    */
+/*                                                                        */
+/*  IT IS SHARED WITH THE TIME-PARTITION FRAME, which is why the symbol    */
+/*  is global.  zx_el2_enter_partition in zx_context.S saves the same      */
+/*  three things here and comes back through the same zx_el2_resume, and   */
+/*  it does not nest either: a schedule enters one partition at a time,    */
+/*  and a WINDOW BOUNDARY never comes back through here at all -- the      */
+/*  boundary handler ERETs into the next partition from inside the         */
+/*  exception path.  One slot serves both because at most one of them is   */
+/*  ever inside a guest.                                                   */
 /**************************************************************************/
 
     .section .bss
     .balign 8
+    .global zx_el2_resume_context
     .type   zx_el2_resume_context, %object
 zx_el2_resume_context:
     .space  ZX_ASM_RESUME_WORDS * 4

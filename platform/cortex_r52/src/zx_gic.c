@@ -125,6 +125,7 @@
 #define ZX_GICR_IGROUPR0            0x0080U
 #define ZX_GICR_ISENABLER0          0x0100U
 #define ZX_GICR_ICENABLER0          0x0180U
+#define ZX_GICR_ISPENDR0            0x0200U
 #define ZX_GICR_IPRIORITYR          0x0400U
 #define ZX_GICR_ICFGR1              0x0C04U
 
@@ -557,4 +558,259 @@ uint32_t zx_gic_priority_bits(const ZX_GIC_LAYOUT *gic_ptr, uint32_t intid)
     }
 
     return bits;
+}
+
+
+/**************************************************************************/
+/*                                                                        */
+/*  FUNCTION                                               RELEASE        */
+/*                                                                        */
+/*    zx_gic_enable_hyp_ppi                                Cortex-R52     */
+/*                                                                        */
+/*  DESCRIPTION                                                           */
+/*                                                                        */
+/*    Enable one PPI in GROUP 0, which is what the GIC delivers as an FIQ. */
+/*                                                                        */
+/*    THE ONLY DIFFERENCE FROM zx_gic_enable_guest_ppi IS ONE BIT, and it  */
+/*    is the bit that decides which exception type the interrupt arrives   */
+/*    as -- and therefore, with HCR.FMO set and HCR.IMO clear, which       */
+/*    exception LEVEL it arrives at.  Group 1 is an IRQ and goes to EL1;   */
+/*    Group 0 is an FIQ and comes to EL2.  Routing is by TYPE, not by      */
+/*    INTID, which is the whole reason a hypervisor tick costs two         */
+/*    register writes instead of an interrupt-virtualization layer.        */
+/*                                                                        */
+/*    IT IS A SEPARATE FUNCTION AND NOT A FLAG ON THE OTHER ONE.  The two  */
+/*    have different callers with different authority: one hands an        */
+/*    interrupt to a partition, the other keeps one for the hypervisor,    */
+/*    and a boolean argument at a call site is the wrong place for that    */
+/*    distinction to live.  A misread flag would put the hypervisor's own  */
+/*    timer in Group 1 -- delivered as an IRQ, straight to whichever       */
+/*    partition happened to be running, whose kernel would acknowledge an  */
+/*    INTID it does not recognise and never end its own window.            */
+/*                                                                        */
+/*    LEVEL, NOT EDGE, for the same reason as a guest's timer: the generic */
+/*    timer asserts a level until its comparator is re-armed.  Configured  */
+/*    as edge it would end exactly one window and never another, which     */
+/*    with two partitions looks like a hypervisor that switched once and   */
+/*    then hung.                                                          */
+/*                                                                        */
+/*    PRIORITY MATTERS HERE IN A WAY IT DOES NOT FOR A GUEST.  Both        */
+/*    targets implement five priority bits, so only the top five of the    */
+/*    byte survive; two values differing only below that are the SAME      */
+/*    priority to the hardware, and equal priorities do not preempt.  The  */
+/*    hypervisor's tick has to be numerically lower -- higher priority --  */
+/*    than any partition's interrupt, or a partition servicing its own     */
+/*    timer could hold off the end of its window for as long as its        */
+/*    handler runs.                                                        */
+/*                                                                        */
+/**************************************************************************/
+
+void zx_gic_enable_hyp_ppi(const ZX_GIC_LAYOUT *gic_ptr, uint32_t intid,
+                           uint32_t priority)
+{
+    zx_addr_t priority_word;
+    uint32_t  shift;
+
+    if ((gic_ptr == (const ZX_GIC_LAYOUT *)0)
+        || (zx_gic_ppi_is_valid(intid) == 0U))
+    {
+        return;
+    }
+
+    /* GROUP 0.  The bit is CLEARED, where the guest path sets it.  */
+
+    ZX_GIC_REG(gic_ptr->zx_gic_sgi_base + ZX_GICR_IGROUPR0) &=
+        ~(uint32_t)ZX_BIT(intid);
+
+    priority_word = gic_ptr->zx_gic_sgi_base + ZX_GICR_IPRIORITYR
+                    + (zx_addr_t)(intid & ~3U);
+    shift = (intid & 3U) * 8U;
+
+    ZX_GIC_REG(priority_word) &= ~(uint32_t)(0xFFU << shift);
+    ZX_GIC_REG(priority_word) |= (uint32_t)((priority & 0xFFU) << shift);
+
+    shift = (intid - ZX_PPI_FIRST_INTID) * 2U;
+    ZX_GIC_REG(gic_ptr->zx_gic_sgi_base + ZX_GICR_ICFGR1) &=
+        ~(uint32_t)(0x3U << shift);
+
+    /* Enable LAST, after everything that describes the interrupt.  */
+
+    ZX_GIC_REG(gic_ptr->zx_gic_sgi_base + ZX_GICR_ISENABLER0) =
+        (uint32_t)ZX_BIT(intid);
+
+    zx_gic_barrier();
+}
+
+
+/**************************************************************************/
+/*                                                                        */
+/*  FUNCTION                                               RELEASE        */
+/*                                                                        */
+/*    zx_gic_el2_cpu_interface_init                        Cortex-R52     */
+/*                                                                        */
+/*  DESCRIPTION                                                           */
+/*                                                                        */
+/*    EL2's own GICv3 CPU interface: the priority mask and Group 0.       */
+/*                                                                        */
+/*    THIS IS THE FUNCTION THAT WOULD BE EASIEST TO OMIT AND HARDEST TO   */
+/*    DEBUG WITHOUT.  Setting HCR.FMO does more than route FIQ.  It also  */
+/*    makes EL1 accesses to the GROUP 0 CPU-interface registers, AND to    */
+/*    the ones COMMON to both groups, go to the VIRTUAL interface instead  */
+/*    of the physical one -- Cortex-R52 TRM 9.3.5, which lists exactly     */
+/*    which registers move.  ICC_PMR is one of the common ones.           */
+/*                                                                        */
+/*    So the instant FMO is set, the guest's own "ICC_PMR = 0xFF" -- which */
+/*    every guest writes at start-up to unmask its interrupts, and which   */
+/*    worked perfectly before -- lands in ICV_PMR and changes nothing      */
+/*    about physical delivery.  The PHYSICAL priority mask resets to ZERO, */
+/*    which masks everything.  A partition that was receiving its timer    */
+/*    end to end a moment earlier stops receiving anything at all, and     */
+/*    nothing faults: the guest simply never ticks, which looks exactly    */
+/*    like a GIC that was never configured.                                */
+/*                                                                        */
+/*    The hypervisor therefore owns the physical mask and opens it fully.  */
+/*    Priority ORDER still does all the work it did before -- the          */
+/*    hypervisor's tick is numerically lower and preempts a partition's    */
+/*    timer -- and what changes is only WHO sets the threshold below which */
+/*    nothing is delivered at all.  That is the right owner: a partition   */
+/*    able to raise the physical priority mask could refuse the interrupt  */
+/*    that ends its own window, which is the same hole the redistributor   */
+/*    was withheld to close.                                              */
+/*                                                                        */
+/*    AND THE REDIRECTION IS WHAT MAKES THE DESIGN AIRTIGHT RATHER THAN    */
+/*    MERELY CHEAP.  ICC_IGRPEN0 is redirected too, so a guest cannot      */
+/*    reach the physical Group 0 enable to switch off the interrupt that   */
+/*    ends its window: it writes ICV_IGRPEN0 and nothing happens.  Before  */
+/*    FMO was set that register was genuinely shared between EL1 and EL2,  */
+/*    and D24 could only argue that a partition had no Group 0 interrupt   */
+/*    worth enabling.  Now it cannot reach the enable at all.              */
+/*                                                                        */
+/**************************************************************************/
+
+void zx_gic_el2_cpu_interface_init(void)
+{
+    uint32_t value;
+
+    /* ICC_PMR is at c4, NOT c12 -- the one encoding in this group that is
+       not where a reader would look for it.  0xFF is the lowest possible
+       priority threshold, which permits everything; the ordering between
+       the hypervisor's tick and a partition's timer is done by their own
+       priorities and not by this.  */
+
+    value = 0xFFU;
+    __asm__ volatile("mcr p15, 0, %0, c4, c6, 0" : : "r"(value) : "memory");
+
+    /* Group 0 enabled at the CPU interface, which is what allows an FIQ to
+       be signalled to the core at all.  */
+
+    value = 1U;
+    __asm__ volatile("mcr p15, 0, %0, c12, c12, 6"
+                     : : "r"(value) : "memory");
+    __asm__ volatile("isb" ::: "memory");
+}
+
+
+uint32_t zx_gic_el2_priority_mask(void)
+{
+    uint32_t value;
+
+    __asm__ volatile("mrc p15, 0, %0, c4, c6, 0" : "=r"(value));
+
+    return value;
+}
+
+
+uint32_t zx_gic_el2_group0_enabled(void)
+{
+    uint32_t value;
+
+    __asm__ volatile("mrc p15, 0, %0, c12, c12, 6" : "=r"(value));
+
+    return value & 1U;
+}
+
+
+/**************************************************************************/
+/*                                                                        */
+/*  FUNCTION                                               RELEASE        */
+/*                                                                        */
+/*    zx_gic_el2_acknowledge                               Cortex-R52     */
+/*    zx_gic_el2_end_of_interrupt                                        */
+/*                                                                        */
+/*  DESCRIPTION                                                           */
+/*                                                                        */
+/*    The Group 0 acknowledge and end-of-interrupt pair, at EL2.          */
+/*                                                                        */
+/*    ICC_IAR0 AND ICC_EOIR0, not the Group 1 registers a guest uses.  The */
+/*    two pairs are separate hardware with separate active-priority state, */
+/*    and acknowledging an FIQ through the Group 1 register would return   */
+/*    the spurious INTID while leaving the FIQ active for ever -- a        */
+/*    hypervisor that ends exactly one partition window and then never     */
+/*    takes another interrupt.                                            */
+/*                                                                        */
+/*    ZX_INTID_SPURIOUS MUST NOT BE GIVEN AN END-OF-INTERRUPT.  It means   */
+/*    nothing was pending, so the running priority was never raised, and   */
+/*    dropping a priority that was never raised corrupts the GIC's         */
+/*    priority stack rather than merely being redundant.  The caller       */
+/*    checks; the check is not made here because the caller also has to    */
+/*    decide what a spurious FIQ at a window boundary MEANS, and that is   */
+/*    policy.                                                             */
+/*                                                                        */
+/**************************************************************************/
+
+uint32_t zx_gic_el2_acknowledge(void)
+{
+    uint32_t intid;
+
+    __asm__ volatile("mrc p15, 0, %0, c12, c8, 0" : "=r"(intid));
+
+    return intid & 0xFFFFFFU;
+}
+
+
+void zx_gic_el2_end_of_interrupt(uint32_t intid)
+{
+    __asm__ volatile("mcr p15, 0, %0, c12, c8, 1"
+                     : : "r"(intid) : "memory");
+    __asm__ volatile("isb" ::: "memory");
+}
+
+
+/**************************************************************************/
+/*                                                                        */
+/*  FUNCTION                                               RELEASE        */
+/*                                                                        */
+/*    zx_gic_ppi_is_pending                                Cortex-R52     */
+/*                                                                        */
+/*  DESCRIPTION                                                           */
+/*                                                                        */
+/*    Whether the GIC has this PPI pending.                               */
+/*                                                                        */
+/*    THE MIDDLE OF THREE QUESTIONS, and it exists because the other two  */
+/*    cannot tell each other's failures apart.  A window that never ends  */
+/*    has three possible causes and they are in three different places:   */
+/*                                                                        */
+/*      the comparator never expired      CNTHP_CTL.ISTATUS says so       */
+/*      the GIC was never told            THIS register says so           */
+/*      the core never took the exception  routing, or the CPU interface  */
+/*                                                                        */
+/*    Without the middle one, the first and the third are indistinguish-  */
+/*    able from each other and the symptom of all three is identical: a   */
+/*    hypervisor that starts a frame and is never heard from again, with  */
+/*    no fault, no message, and a harness timeout that names nothing.     */
+/*    That is the least informative failure this suite can produce, and   */
+/*    one memory-mapped read stands between it and a diagnosis.           */
+/*                                                                        */
+/**************************************************************************/
+
+uint32_t zx_gic_ppi_is_pending(const ZX_GIC_LAYOUT *gic_ptr, uint32_t intid)
+{
+    if ((gic_ptr == (const ZX_GIC_LAYOUT *)0)
+        || (zx_gic_ppi_is_valid(intid) == 0U))
+    {
+        return 0U;
+    }
+
+    return ((ZX_GIC_REG(gic_ptr->zx_gic_sgi_base + ZX_GICR_ISPENDR0)
+             & (uint32_t)ZX_BIT(intid)) != 0U) ? 1U : 0U;
 }
