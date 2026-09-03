@@ -147,10 +147,89 @@ void zx_guest_image_load(const ZX_PARTITION_LOAD *load_ptr);
    never before: the mailbox is a LOADED section in the guest image, zeroed
    by the copy, so a handover written first would be copied over.  */
 
+/**************************************************************************/
+/*  ZX_GUEST_MATRIX -- the addresses one partition is asked to reach for.  */
+/*                                                                        */
+/*  A STRUCT RATHER THAN SEVEN ARGUMENTS, because seven addresses in a     */
+/*  call are seven chances to transpose two of them -- and two of these    */
+/*  are the neighbour's DATA and the neighbour's CODE, which differ by a   */
+/*  region attribute rather than by anything a reader would notice at a    */
+/*  call site.  Transposed, the sweep would branch into data and write     */
+/*  into code, and both would still fault: the run would pass and two rows */
+/*  of the matrix would have swapped places silently.                      */
+/*                                                                        */
+/*  EVERY FIELD IS AN ADDRESS THE GUEST COULD NOT HAVE DERIVED, which is   */
+/*  the point of handing them over at all.  A guest computing its          */
+/*  neighbour's window from its own base would be a guest that had been    */
+/*  TOLD the layout; a guest handed an address it cannot derive is a guest */
+/*  being asked to reach somewhere it has no business knowing about.       */
+/**************************************************************************/
+
+typedef struct ZX_GUEST_MATRIX_STRUCT
+{
+    /* Which cases to run, as ZX_MC_* bits.  Zero means no sweep, which is
+       what every image but the regression asks for.  */
+
+    uint32_t    zx_matrix_cases;
+
+    /* The other partition's data window, read at this address and written
+       four bytes above it -- so that the read case and the write case have
+       an address each and the fault log can tell them apart.  */
+
+    uint32_t    zx_matrix_neighbour;
+
+    /* And its code, BRANCHED to.  A prefetch abort rather than a data
+       abort, EC 0x20 rather than 0x24, reported through HIFAR.  */
+
+    uint32_t    zx_matrix_neighbour_code;
+
+    /* The ungranted granule ADJACENT to this partition's own window.  Not
+       "an ungranted address": adjacency is the whole test, because the
+       defect class worth catching is a region limit out by one granule and
+       an address far from every grant proves only that unmapped memory
+       faults.  */
+
+    uint32_t    zx_matrix_hole;
+
+    /* The hypervisor's own memory, and its own MMIO.  Under decision D2 --
+       HSCTLR.BR set, hypervisor memory covered by no enabled region --
+       these pass structurally rather than by a permission check, and the
+       regression says so in its output because WHY they pass is the
+       interesting part.  */
+
+    uint32_t    zx_matrix_hyp_data;
+    uint32_t    zx_matrix_hyp_mmio;
+
+    /* Where the marks go, and how many.  Inside the partition's own window
+       and above its image, so that marking cannot corrupt the program doing
+       the marking; the guest checks that independently and refuses a range
+       it does not own.  */
+
+    uint32_t    zx_matrix_mark_base;
+    uint32_t    zx_matrix_mark_count;
+
+} ZX_GUEST_MATRIX;
+
 void zx_guest_hand_over(const ZX_GUEST_LAUNCH *launch_ptr,
                         uint32_t probe_target, uint32_t options);
 
 /* One excursion, measured in PMU cycles.  Returns ZX_RUN_*.  */
+
+/* Ask a partition for the isolation sweep.  Called AFTER zx_guest_hand_over,
+   which has already zeroed every word this touches -- so a word this does
+   not set stays absent rather than stale.  */
+
+void zx_guest_ask_for_matrix(const ZX_GUEST_LAUNCH *launch_ptr,
+                             const ZX_GUEST_MATRIX *matrix_ptr);
+
+/* Tell a partition what to do next, as one of the ZX_GB_* behaviours.  Safe
+   to call between windows, which is when the frame calls it: the guest
+   re-reads the word on every iteration of its endless phase and needs no
+   interrupt to notice, which is what lets a partition be steered OUT of a
+   phase it entered by masking its own interrupts.  */
+
+void zx_guest_set_behaviour(const ZX_GUEST_LAUNCH *launch_ptr,
+                            uint32_t behaviour);
 
 ZX_NODISCARD uint32_t zx_guest_run(const ZX_GUEST_LAUNCH *launch_ptr,
                                    ZX_PARTITION_CB *partition_ptr,

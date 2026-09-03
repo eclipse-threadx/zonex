@@ -51,6 +51,7 @@ endfunction()
 # to LINK, which is a confusing way to discover that a test needs a console.
 zx_add_host_test(test_zx_api)
 zx_add_host_test(test_zx_fault)
+zx_add_host_test(test_zx_fault_log)
 zx_add_host_test(test_zx_guest_console)
 zx_add_host_test(test_zx_manifest)
 zx_add_host_test(test_zx_mm)

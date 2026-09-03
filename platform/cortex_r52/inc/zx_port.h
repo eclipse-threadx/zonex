@@ -422,6 +422,7 @@
 #include "zx_api.h"
 #include "zx_console.h"
 #include "zx_fault.h"
+#include "zx_fault_log.h"
 
 /* The region descriptor (ZX_REGION) and the AP/SH/XN encodings it holds come
    from here.  The port programs what a manifest declares, so the descriptor
@@ -1027,6 +1028,86 @@ typedef struct ZX_GUEST_CONTEXT_STRUCT
     uint32_t    zx_ctx_entries;         /* times this context was entered */
     uint32_t    zx_ctx_preemptions;     /* times a boundary took the core */
     uint32_t    zx_ctx_started;         /* zero until its first entry     */
+
+    /* ---- EVERYTHING BELOW IS AT THE END OF THE STRUCTURE ON PURPOSE ----
+     *
+     * A SWITCH DOES NOT TOUCH ANY OF IT, and where it sits changes what a
+     * switch COSTS.  These fields were first declared next to the ones they
+     * belong with -- the freeze beside the offset it governs, the period
+     * beside the timestamps it is computed from -- which was better to read
+     * and 370 cycles more expensive, measured on the S32Z280: 6,042 / 6,097
+     * / 6,298 against 5,672 / 5,715 / 5,862.
+     *
+     * Nothing here is on the switch path, so nothing here should have been
+     * able to cost it anything.  What it cost was OFFSETS.  The EL1 MPU
+     * arrays dominate the switch and they come after the time group, so a
+     * word inserted before them moves every one of their offsets -- and an
+     * offset that no longer fits an instruction's immediate field is an
+     * extra instruction, twenty regions and two registers deep, with the
+     * caches off.
+     *
+     * So they go at the end, where an addition cannot move anything the
+     * switch reads, and the published figures stay comparable with the ones
+     * taken before this step.  It is worth knowing that the cost of a field
+     * in this structure depends on where in it the field is put.  */
+
+    /* Stage-2 violations this partition committed and was RESUMED past.
+       Only a build with the test-only continue mode can make this non-zero;
+       the shipping policy stops a partition on its first violation, so
+       there is no second one to count.  It is here rather than in the fault
+       log because the log keeps its first entries and then stops, and the
+       determinism phase in which a partition faults on every iteration of
+       its own loop is a claim about the COUNT.  */
+    uint32_t    zx_ctx_violations;
+
+    /* WHETHER THIS PARTITION IS CREDITED THE TIME IT SPENT DESCHEDULED.
+     *
+     * Non-zero -- which is what zx_context_time_reset establishes and what
+     * every real configuration wants -- means the interval this partition
+     * was away is added to its CNTVOFF when it comes back, so its own clock
+     * advances by the counts it spent ON THE CORE and by nothing else.
+     * That is the freeze, and it is the difference between temporal
+     * partitioning and time slicing a guest can observe: see
+     * docs/decisions.md D7.
+     *
+     * IT IS A FIELD RATHER THAN AN INVARIANT OF THE CODE for two reasons.
+     * The decision belongs in the data where a reader can see it -- and a
+     * claim whose negation cannot be built is not a claim that has been
+     * tested.  Clearing it gives a partition WALL CLOCK, so its own clock
+     * starts advancing by time its NEIGHBOUR spent on the core, which is
+     * the coupling the whole mechanism is bought to remove; the regression
+     * has a build that does exactly that and must report FAILED.  */
+    uint32_t    zx_ctx_credit_time;
+
+    /* ---- HOW OFTEN THIS PARTITION'S WINDOW COMES ROUND ---- */
+
+    /* The determinism claim, made measurable, and it is the frame's own
+       observation rather than the guest's: a partition's period is the
+       interval between the instants ZoneX gave it the core, and only ZoneX
+       knows those.  The guest's own tick-to-tick interval is the other half
+       and the guest reports it separately -- neither alone would do,
+       because a partition whose clock the hypervisor was mismanaging would
+       see a steady period through a moving clock.
+     *
+       MEASURED FROM THE TIMESTAMPS THE SWITCH ALREADY TAKES, so this costs
+       no counter read at all: zx_ctx_resumed_at is read by the time freeze
+       on every entry, and a period is the difference between consecutive
+       values.  The bookkeeping is done OUTSIDE the timed bracket in the
+       boundary handler, so a switch cost measured with this present is the
+       same number as one measured without it -- which matters, because the
+       silicon figures this repository quotes were taken before it existed.
+     *
+       And the offset between "the core was given to the partition" and
+       "the timestamp was taken" is CONSTANT, so it cancels between two
+       consecutive entries: the period is unaffected by where in the switch
+       the reading happens, which is what makes moving it out of the
+       bracket free rather than merely cheap.  */
+
+    uint64_t    zx_ctx_period_prev;     /* the previous entry's timestamp */
+    uint64_t    zx_ctx_period_min;
+    uint64_t    zx_ctx_period_max;
+    uint64_t    zx_ctx_period_total;
+    uint32_t    zx_ctx_period_samples;
 } ZX_GUEST_CONTEXT;
 
 /* How many EL1 MPU regions this part actually has, clamped to the array
@@ -1095,6 +1176,116 @@ void zx_context_report(const ZX_GUEST_CONTEXT *context_ptr,
                        const char *name_ptr);
 
 /**************************************************************************/
+/*                  How often a partition's window came round             */
+/**************************************************************************/
+
+/* Forget the period statistics, INCLUDING the last timestamp, so that the
+ * next period measured begins a fresh chain.
+ *
+ * DROPPING THE TIMESTAMP IS THE WHOLE POINT, and the first version of this
+ * kept it for a reason that turned out to be backwards.  The argument was
+ * that the period straddling a phase change is the most interesting sample
+ * in the new phase.  It is not: it is the SAME EVENT as the last sample of
+ * the OLD phase, attributed to the wrong behaviour.
+ *
+ * The schedule works from absolute deadlines, so a late entry is followed
+ * by a period that is short by exactly as much as the previous one was
+ * long -- the frame self-corrects, which is the property the absolute
+ * deadline is for.  One perturbation therefore produces two samples: a
+ * long one, caused by whatever the neighbour was doing, and a short
+ * correction.  Keeping the timestamp across the reset put the correction in
+ * the next phase, so a phase that had done nothing to deserve it inherited
+ * a minimum from its predecessor's worst moment.  Measured on silicon: a
+ * console-storm phase with a maximum 14,451 counts long, and the following
+ * phase reporting a minimum 16,020 counts short.
+ *
+ * So each phase now measures only periods that lie entirely inside it, and
+ * pays for its own behaviour and nothing else.  It costs one sample per
+ * phase, which is the honest price of attribution.  */
+
+/* Record that this partition was given the core at `now`.  Called by the
+   frame, OUTSIDE the timed bracket, with the timestamp the time freeze
+   already took -- so it costs no counter read and does not move a switch
+   figure.  The first entry records no period: there is nothing to subtract
+   from, and the interval since the context was initialised is a number with
+   no meaning that would become the minimum on every run.  */
+
+void zx_context_period_note(ZX_GUEST_CONTEXT *context_ptr, uint64_t now);
+
+void zx_context_period_reset(ZX_GUEST_CONTEXT *context_ptr);
+
+/* The mean, or zero when nothing has been sampled.  A separate function
+   because a caller computing it inline is a caller dividing by a sample
+   count it has not checked, and a period of zero reads exactly like a
+   partition whose window never came round.  */
+
+ZX_NODISCARD uint64_t zx_context_period_mean(
+    const ZX_GUEST_CONTEXT *context_ptr);
+
+/* max - min, or zero when fewer than two periods were sampled.  ONE sample
+   has no spread, and reporting the difference between a min and a max that
+   are the same reading as "no jitter" would be the most flattering possible
+   way to describe a run too short to say anything.  */
+
+ZX_NODISCARD uint64_t zx_context_period_jitter(
+    const ZX_GUEST_CONTEXT *context_ptr);
+
+/**************************************************************************/
+/*             What happens AFTER a violation has been recorded            */
+/**************************************************************************/
+
+/* THE SHIPPING POLICY IS HALT, and zx_el2_fault_continue below is what
+ * implements it.  An image that configures the test-only alternative gets a
+ * partition resumed past the access instead, so that one image can sweep a
+ * whole matrix of violations rather than needing one image and one run per
+ * case.  The reasoning, and the four things that keep the mode honest, are
+ * in platform/cortex_r52/src/zx_fault_continue.c.
+ *
+ * THE POLICY IS THE IMAGE'S TO SET AT BUILD TIME, and its default is HALT
+ * because the variable holding it lives in .bss -- an image that configures
+ * nothing gets the value of zeroed memory.  It is not a compile definition
+ * on the hypervisor, and that is a discovered constraint rather than a
+ * preference: ZoneX is a library built once per build tree and linked into
+ * every image in it, so a compile definition on one image's target cannot
+ * reach the hypervisor's own translation units.
+ *
+ * THE VECTOR CALLS THIS ON EVERY BUILD.  There is no conditional in the
+ * trap handler: a continue mode that took a different route through it
+ * would leave the shipping route less exercised rather than more.  */
+
+/* Where a partition wants to be resumed after a BRANCH it was refused.
+ *
+ * A prefetch abort cannot be stepped over -- the fetch is what failed, so
+ * there is no instruction whose length would say where the next one starts
+ * -- and resuming at ELR + 4 would walk the partition through its
+ * neighbour's code one exception at a time.  So the guest publishes a
+ * resume point before it branches, and the hypervisor asks the IMAGE for it
+ * through this hook: where that address lives is a mailbox layout, which is
+ * an example's business and not the port's.
+ *
+ * Returning zero means the partition is stopped, which is the shipping
+ * behaviour and the right answer for a path with no answer.  */
+
+typedef uint32_t (*ZX_FAULT_RESUME_FN)(UINT partition);
+
+void zx_el2_fault_continue_configure(ZX_FAULT_LOG *log_ptr,
+                                     ZX_FAULT_RESUME_FN resume_fn,
+                                     uint32_t continue_past_violations);
+
+/* Whether the test-only continue mode is in force.  What an image PRINTS
+   about its own fault policy must come from the translation unit that ACTS
+   on it, or the two can disagree -- which they did, in the first version of
+   this seam, in the direction that reads as a pass.  */
+
+ZX_NODISCARD uint32_t zx_el2_fault_continue_enabled(void);
+
+/* Called from the Hyp trap vector once a guest violation is captured.
+   Returns the context to resume, or a null pointer to stop the partition.
+   Not called from C.  */
+
+ZX_NODISCARD ZX_GUEST_CONTEXT *zx_el2_fault_continue(void);
+
+/**************************************************************************/
 /*                     Entering a time-partitioned frame                  */
 /**************************************************************************/
 
@@ -1144,6 +1335,12 @@ extern ZX_GUEST_CONTEXT *zx_el2_current_context;
  * PMCCNTR IS 32-BIT AND WRAPS, which is why the per-switch figures are
  * uint32_t and the total is not: a switch is a few thousand cycles so one
  * difference cannot wrap, and ten thousand of them summed comfortably can.  */
+
+/* What a frame calls once per completed major frame.  Declared before the
+   structure that holds one, since the structure holds it; what it is FOR is
+   beside zx_frame_set_frame_hook below.  */
+
+typedef void (*ZX_FRAME_HOOK_FN)(void *argument, ULONG frames_completed);
 
 typedef struct ZX_FRAME_STRUCT
 {
@@ -1205,6 +1402,14 @@ typedef struct ZX_FRAME_STRUCT
        ZX_RUN_FRAME_DONE when nobody left early.  */
     UINT                zx_frame_stopped_index;
     uint32_t            zx_frame_stop_outcome;
+
+    /* The per-major-frame hook, and the frame count it was last called at.
+       See zx_frame_set_frame_hook: this is how a regression divides one run
+       into phases, and it is called OUTSIDE the timed bracket so that it
+       cannot move a switch figure.  Null in every image but one.  */
+    ZX_FRAME_HOOK_FN    zx_frame_hook;
+    void               *zx_frame_hook_argument;
+    ULONG               zx_frame_hook_frames;
 } ZX_FRAME;
 
 /* Wire the frame up.  Nothing is entered and no timer is armed: this only
@@ -1241,6 +1446,38 @@ ZX_NODISCARD ZX_GUEST_CONTEXT *zx_el2_window_boundary(void);
    vector it runs in has no caller to return one to.  */
 
 extern uint32_t zx_el2_frame_result;
+
+/* Which partition the schedule says is running, or ZX_MANIFEST_NO_INDEX.
+ *
+ * Asked by the fault path, which has a syndrome and a context pointer and
+ * no way to name whose window the violation happened in.  A caller could
+ * compare zx_el2_current_context against the contexts array and get the
+ * same answer; going through the SCHEDULE instead means the attribution in
+ * a fault log and the attribution in the frame's own report come from one
+ * source, and cannot disagree about a partition that had just been
+ * switched.  */
+
+ZX_NODISCARD UINT zx_frame_current_partition(void);
+
+/* CALLED ONCE PER COMPLETED MAJOR FRAME, outside the timed bracket.
+ *
+ * WHAT THIS IS FOR AND WHAT IT IS NOT.  It is not a scheduler hook: it
+ * cannot change what runs next, and it is deliberately not called per
+ * WINDOW.  It exists so that a regression can divide one run into PHASES --
+ * changing what the untrusted partition is doing every so many frames while
+ * the critical one is measured continuously -- and a frame boundary is the
+ * coarsest place that can happen, which is the right one.
+ *
+ * OUTSIDE THE TIMED BRACKET, and that is a requirement rather than a
+ * courtesy: a hook called inside it would add its own cost to every switch
+ * figure this repository has published, and the whole point of measuring a
+ * switch is that the number does not depend on what the image happens to be
+ * doing with it.
+ *
+ * A null pointer means no hook, which is every image but one.  */
+
+void zx_frame_set_frame_hook(ZX_FRAME *frame_ptr, ZX_FRAME_HOOK_FN hook_fn,
+                             void *argument);
 
 /* MEASURE THE SWITCH, BY GROUP, using the same code the switch runs.
  *

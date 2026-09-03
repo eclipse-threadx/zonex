@@ -1304,6 +1304,20 @@ which are equal in any run where both partitions live to the end.
   partition, which faults again on the same instruction. Neither order loses
   an event, because neither event is edge-triggered and neither is
   acknowledged until it is handled.
+
+  **Amended: it is now exercised, incidentally and in bulk, and it is still
+  not a targeted test.** The isolation regression's last phase has one
+  partition violate its boundary on every iteration of its own loop, under
+  the test-only continue mode of D26 — on the model, 117,561 violations
+  across ten major frames, against twenty window boundaries in the same
+  span. The two events are therefore in flight together thousands of times
+  in every run, and no run has lost one: no missed deadline, no unexplained
+  FIQ, and the neighbour's period unmoved. That is real evidence where there
+  was none, and it is worth being precise about what kind: it is not a test
+  of the race, because nothing arranges the coincidence and nothing would
+  report having hit it. It is a very large number of chances for the
+  structural argument above to be wrong, taken every time the regression
+  runs.
 * **The FPU is DENIED to a time-partitioned system rather than saved.** D23
   recorded that opening `HCPTR.TCP10/TCP11` was exactly right with one
   partition and a shared register bank with two, since nothing saves `FPEXC`,
@@ -1313,3 +1327,326 @@ which are equal in any run where both partitions live to the end.
   Saving the bank is a real later-phase option and needs the register file's
   width read from `MVFR0` rather than assumed; sharing it silently is not an
   option at all.
+
+---
+
+## D26 — Halt on fault, and a test-only continue mode · **settled, and run on both targets**
+
+**A stage-2 violation STOPS the partition. That is the shipping policy and it
+is unchanged. A build may additionally ask, at build time, for the partition
+to be RECORDED and RESUMED past the access instead, so that one image can
+sweep a whole matrix of violations rather than needing one image and one run
+per case.**
+
+### Why the mode exists
+
+Phase 0's specified behaviour is fault, log, halt, and it is right: a
+hypervisor that quietly re-entered a partition which had just violated its
+boundary would be doing the easy half of supervised restart.
+
+But the isolation regression is **fourteen cases** — seven in each direction —
+and under halt-on-fault each case ends its partition's excursion. Fourteen
+cases would then need fourteen images and fourteen runs. On the S32Z280 that
+is fourteen debug-probe sessions, most of a working day; on the functional
+model it is minutes of simulation each, on a lane that already dominates the
+suite's wall clock. The alternative — one image per case with a shared
+manifest — was weighed and rejected on exactly that arithmetic.
+
+### The four things that keep it honest
+
+* **The policy is a build-time decision and cannot be reached by a manifest,
+  a mailbox word, or a partition.** It arrives through
+  `zx_el2_fault_continue_configure`, which an image calls with a value taken
+  from its own compile-time definition.
+* **The default is HALT because the variable holding the policy lives in
+  `.bss`.** An image that configures nothing gets the value of zeroed memory.
+  A default that has to be written down somewhere is a default somebody can
+  write down wrongly.
+* **The shipping path is the same code.** There is no conditional in the trap
+  vector: every build calls the same function on every guest violation and
+  that function decides. A continue mode reached through a *different* route
+  would leave the shipping route the less exercised of the two.
+* **Halt is tested rather than assumed.** `zx_regression_halt.elf` is the same
+  image without the definition, asks each partition for one case, and must
+  report that both were stopped — on both targets.
+
+And one more build exists for a reason that has nothing to do with the fault
+policy and everything to do with the same rule: `zx_regression_no_tick.elf`
+leaves the hypervisor's own timer PPI disabled at the GIC, so no window can
+end and the regression must REFUSE to start the frame. The refusal itself was
+dead code in every build until then. The demonstration image beside it had
+always had the equivalent build, and the two now share the bring-up routine —
+so the shared half was covered and the regression's own three lines of refusal
+were not. A branch nothing has ever taken is not evidence that it works, which
+is the same sentence that justifies every other negative build here.
+
+⚠ **It was an `#ifdef` in the hypervisor first, and it could not work.** ZoneX
+is a library, built once per build tree and linked into every image in it, so
+a compile definition on one image's target never reaches the hypervisor's own
+translation units. The option was set on the regression target, the library
+was built without it, and the run reported every partition STOPPED while its
+own banner claimed continue mode. The definition now lives where every other
+build variant in this suite has always lived — on the image — and what the run
+PRINTS about its policy comes from the translation unit that acts on it rather
+than from a macro the image tests itself.
+
+### A prefetch abort cannot be resumed the way a data abort can
+
+"Step over the faulting instruction" needs the instruction, and for a prefetch
+abort there is none: the **fetch** is what failed. Resuming at `ELR + 4` would
+resume inside the neighbour's window and fault again on the next word, and
+again, for the rest of the window — a partition walking through its
+neighbour's code taking one exception per instruction, which is a livelock
+wearing the costume of a test.
+
+So the **guest** publishes where it wants to be put back, before it branches,
+and the hypervisor asks the image for that address through a hook rather than
+reading a mailbox itself: a mailbox layout is an example's business. An address
+the hypervisor was not given means the partition is stopped, which is the
+shipping behaviour and the right answer for a path with no answer.
+
+### What the continue mode revealed about what a guest can report
+
+Two findings, and the second was a defect in the regression's own first
+version.
+
+**A guest cannot report having been denied.** It is resumed past the faulting
+instruction, so the store that would have recorded "this case survived"
+executes anyway, one instruction later, on a case that was refused. Every "it
+faulted" judgement therefore belongs to EL2 and comes out of the fault log,
+matched by ADDRESS — which is why every case in the matrix aims at an address
+of its own.
+
+**And it cannot report what it failed to READ either.** A denied load never
+writes its destination register — but the instruction the partition is resumed
+at is the STORE of that register, so the mailbox is written with whatever the
+compiler happened to leave there. On a real run that was the number one, and
+the check "the read returned the poison the guest wrote first" duly failed.
+The hypervisor now reads what is really at the address — it can, because
+stage-2 AP cannot deny EL2 — and compares. That is the claim anyway (*the
+neighbour's data did not reach the partition*) rather than a proxy for it.
+
+The converse holds and is why both halves are recorded: **EL2 cannot report
+what was attempted.** A case the guest refused to run and a case stage 2 denied
+both leave the hypervisor with no fault to look at. A row of the matrix
+therefore passes only when the guest says it tried, the log says it was
+refused, and the syndrome is the right *kind* of refusal — three conditions
+from two independent sources.
+
+---
+
+## D27 — Where the shared read-only granule is demonstrated · **settled**
+
+**The stage-2 probe image declares one and demonstrates both halves of it. The
+frame images — the two-partition demonstration and the isolation regression —
+declare NONE, deliberately.**
+
+A shared granule is a **declared exception** to isolation: one range readable
+by both partitions and writable by exactly one. Both halves are worth
+demonstrating, and the interesting one is the second — a reader that cannot
+write it fails with `DFSC 0x0C`, a region PERMISSION failure, and not with
+`DFSC 0x04`, a region miss. Those are two different claims and only one of
+them means "read-only".
+
+### Why it stays in the probe image
+
+Putting one in the frame images as well would cost their central claim its
+simplicity for no new evidence. Every temporal number those runs produce is
+currently a number about two partitions that share **nothing but a core**;
+with a shared granule it would be a number about two partitions that share a
+core and sixty-four bytes, and a reader asking "could the shared line be how B
+reached A" would be entitled to an answer the run could not give.
+
+So the exception is demonstrated where it is cheap and asserted where it is
+sharp, and it is not smuggled into the image whose job is to say the two
+partitions are disjoint.
+
+### And its read-only half now has a negative build
+
+`zx_probe_shared_rw.elf` gives the READER's copy of the shared range write
+permission, so the publish must survive and the run must report FAILED.
+
+⚠ **It has to break the manifest AFTER the validator has passed it,** and that
+is the interesting part rather than a workaround. There are two independent
+defences. `zx_manifest_shared_check` requires the non-publisher's copy of a
+shared range to be read-only, so a manifest declaring it writable is refused
+before a single region is programmed — which was the first version of this
+build, and it reported the validator refusing the manifest rather than the
+access being permitted. A real result, and a test of a different check. Reaching
+the second defence means handing the region programmer a descriptor the
+validator never saw; only the permission field changes, so nothing else in the
+run moves and the one thing that can catch it is the access itself.
+
+---
+
+## D28 — What the determinism regression measures, and against what bound · **settled, and run on both targets**
+
+**The critical partition's WINDOW PERIOD, observed by the hypervisor, together
+with its OWN VIRTUAL COUNTER, reported by the guest — both measured in phases
+of ONE run while the untrusted partition is steered through five behaviours.
+Absolute figures are reported; a RELATIVE bound is asserted; the clock is
+stated beside every number.**
+
+### One run in phases, not one run per behaviour
+
+The obvious shape was six images: one per row of the determinism table. It is
+the weaker one. Six images is six boots, six epochs and six sets of switch
+measurements, so comparing the critical partition's period across them
+compares **runs** — and a difference between two runs has a dozen explanations
+that a difference between two phases of one run does not. It is also a sixth of
+the model time, on the slowest lane in the suite.
+
+What a partition is doing is a mailbox word the guest re-reads on every
+iteration of its endless phase, so the hypervisor can change it at a frame
+boundary. Re-reading costs one load from a granule the partition already owns:
+no hypercall, no kernel call, and nothing the masked phase could not do with
+its interrupts off — which is what lets a partition be steered *out* of a phase
+it entered by disabling interrupts.
+
+The first phase is **discarded**: the untrusted partition is still booting its
+kernel and reaching its verdict during it, so a baseline that included it would
+be a baseline of a partition doing real work and every later phase would look
+artificially good. It is still printed, so that what was discarded is visible
+rather than taken on trust. This is the same discipline the switch measurement
+already uses.
+
+### The bound: report absolute, assert relative, state the clock
+
+The assertion is **one eighth of one window**, and the derivation is printed
+beside every figure it governs.
+
+The worst partition switch measured on the S32Z280-594EVB by the two-partition
+image is 5,862 core cycles at a measured 48.05 MHz — about 122 µs, which at
+that board's 8 MHz system counter is roughly 976 counts, or 1.2% of one
+window. The bound is **ten times that**, rounded to a power of two.
+
+* **Relative and not absolute**, which was an open question worth deciding. An
+  absolute bound in counts is what a safety customer wants and it does not
+  survive two targets whose counters differ by a factor of twelve — the model's
+  runs at 100 MHz and the board's at 8. A fraction of a *window* is the same
+  claim on both, and it is also the claim that matters: what a schedule has to
+  survive is jitter relative to the window it must fit in.
+* **Ten times the switch and not one.** A bound at the measured spread would
+  fail the first time somebody added a register to the switch, which is a
+  regression reporting a change rather than a defect. What it has to catch is
+  COUPLING, and coupling is not a percentage: a partition that lost a window to
+  its neighbour is out by a whole window, eight times this bound.
+
+### Two halves, and they fail separately
+
+⚠ **A serviced tick count is insensitive to the time freeze, and finding that
+out cost a negative build that passed.** The guest-side half was first written
+as "the critical partition saw the same number of its own ticks in every
+phase". The virtual timer asserts a LEVEL, so several expiries while a
+partition is descheduled coalesce into one interrupt, and the number a guest
+services is bounded by the core time it was given whether or not its clock was
+frozen. The build with the freeze removed had a partition whose own clock ran
+42% ahead of the time it had been given — and an identical tick count in every
+phase.
+
+The assertion is now on the partition's own **counter** against the core time
+the hypervisor knows it was given, which is the temporal claim in its sharpest
+form: *its clock advanced by the counts it spent on the core and by none of the
+counts it did not.* The tick count is still printed, because it is the number a
+reader recognises.
+
+The two halves are separate because they fail separately, and the negative
+build proves it: with the freeze removed the window period is untouched — the
+schedule is what the period measures — while the clock is out by three windows
+per frame. A regression that measured only the period would have stayed green
+while every partition's clock lied.
+
+⚠ **And `zx_launch_freeze_time` was dead on the frame path.** That field
+governs the single-excursion path `zx_guest_run` takes; under a major frame the
+freeze is the context's, applied by the switch on every entry. The first
+version of the negative build cleared the launch field, changed nothing, and
+passed — and it was the runner's `--expect fail` that caught it rather than
+anything in the image, which is the whole argument for registering negative
+builds that way. The freeze is now a per-context field, `zx_ctx_credit_time`,
+set by `zx_context_time_reset` so that no image can forget it; the negative
+build clears the field that actually governs it. It costs the switch one
+compare, inside the group the measurement reports as the time freeze, and that
+is said here rather than discovered later.
+
+### What is deliberately not measured
+
+* **Interrupt latency**, for the reason D25 gives: guest interrupts go straight
+  to EL1, so bounding them needs the List Registers this phase does not use.
+* **Anything about timing on the functional model.** A green run there proves
+  the code is right; every period and every cycle count has to come from
+  silicon before it is quoted, and the run says so in its own output.
+
+### How many frames a determinism run needs, and what a longer one found
+
+Open question, answered by measurement rather than by assertion: **sixty major
+frames is enough for the bound being asserted, and is not enough to have found
+the true maximum.** A build with ten times the frame count exists and is run by
+hand on silicon; it is not in the automated suite, because sixty seconds of
+silicon is cheap and ten minutes of a functional model on every pull request is
+not.
+
+Jitter in counter counts, S32Z280-594EVB, ten frames per phase against a
+hundred:
+
+| the untrusted partition is… | 60 frames | 600 frames |
+|---|---|---|
+| idle | 9 | 17 |
+| in a tight compute loop | 15 | 16 |
+| computing with IRQ and FIQ masked | 15 | 19 |
+| storming the console | 24,420 | 24,584 |
+| violating its boundary every iteration | 69 | 282 |
+
+The quiet phases roughly double and stay in the tens of counts. The fault phase
+grows fourfold — 117,000 violations in the short run, over a million in the long
+one, so the tail had more chances to appear. The console phase is stable to
+0.7%, which is what a bound set by a UART's character rate should look like.
+
+Every one of them stays two to three orders of magnitude inside the bound
+asserted against it. So the short run is sound for the claim it makes, and
+nobody should quote these maxima as worst cases: they are the largest values
+seen in a run of a stated length, and the longer run says plainly that a longer
+one would see more.
+
+### ⚠ What re-measuring the partition switch found, and what it means for the figure
+
+The switch cost was re-measured on the same bench, in one session, to separate
+this step's changes from the bench itself. Four readings of the same
+measurement:
+
+| | min | mean | max | spread | measured core clock |
+|---|---|---|---|---|---|
+| archived, 2 Sep | 5,672 | 5,715 | 5,862 | 190 | 48,050,135 |
+| the **same code**, re-measured today | 5,854 | 5,893 | 6,046 | 192 | 48,193,299 |
+| with this step's changes | 6,030 | 6,078 | 6,370 | 340 | 48,187,087 |
+| …and with the one instruction this step adds to the switch removed | 5,988 | 6,036 | 6,232 | 244 | 48,203,161 |
+
+Two things follow, and the second is the important one.
+
+**The one instruction this step puts on the switch path costs nothing
+measurable.** Removing the `zx_ctx_credit_time` compare moves the mean by 42
+cycles, which is inside the run-to-run scatter of the other rows. The field
+stays.
+
+**And the figure reproduces to about ±4% on this bench, across days and across
+unrelated code changes — so quoting it to four significant figures was always
+over-precise.** The same code measures 3.2% higher today than when it was
+archived; this step's changes account for a further 2.4% that is not
+attributable to any instruction added to the path. The EL2 caches are off, which
+the image's own conditions block already gives as a reason the figure is an
+over-estimate; what re-measurement adds is that with caches off the cost also
+depends on **where the code sits in memory**, so adding a translation unit to
+the hypervisor library moves it. The RC oscillator drifts too — 48.05 to 48.20
+MHz across these readings, and it is temperature-dependent.
+
+None of this touches anything that rests on the number. The jitter bound is ten
+times the worst switch rounded to a power of two, and 6,370 cycles is as
+comfortably inside one eighth of a window as 5,862 was. The ratio claim between
+the two partitions' clocks is counter-only and does not involve the core clock
+at all. What changes is how the figure should be written down: **about 6,000
+cycles, reproducible to a few per cent on one bench**, and not a worst case in
+either direction until the clock tree lands.
+
+An amendment to the linker script's own placement, or `-ffunction-sections`
+with an ordering file, would make the figure repeatable across code changes.
+That is worth doing before anybody characterises this across a population, and
+it is not worth doing to make a demonstrator's number look tidier.

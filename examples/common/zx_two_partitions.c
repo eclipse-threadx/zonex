@@ -91,6 +91,7 @@
 #include "zx_partition.h"
 #include "zx_schedule.h"
 #include "zx_guest_console.h"
+#include "zx_frame_setup.h"
 
 /* THE GUEST'S CONTRACT AND THE HYPERVISOR'S MUST AGREE, and this is one of
    the few translation units that can see both spellings.  The guest is a
@@ -375,282 +376,36 @@ static void zx_build_manifest(uint32_t board_regions)
 
 
 /**************************************************************************/
-/*  zx_grant_the_clocks                                                   */
+/*  EVERYTHING AT EL2 THAT MAKES A TIME-PARTITIONED SYSTEM POSSIBLE now   */
+/*  lives in zx_frame_setup.c, shared with the isolation and determinism  */
+/*  regression, which needs the same bring-up in the same order.          */
 /*                                                                        */
-/*  EVERYTHING AT EL2 THAT MAKES A TIME-PARTITIONED SYSTEM POSSIBLE, in   */
-/*  one place, because the order matters and several steps of it fail     */
-/*  silently on their own.                                                */
+/*  IT WAS MOVED RATHER THAN COPIED, and the reason is sharper than       */
+/*  tidiness: half of that routine is checks that exist because something */
+/*  went wrong once -- HCR examined by BIT POSITION because this port had */
+/*  FMO and AMO defined the other way round, EL2's CPU interface brought  */
+/*  up LAST because setting FMO redirects a guest's ICC_PMR writes and    */
+/*  the physical mask resets to zero, and a pre-flight of the comparator  */
+/*  before any partition runs because a window that never ends has three  */
+/*  causes that present identically.  A second copy would drift, and the  */
+/*  drift would present as a partition that silently stopped being        */
+/*  interrupted in whichever image was edited second.                     */
 /*                                                                        */
-/*    THE COUNTER, then the GIC, then the two interrupts -- one for the   */
-/*    partitions and one for the hypervisor -- and then the ROUTING.      */
-/*                                                                        */
-/*    THE PARTITIONS' TIMER IS ONE INTID FOR BOTH OF THEM.  They never    */
-/*    run at once, and its meaning is switched with everything else a     */
-/*    switch switches: the outgoing partition's comparator is saved and   */
-/*    DISARMED, the incoming one's is restored.  Two INTIDs would make    */
-/*    "which PPIs are enabled" guest state and grow the switch by a       */
-/*    register write for no gain; one INTID keeps it hypervisor state     */
-/*    that never changes.  This is open question 2 of the step this image */
-/*    was written for, answered the way it recommended, and recorded here */
-/*    rather than only in the manifest's comments.                        */
-/*                                                                        */
-/*    THE HYPERVISOR'S TIMER GOES IN GROUP 0, which is what makes the     */
-/*    whole design work: routing is by exception TYPE, so Group 0 arrives */
-/*    as an FIQ and HCR.FMO brings FIQ to EL2, while every partition      */
-/*    interrupt stays Group 1, stays an IRQ, and is delivered straight to */
-/*    EL1 exactly as it was before this image existed.                    */
-/*                                                                        */
-/*    AND EL2'S OWN CPU INTERFACE COMES UP LAST, AFTER FMO IS SET,        */
-/*    because that is where the trap is.  See zx_gic_el2_cpu_interface_   */
-/*    init: setting FMO redirects the guest's ICC_PMR writes to the       */
-/*    VIRTUAL interface, so the physical priority mask -- which resets to */
-/*    zero, masking everything -- becomes the hypervisor's to open.  A    */
-/*    partition that was receiving its timer perfectly well stops         */
-/*    receiving anything, with no fault and no message.                   */
-/*                                                                        */
-/*  Returns non-zero when everything both partitions depend on is up.     */
+/*  ONE thing is a parameter: whether the hypervisor's own timer PPI is    */
+/*  enabled.  This image's ZX_TWO_NO_TICK build leaves it disabled on     */
+/*  purpose, which is what makes its preemption checks evidence.          */
 /**************************************************************************/
 
 static uint32_t zx_grant_the_clocks(void)
 {
-    uint32_t running;
-    uint32_t awake;
-    uint32_t priority_bits;
-    uint32_t hyp_priority;
-    uint32_t tick_deliverable;
-
-    zx_console_puts("\n--- the clocks and the interrupts ZoneX grants ---\n");
-
-    zx_board_counter_start();
-    running = zx_counter_is_running();
-
-    zx_note("CNTFRQ         ", zx_read_cntfrq());
-    zx_check("the system counter is RUNNING, not merely declared.  Every\n"
-             "         window boundary in this run is an absolute comparison\n"
-             "         against it, so a counter that does not move is a frame\n"
-             "         that never turns",
-             running);
-
-    awake = zx_gic_el2_init(&zx_gic);
-    zx_check("the redistributor cleared ProcessorSleep and reports its\n"
-             "         children awake, so this core can be delivered to",
-             awake);
-
-    priority_bits = zx_gic_priority_bits(&zx_gic, ZX_PPI_VIRTUAL_TIMER);
-    hyp_priority  = zx_frame_hyp_tick_priority();
-
-    zx_note("implemented priority bits", priority_bits);
-    zx_note("partition timer priority ", ZX_GUEST_TIMER_PRIORITY);
-    zx_note("hypervisor tick priority ", hyp_priority);
-
-    /* THE TWO PRIORITIES MUST STILL DIFFER AFTER THE PART HAS THROWN AWAY
-       THE BITS IT DOES NOT IMPLEMENT.  Both targets keep only the top five,
-       so two values differing below that are the SAME priority -- and equal
-       priorities do not preempt.  A hypervisor tick that could not preempt
-       a partition's timer handler would let a guest defer the end of its
-       own window for as long as its handler ran, which is the masking hole
-       wearing a different hat.  */
-
-    {
-        uint32_t keep = (uint32_t)(0xFFU << (8U - priority_bits));
-
-        zx_check("the hypervisor's tick is a HIGHER priority than a\n"
-                 "         partition's timer even after this part has\n"
-                 "         discarded the priority bits it does not implement --\n"
-                 "         numerically lower wins, and equal priorities do not\n"
-                 "         preempt at all",
-                 ((hyp_priority & keep) < (ZX_GUEST_TIMER_PRIORITY & keep))
-                     ? 1U : 0U);
-    }
-
-    /* ONE INTID FOR BOTH PARTITIONS.  Enabled once, here, and never touched
-       by a switch: the comparator behind it is what changes hands.  */
-
-    zx_gic_enable_guest_ppi(&zx_gic, ZX_PPI_VIRTUAL_TIMER,
-                            ZX_GUEST_TIMER_PRIORITY);
-
-#ifndef ZX_TWO_NO_TICK
-
-    zx_gic_enable_hyp_ppi(&zx_gic, ZX_PPI_HYPERVISOR_TIMER, hyp_priority);
-
+#ifdef ZX_TWO_NO_TICK
+    const uint32_t enable_hyp_tick = 0U;
 #else
-
-    zx_console_puts("\n  NEGATIVE BUILD: the HYPERVISOR's own timer PPI is\n"
-                    "  deliberately NOT enabled.  The comparator is still\n"
-                    "  armed at every boundary and still expires; the GIC is\n"
-                    "  simply never told to deliver it.  No window can then\n"
-                    "  end, partition A runs for ever, and partition B never\n"
-                    "  runs at all -- so this run must report FAILED.\n");
-
+    const uint32_t enable_hyp_tick = 1U;
 #endif
 
-    zx_check("the partitions' virtual-timer PPI reads back ENABLED and in\n"
-             "         GROUP 1, which is what the GIC delivers as an IRQ,\n"
-             "         straight to EL1 with no injection and no List Register",
-             (zx_gic_ppi_is_enabled(&zx_gic, ZX_PPI_VIRTUAL_TIMER)
-              && zx_gic_ppi_is_group1(&zx_gic, ZX_PPI_VIRTUAL_TIMER))
-                 ? 1U : 0U);
-
-    zx_check("and the HYPERVISOR's own timer PPI is in GROUP 0, which is\n"
-             "         what the GIC delivers as an FIQ.  Routing is by\n"
-             "         exception TYPE and not by INTID: that one bit is the\n"
-             "         whole difference between a tick that reaches EL2 and a\n"
-             "         tick that would have to be injected into a List\n"
-             "         Register",
-             (zx_gic_ppi_is_group1(&zx_gic, ZX_PPI_HYPERVISOR_TIMER) == 0U)
-                 ? 1U : 0U);
-
-    /* AND THAT IT IS ENABLED, which is the check the whole refusal below
-       rests on.  A hypervisor whose own tick is not deliverable cannot end
-       a window, and a frame started in that state does not fail -- it
-       HANGS, with the first partition running until something outside the
-       image stops it.  That is the least informative outcome this suite can
-       produce and it names nothing at all.  */
-
-    tick_deliverable = zx_gic_ppi_is_enabled(&zx_gic,
-                                             ZX_PPI_HYPERVISOR_TIMER);
-    zx_note("hypervisor tick PPI enabled", tick_deliverable);
-
-    zx_check("and the PHYSICAL timer's PPI is enabled for nobody.  A\n"
-             "         partition could not read it anyway -- CNTHCTL.PL1PCTEN\n"
-             "         and PL1PCEN are left clear on purpose -- because\n"
-             "         physical time keeps running while a partition is\n"
-             "         descheduled, and a guest that can read it can see that\n"
-             "         it was not running",
-             (zx_gic_ppi_is_enabled(&zx_gic, ZX_PPI_PHYSICAL_TIMER) == 0U)
-                 ? 1U : 0U);
-
-    /* ROUTING, AND THEN EL2's OWN CPU INTERFACE.  In that order, because
-       the second only matters once the first has changed where the guest's
-       own writes go.  */
-
-    zx_el2_route_fiq();
-
-    zx_note("HCR after routing", zx_read_hcr());
-
-    /* THE BIT, BY POSITION, AND NOT BY NAME.  This port had ZX_HCR_FMO and
-       ZX_HCR_AMO defined the other way round, and a check written as
-       "(HCR & ZX_HCR_FMO) != 0" passes cheerfully against either
-       definition -- it is the same symbol on both sides of the comparison.
-       What it cost was a run in which every set-up check was green, the
-       comparator expired, the GIC made the interrupt pending, and no window
-       ever ended: bit 5 is AMO, and physical FIQ had never been routed
-       anywhere.  Bit 3 is FMO on this architecture and on this part, TRM
-       Table 3-70, and comparing against the NUMBER is the only form of this
-       check a swapped definition cannot satisfy.  */
-
-    zx_check("HCR bit 3 -- FMO, by position and not by the name this port\n"
-             "         happens to give it -- is SET, so a physical FIQ is\n"
-             "         taken to EL2.  And with it set, PSTATE.F is IGNORED at\n"
-             "         EL0 and EL1: a partition cannot mask the interrupt\n"
-             "         that ends its own window, whatever its kernel does\n"
-             "         with its own masks",
-             ((zx_read_hcr() & 0x8U) != 0U) ? 1U : 0U);
-    zx_check("and HCR bit 5 -- AMO -- is CLEAR.  Routing asynchronous aborts\n"
-             "         to EL2 would send them to the vector that today means\n"
-             "         'ZoneX faulted on its own access', so a guest's abort\n"
-             "         would be reported as a hypervisor bug.  Not needed for\n"
-             "         a window to end, and deliberately deferred",
-             ((zx_read_hcr() & 0x20U) == 0U) ? 1U : 0U);
-    zx_check("and HCR bit 4 -- IMO -- is CLEAR, so every partition interrupt\n"
-             "         is still a physical IRQ delivered straight to EL1.  The\n"
-             "         guest side of this arrangement needed no change\n"
-             "         whatever, which is the strongest argument the design\n"
-             "         has",
-             ((zx_read_hcr() & 0x10U) == 0U) ? 1U : 0U);
-
-    zx_gic_el2_cpu_interface_init();
-
-    zx_note("EL2 ICC_PMR    ", zx_gic_el2_priority_mask());
-    zx_note("EL2 ICC_IGRPEN0", zx_gic_el2_group0_enabled());
-
-    zx_check("the PHYSICAL priority mask is open, and it is the\n"
-             "         HYPERVISOR'S to open now.  Setting HCR.FMO redirects an\n"
-             "         EL1 write of ICC_PMR to the VIRTUAL interface, so the\n"
-             "         guest's own 'unmask everything' stops affecting\n"
-             "         physical delivery -- and the physical mask resets to\n"
-             "         zero, which masks it all.  A partition that received\n"
-             "         its timer end to end a moment ago would stop receiving\n"
-             "         anything, with nothing to fault on",
-             (zx_gic_el2_priority_mask() != 0U) ? 1U : 0U);
-
-    zx_check("and Group 0 is enabled at EL2's own CPU interface, without\n"
-             "         which an FIQ could not be signalled to the core at all",
-             zx_gic_el2_group0_enabled());
-
-    /* ---------------------------------------------------------------- */
-    /*  A PRE-FLIGHT, BEFORE ANY PARTITION RUNS.                        */
-    /*                                                                  */
-    /*  A window that never ends has three possible causes in three     */
-    /*  different places, and they present identically: a hypervisor    */
-    /*  that starts a frame and is never heard from again, with no      */
-    /*  fault, no message and a harness timeout that names nothing.     */
-    /*  That is the least informative failure this suite can produce.   */
-    /*                                                                  */
-    /*  So the comparator is armed for a short interval HERE, with no   */
-    /*  partition running and FIQ still masked at EL2, and two          */
-    /*  questions are asked separately: did it expire, and did the GIC  */
-    /*  make the interrupt pending.  A run that fails either of them    */
-    /*  says which half is broken instead of hanging.                   */
-    /*                                                                  */
-    /*  The same discipline as zx_counter_is_running, one level up:     */
-    /*  a guest that armed a timer against a stopped counter was the    */
-    /*  failure that check was written for, and this is the             */
-    /*  hypervisor's own version of it.                                 */
-    /* ---------------------------------------------------------------- */
-
-    {
-        uint64_t soon  = zx_read_cntpct() + (uint64_t)(zx_board_counter_hz()
-                                                       / 1000U);
-        uint32_t armed = zx_el2_hyp_timer_arm(soon);
-
-        zx_el2_dwell_until(soon + (uint64_t)(zx_board_counter_hz() / 1000U));
-
-        zx_console_puts("\n--- the hypervisor's own tick, before any "
-                        "partition runs ---\n");
-        zx_note("armed for a future deadline", armed);
-        zx_note("CNTHP expired (ISTATUS)    ", zx_el2_hyp_timer_fired());
-        zx_note("GIC has PPI 26 pending     ",
-                zx_gic_ppi_is_pending(&zx_gic, ZX_PPI_HYPERVISOR_TIMER));
-
-        zx_check("the hypervisor's own comparator EXPIRED.  This is the\n"
-                 "         first of three questions a window that never ends\n"
-                 "         raises, and the only one that is about the timer\n"
-                 "         rather than about the interrupt controller",
-                 zx_el2_hyp_timer_fired());
-
-#ifndef ZX_TWO_NO_TICK
-
-        zx_check("and the GIC made it PENDING, which is the second: a\n"
-                 "         comparator that expires into a controller that was\n"
-                 "         never told is indistinguishable, from the outside,\n"
-                 "         from a core that never took the exception",
-                 zx_gic_ppi_is_pending(&zx_gic, ZX_PPI_HYPERVISOR_TIMER));
-
-#endif
-
-        zx_el2_hyp_timer_stop();
-    }
-
-    zx_console_puts(
-        "\n"
-        "  AND THE SAME REDIRECTION IS WHAT MAKES THIS AIRTIGHT RATHER THAN\n"
-        "  MERELY CHEAP.  ICC_IGRPEN0 is redirected too, so a partition\n"
-        "  cannot reach the physical Group 0 enable to switch off the\n"
-        "  interrupt that ends its window: it writes the virtual copy and\n"
-        "  nothing happens.  Before FMO was set that register was genuinely\n"
-        "  shared, and the argument had to be that a partition was granted\n"
-        "  no Group 0 interrupt worth enabling.  Now it cannot reach the\n"
-        "  enable at all.\n");
-
-    /* THREE THINGS, AND A FRAME NEEDS ALL OF THEM.  The counter has to be
-       moving, the GIC has to be awake, and the hypervisor's own tick has to
-       be deliverable.  Returned as one answer so that the caller has one
-       decision to make, and the caller's decision is to REFUSE rather than
-       to start a frame whose windows could never end.  */
-
-    return ((running != 0U) && (awake != 0U) && (tick_deliverable != 0U))
-               ? 1U : 0U;
+    return zx_frame_grant_the_clocks(&zx_gic, ZX_GUEST_TIMER_PRIORITY,
+                                     enable_hyp_tick);
 }
 
 

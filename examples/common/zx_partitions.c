@@ -143,6 +143,7 @@ static void zx_build_manifest(uint32_t board_regions)
               __zx_shared_start, __zx_shared_end,
               ZX_AP_EL2_RO_GUEST_RO, ZX_XN_NEVER);
 
+
     zx_shared[0].zx_shared_base         = zx_symbol_address(__zx_shared_start);
     zx_shared[0].zx_shared_limit        = zx_symbol_address(__zx_shared_end) - 1U;
     zx_shared[0].zx_shared_publisher_id = ZX_PARTITION_A_ID;
@@ -449,6 +450,49 @@ void zx_phase_two_partitions(uint32_t board_regions, uint32_t el2_regions)
     }
 
     zx_check("the manifest passes every rule", 1U);
+
+#ifdef ZX_PROBE_SHARED_RW
+
+    /* THE NEGATIVE VERIFICATION OF THE SHARED GRANULE'S READ-ONLY HALF, and
+     * it has to be applied HERE -- after the validator has passed a manifest
+     * that says the right thing -- because there are TWO independent
+     * defences and this build exists to test the second one.
+     *
+     * A shared granule is the one DECLARED EXCEPTION to isolation in this
+     * whole component: one range readable by both partitions and writable by
+     * exactly one.  Its read-only half's passing condition is the ABSENCE of
+     * a successful write, and an absence nobody has seen turn into a
+     * presence is not evidence of anything.
+     *
+     * THE FIRST DEFENCE IS THE VALIDATOR, and it is why this edit cannot go
+     * where the other negative builds' edits go.  zx_manifest_shared_check
+     * requires the non-publisher's copy of a shared range to be read-only,
+     * so a manifest declaring it writable is REFUSED before a single region
+     * is programmed -- which was the first version of this build, and it
+     * reported the validator refusing the manifest rather than the access
+     * being permitted.  That is a real result and a good one; it is simply
+     * a test of a different check.
+     *
+     * THE SECOND IS THE HARDWARE, and reaching it means handing the region
+     * programmer a descriptor the validator never saw.  What that then
+     * demonstrates is the sharp end of the claim: the write SURVIVES, so
+     * the run must fail -- and the two DFSC values the positive check rests
+     * on, a region MISS against a region PERMISSION failure, are what
+     * separate "read-only" from "not mapped here at all".
+     *
+     * ONLY THE PERMISSION CHANGES.  The range, the attributes and the
+     * declared publisher stay exactly as validated, so nothing else in the
+     * run moves and the one thing that can catch this is the access.  */
+
+    zx_console_puts("\n  SHARED-WRITABLE BUILD: the READER's copy of the\n"
+                    "  shared granule is being given write permission AFTER\n"
+                    "  the validator passed a manifest that said read-only.\n"
+                    "  Partition B's publish must then SURVIVE and this run\n"
+                    "  must report FAILED.\n");
+
+    zx_regions_b[ZX_PART_REGION_SHARED].zx_region_ap = ZX_AP_EL2_RW_GUEST_RW;
+
+#endif
 
     /* ---------------------------------------------------------------- */
     /*  The plan.                                                      */

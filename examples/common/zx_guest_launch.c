@@ -245,6 +245,123 @@ void zx_guest_hand_over(const ZX_GUEST_LAUNCH *launch_ptr,
     zx_guest_mailbox_write(launch_ptr, ZX_GD_VCT_NOW, 0U);
     zx_guest_mailbox_write(launch_ptr, ZX_GD_TICKS_NOW, 0U);
 
+    /* The third granule: the isolation matrix, and what a partition is
+       doing while its neighbour is being measured.
+     *
+       ZEROED HERE AND ASKED FOR SEPARATELY.  Every one of these is either
+       an address only the hypervisor can supply or a report only the guest
+       can make, and none belongs in this function's argument list: a
+       handover taking eight more addresses would be a handover most images
+       passed eight zeroes to.  The regression image calls
+       zx_guest_ask_for_matrix after this, and every other image simply
+       does not -- so a zero here is what "no sweep was asked for" means,
+       and the guest's own first test is that the case mask is non-zero.
+     *
+       ZERO IS THE RIGHT ABSENT VALUE FOR ALL OF THEM.  An address of zero
+       is refused by the sweep with ZX_MR_NO_ADDRESS rather than probed,
+       which matters: the alternative -- leaving whatever the copy put there
+       -- would have a guest reach for an address nobody chose and report a
+       fault nobody can attribute.  */
+
+    zx_guest_mailbox_write(launch_ptr, ZX_GD_M_CASES, 0U);
+    zx_guest_mailbox_write(launch_ptr, ZX_GD_M_NEIGHBOUR, 0U);
+    zx_guest_mailbox_write(launch_ptr, ZX_GD_M_NEIGHBOUR_CODE, 0U);
+    zx_guest_mailbox_write(launch_ptr, ZX_GD_M_HOLE, 0U);
+    zx_guest_mailbox_write(launch_ptr, ZX_GD_M_HYP_DATA, 0U);
+    zx_guest_mailbox_write(launch_ptr, ZX_GD_M_HYP_MMIO, 0U);
+    zx_guest_mailbox_write(launch_ptr, ZX_GD_M_MARK_BASE, 0U);
+    zx_guest_mailbox_write(launch_ptr, ZX_GD_M_MARK_COUNT, 0U);
+    zx_guest_mailbox_write(launch_ptr, ZX_GD_M_ATTEMPTED, 0U);
+    zx_guest_mailbox_write(launch_ptr, ZX_GD_M_REFUSED, 0U);
+    zx_guest_mailbox_write(launch_ptr, ZX_GD_M_RESUME, 0U);
+    zx_guest_mailbox_write(launch_ptr, ZX_GD_M_READ_VALUE, 0U);
+    zx_guest_mailbox_write(launch_ptr, ZX_GD_M_MARKS_WRITTEN, 0U);
+    zx_guest_mailbox_write(launch_ptr, ZX_GD_M_MARKS_OK, 0U);
+    zx_guest_mailbox_write(launch_ptr, ZX_GD_M_BEHAVIOUR, ZX_GB_QUIET);
+    zx_guest_mailbox_write(launch_ptr, ZX_GD_M_PHASE_SEEN, 0U);
+
+    __asm__ volatile("dsb" ::: "memory");
+}
+
+
+/**************************************************************************/
+/*  zx_guest_ask_for_matrix -- the isolation sweep, described.            */
+/*                                                                        */
+/*  SEPARATE FROM THE HANDOVER, and deliberately.  Only one image asks     */
+/*  for a sweep; folding six addresses into zx_guest_hand_over would make  */
+/*  every other image pass six zeroes to say it did not want one, and a    */
+/*  parameter that is zero at almost every call site is a parameter nobody */
+/*  reads.  Called after the handover, which has already zeroed all of     */
+/*  these, so the words this does not set stay absent rather than stale.   */
+/*                                                                        */
+/*  A DSB AT THE END, because the guest is ERETed into after this and the  */
+/*  first thing its sweep does is read these words.  The hypervisor's own  */
+/*  caches are off, so this is currently redundant -- and it is here       */
+/*  anyway, for the same reason the loader's cache maintenance is: the     */
+/*  change that turns caches on will be made by somebody with no reason to */
+/*  think about a mailbox.                                                 */
+/**************************************************************************/
+
+void zx_guest_ask_for_matrix(const ZX_GUEST_LAUNCH *launch_ptr,
+                             const ZX_GUEST_MATRIX *matrix_ptr)
+{
+    if ((launch_ptr == (const ZX_GUEST_LAUNCH *)0)
+        || (matrix_ptr == (const ZX_GUEST_MATRIX *)0))
+    {
+        return;
+    }
+
+    zx_guest_mailbox_write(launch_ptr, ZX_GD_M_NEIGHBOUR,
+                           matrix_ptr->zx_matrix_neighbour);
+    zx_guest_mailbox_write(launch_ptr, ZX_GD_M_NEIGHBOUR_CODE,
+                           matrix_ptr->zx_matrix_neighbour_code);
+    zx_guest_mailbox_write(launch_ptr, ZX_GD_M_HOLE,
+                           matrix_ptr->zx_matrix_hole);
+    zx_guest_mailbox_write(launch_ptr, ZX_GD_M_HYP_DATA,
+                           matrix_ptr->zx_matrix_hyp_data);
+    zx_guest_mailbox_write(launch_ptr, ZX_GD_M_HYP_MMIO,
+                           matrix_ptr->zx_matrix_hyp_mmio);
+    zx_guest_mailbox_write(launch_ptr, ZX_GD_M_MARK_BASE,
+                           matrix_ptr->zx_matrix_mark_base);
+    zx_guest_mailbox_write(launch_ptr, ZX_GD_M_MARK_COUNT,
+                           matrix_ptr->zx_matrix_mark_count);
+
+    /* THE CASE MASK LAST, and it is the only word whose order matters.  It
+       is what the guest tests before it reads any of the others, so writing
+       it first would leave a window -- if a partition somehow ran between
+       the two -- in which the sweep was asked for and its addresses were
+       still zero.  Nothing can run between them today; the ordering costs
+       one line and removes the question.  */
+
+    zx_guest_mailbox_write(launch_ptr, ZX_GD_M_CASES,
+                           matrix_ptr->zx_matrix_cases);
+
+    __asm__ volatile("dsb" ::: "memory");
+}
+
+
+/**************************************************************************/
+/*  zx_guest_set_behaviour -- what an untrusted partition does next.      */
+/*                                                                        */
+/*  ONE WORD, RE-READ BY THE GUEST ON EVERY ITERATION of its endless       */
+/*  phase, which is what lets one run put a partition through every row of */
+/*  the determinism table while its neighbour is measured continuously.    */
+/*  Six builds would have been the obvious shape and it is the weaker one: */
+/*  comparing the critical partition's period across six runs compares     */
+/*  RUNS, and a difference between two runs has a dozen explanations a     */
+/*  difference between two phases of one run does not.                     */
+/**************************************************************************/
+
+void zx_guest_set_behaviour(const ZX_GUEST_LAUNCH *launch_ptr,
+                            uint32_t behaviour)
+{
+    if (launch_ptr == (const ZX_GUEST_LAUNCH *)0)
+    {
+        return;
+    }
+
+    zx_guest_mailbox_write(launch_ptr, ZX_GD_M_BEHAVIOUR, behaviour);
+
     __asm__ volatile("dsb" ::: "memory");
 }
 

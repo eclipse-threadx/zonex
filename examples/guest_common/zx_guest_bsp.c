@@ -690,22 +690,33 @@ static unsigned int within(unsigned long address, const char *base,
 }
 
 
-unsigned int guest_grant_probe_region(unsigned long target)
+static unsigned int guest_covers(unsigned long target)
 {
-    unsigned long granule_base = target & GRANULE_MASK;
-
     if (within(target, zx_guest_mailbox,
                &zx_guest_mailbox[ZX_GD_WINDOW_SIZE]) != 0U)
     {
-        return 0U;
+        return 1U;
     }
 
     if (within(target, __zx_guest_code_start, __zx_guest_code_end) != 0U)
     {
-        return 0U;
+        return 1U;
     }
 
     if (within(target, __zx_guest_data_start, __zx_guest_window_end) != 0U)
+    {
+        return 1U;
+    }
+
+    return 0U;
+}
+
+
+unsigned int guest_grant_probe_region(unsigned long target)
+{
+    unsigned long granule_base = target & GRANULE_MASK;
+
+    if (guest_covers(target) != 0U)
     {
         return 0U;
     }
@@ -725,6 +736,117 @@ unsigned int guest_grant_probe_region(unsigned long target)
     __asm__ volatile("isb" ::: "memory");
 
     return 1U;
+}
+
+
+/**************************************************************************/
+/*  guest_grant_scratch_region / guest_release_scratch_region             */
+/*                                                                        */
+/*  ONE region, reprogrammed per case.  The rationale is in               */
+/*  zx_guest_bsp.h; what matters here is the two properties that make it   */
+/*  safe to reuse.                                                        */
+/*                                                                        */
+/*  IT IS CLAIMED ONCE AND KEPT.  The index is allocated on the first      */
+/*  call and never released back into guest_mpu_regions_used, so a later   */
+/*  guest_grant_probe_region cannot be handed the same index and end up    */
+/*  with two enabled regions on one address -- which is CONSTRAINED        */
+/*  UNPREDICTABLE and aborts on the S32Z280.  Reuse WITHIN the scratch     */
+/*  region is safe for the same reason it is cheap: there is only ever one */
+/*  of it, and reprogramming a region is not the same as adding one.       */
+/*                                                                        */
+/*  AND IT IS DISABLED WHEN THE SWEEP ENDS.  A grant left standing is a    */
+/*  partition carrying a stage-1 permission the manifest never gave it     */
+/*  into every window that follows, which would make every later claim in  */
+/*  the run about a machine in a state nobody described.                   */
+/**************************************************************************/
+
+static unsigned int guest_scratch_index;
+static unsigned int guest_scratch_claimed;
+
+unsigned int guest_grant_scratch_region(unsigned long target,
+                                        unsigned int executable)
+{
+    unsigned long granule_base = target & GRANULE_MASK;
+
+    if (guest_covers(target) != 0U)
+    {
+        return ZX_GRANT_ALREADY;
+    }
+
+    if (guest_scratch_claimed == 0U)
+    {
+        if (guest_mpu_region_count() <= guest_mpu_regions_used)
+        {
+            return ZX_GRANT_NO_REGION;
+        }
+
+        guest_scratch_index = guest_mpu_regions_used;
+        guest_mpu_regions_used++;
+        guest_scratch_claimed = 1U;
+    }
+
+    /* EXECUTABLE MEANS READ-ONLY AS WELL, and that pairing is forced rather
+       than chosen.  A region that is both writable and executable at EL1 is
+       what the linker's own RWX warning exists to complain about, and the
+       execute case does not need to write -- it needs to BRANCH.  Asking
+       for both would widen the grant past what the case demonstrates.  */
+
+    program_region(guest_scratch_index, granule_base, granule_base + 63UL,
+                   (executable != 0U) ? EL1_AP_PRIV_RO : EL1_AP_PRIV_RW,
+                   (executable != 0U) ? 0UL : 1UL,
+                   ATTR_NORMAL_WB);
+
+    __asm__ volatile("dsb" ::: "memory");
+    __asm__ volatile("isb" ::: "memory");
+
+    return ZX_GRANT_PROGRAMMED;
+}
+
+
+unsigned int guest_owns_range(unsigned long base, unsigned long size)
+{
+    unsigned long low  = (unsigned long)(unsigned char *)__zx_guest_data_start;
+    unsigned long high = (unsigned long)(unsigned char *)__zx_guest_window_end;
+
+    /* The FREELY WRITABLE part, which starts at .data and not at the window
+       base.  The mailbox and the code are inside the window and inside the
+       guest's own regions, and marking either would corrupt the report or
+       the program producing it.  */
+
+    if ((base < low) || (size == 0UL))
+    {
+        return 0U;
+    }
+
+    /* Written as a subtraction against the top rather than as base + size,
+       because base + size on a range at the end of the address space wraps
+       and the comparison then passes.  No window is there today; a check
+       that only works for windows below 4 GB minus a bit is not a check.  */
+
+    if (size > (high - base))
+    {
+        return 0U;
+    }
+
+    return 1U;
+}
+
+
+void guest_release_scratch_region(void)
+{
+    unsigned long zero = 0UL;
+
+    if (guest_scratch_claimed == 0U)
+    {
+        return;
+    }
+
+    __asm__ volatile("mcr p15, 0, %0, c6, c2, 1"
+                     : : "r"((unsigned long)guest_scratch_index));
+    __asm__ volatile("isb");
+    __asm__ volatile("mcr p15, 0, %0, c6, c3, 1" : : "r"(zero));  /* EN=0 */
+    __asm__ volatile("isb");
+    __asm__ volatile("dsb" ::: "memory");
 }
 
 
@@ -892,6 +1014,12 @@ unsigned long guest_mailbox_read(unsigned long offset)
 void guest_mailbox_write(unsigned long offset, unsigned long value)
 {
     *mailbox_word(offset) = value;
+}
+
+
+volatile unsigned long *guest_mailbox_slot(unsigned long offset)
+{
+    return mailbox_word(offset);
 }
 
 

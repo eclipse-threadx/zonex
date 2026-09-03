@@ -283,18 +283,24 @@ SECTIONS
        check would then be reading past the end of the section, which is
        the out-of-bounds read this assert exists to prevent.
 
-       0x90 is ZX_GUEST_IMAGE_OFF_MAGIC + 4, from
+       0xD0 is ZX_GUEST_IMAGE_MIN_SIZE, from
        examples/common/zx_guest_abi.h.  A linker script cannot include a C
        header, so the number is restated here -- and it is restated WRONG
        the moment the header moves, which is exactly what happened when the
        mailbox grew to two granules and pushed the entry branch and the
        header from 0x40 to 0x80.  The bound stayed at 0x50, so a blob of
        0x51 to 0x8F bytes linked cleanly and the magic check read past the
-       section into whatever followed it.  */
+       section into whatever followed it.
+       The mailbox has since grown a THIRD granule, for the isolation
+       matrix, which moved the header again -- to 0xCC, so the bound is
+       0xD0.  The header end is a NAMED constant now, ZX_GUEST_IMAGE_MIN_
+       SIZE, for exactly this reason: four scripts restating a literal is
+       four chances to leave one behind, and last time all four were left
+       behind together.  */
 
-    ASSERT((__zx_guest_a_blob_end - __zx_guest_a_blob_start) >= 0x90,
+    ASSERT((__zx_guest_a_blob_end - __zx_guest_a_blob_start) >= 0xD0,
            "guest A's embedded image is empty or too small to carry its header")
-    ASSERT((__zx_guest_b_blob_end - __zx_guest_b_blob_start) >= 0x90,
+    ASSERT((__zx_guest_b_blob_end - __zx_guest_b_blob_start) >= 0xD0,
            "guest B's embedded image is empty or too small to carry its header")
 
     ASSERT((__zx_guest_a_blob_end - __zx_guest_a_blob_start)

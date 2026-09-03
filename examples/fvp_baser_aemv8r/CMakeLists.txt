@@ -152,6 +152,22 @@ target_compile_definitions(zx_probe_overlap.elf PRIVATE ZX_PROBE_MANIFEST_OVERLA
 zx_add_fvp_probe(zx_probe_badattr.elf)
 target_compile_definitions(zx_probe_badattr.elf PRIVATE ZX_PROBE_BAD_ATTR)
 
+# THE SHARED GRANULE'S READ-ONLY HALF, BROKEN.  The reader's copy of the
+# shared range is given write permission, so its attempt to publish must
+# SURVIVE and the run must report FAILED.
+#
+# A shared granule is the one DECLARED EXCEPTION to isolation in this
+# component -- one range readable by both partitions and writable by one --
+# which makes it the place where "the check can fail" is least optional.  Its
+# passing condition is the ABSENCE of a successful write, and an absence
+# nobody has seen turn into a presence is not evidence of anything.
+#
+# Only the PERMISSION field changes.  The range, the attributes and the
+# declared publisher are untouched, so the manifest validator has nothing to
+# object to and the only thing that can catch it is the access itself.
+zx_add_fvp_probe(zx_probe_shared_rw.elf)
+target_compile_definitions(zx_probe_shared_rw.elf PRIVATE ZX_PROBE_SHARED_RW)
+
 ###############################################################################
 # The ThreadX guest, and the image that launches it
 ###############################################################################
@@ -449,6 +465,7 @@ if(ZX_THREADX_SOURCE_DIR)
     function(zx_add_two_partitions target_name)
         add_executable(${target_name} EXCLUDE_FROM_ALL
             ${ZX_COMMON_DIR}/zx_two_partitions.c
+            ${ZX_COMMON_DIR}/zx_frame_setup.c
             ${ZX_COMMON_DIR}/zx_guest_launch.c
             ${ZX_COMMON_DIR}/zx_report.c
             ${ZX_COMMON_DIR}/zx_guest_image.S
@@ -530,6 +547,164 @@ if(ZX_THREADX_SOURCE_DIR)
     zx_add_two_partitions(zx_two_partitions_cross.elf)
     target_compile_definitions(zx_two_partitions_cross.elf PRIVATE ZX_TWO_CROSS)
 
+    ###########################################################################
+    # THE ISOLATION AND DETERMINISM REGRESSION
+    ###########################################################################
+    #
+    # The image the whole of this phase exists to produce: proof that neither
+    # partition can reach the other's memory, the ungranted granule next door
+    # to its own, or the hypervisor's -- and that the critical partition's
+    # timing is unaffected by anything the untrusted one does.
+    #
+    # IT IS A SEPARATE PROGRAM FROM zx_two_partitions.elf AND SHARES
+    # EVERYTHING UNDER IT: the same loader, the same frame driver, the same
+    # guest blobs, the same linker script and the same two windows.  What
+    # differs is that this one ASSERTS where that one DEMONSTRATES -- sixty
+    # major frames instead of twenty, because a maximum over ten periods is
+    # not a maximum; the test-only fault-continue mode, which that image must
+    # not have; and a matrix rather than a narrative for output.
+    #
+    # A regression built on a different foundation from the demonstration
+    # would be a regression for a different hypervisor.
+    function(zx_add_regression target_name)
+        add_executable(${target_name} EXCLUDE_FROM_ALL
+            ${ZX_COMMON_DIR}/zx_regression.c
+            ${ZX_COMMON_DIR}/zx_frame_setup.c
+            ${ZX_COMMON_DIR}/zx_guest_launch.c
+            ${ZX_COMMON_DIR}/zx_report.c
+            ${ZX_COMMON_DIR}/zx_guest_image.S
+            ${ZX_FVP_DIR}/zx_board.c
+        )
+
+        add_dependencies(${target_name} zx_guest_a zx_guest_b)
+
+        target_include_directories(${target_name} PRIVATE
+            ${ZX_FVP_DIR}
+            ${ZX_COMMON_DIR}
+        )
+
+        set_source_files_properties(${ZX_COMMON_DIR}/zx_guest_image.S
+            PROPERTIES
+                COMPILE_OPTIONS
+                    "-Wa,-I${ZX_GUEST_A_BUILD};-Wa,-I${ZX_GUEST_B_BUILD};-DZX_GUEST_B_BLOB"
+                OBJECT_DEPENDS  "${ZX_GUEST_A_BLOB};${ZX_GUEST_B_BLOB}"
+                TARGET_DIRECTORY ${target_name}
+        )
+
+        target_link_libraries(${target_name} PRIVATE
+            eclipse-threadx::zonex
+            zonex::warnings
+        )
+
+        target_link_options(${target_name} PRIVATE
+            -T${ZX_FVP_DIR}/zx_two_partitions.lds
+            -nostartfiles
+            -Wl,-Map=${target_name}.map
+            ${ZX_LINK_QUIET_RWX}
+        )
+
+        set_target_properties(${target_name} PROPERTIES
+            LINK_DEPENDS ${ZX_FVP_DIR}/zx_two_partitions.lds
+        )
+    endfunction()
+
+    # THE REGRESSION ITSELF, and it must pass.  ZX_TEST_FAULT_CONTINUE is what
+    # lets one image sweep fourteen violation cases: without it the first case
+    # a partition attempts ends its excursion, and the matrix would need
+    # fourteen images and fourteen runs -- which on silicon is most of a
+    # working day and on a functional model is minutes of simulation per case.
+    #
+    # THE OPTION IS SET HERE AND NOWHERE ELSE IN THIS FILE.  Every other image
+    # in the suite is built without it, which is the whole basis for saying the
+    # shipping policy is halt: it is not a claim about a default, it is a claim
+    # about which single target carries the definition.
+    zx_add_regression(zx_regression.elf)
+    target_compile_definitions(zx_regression.elf PRIVATE ZX_TEST_FAULT_CONTINUE)
+
+    # HALT ON FAULT -- THE SHIPPING POLICY, TESTED RATHER THAN ASSUMED, and it
+    # must PASS because halting is the correct outcome.
+    #
+    # The same image without the continue option, asking each partition for
+    # ONE case.  What it proves is the constraint that makes the continue mode
+    # acceptable at all: a build without the definition stops a partition on
+    # its first violation, records which partition and which address, and
+    # still reaches a verdict.  Without this build, "the shipping default is
+    # halt" would be a claim about a path no automated run had ever taken.
+    #
+    # It is also fast: both partitions are stopped within the first couple of
+    # frames, so the run ends long before the frame limit.
+    zx_add_regression(zx_regression_halt.elf)
+    target_compile_definitions(zx_regression_halt.elf PRIVATE
+                               ZX_REGRESSION_HALT_ONLY)
+
+    # THE TWO NEGATIVE VERIFICATIONS, and they break different halves of the
+    # deliverable.  Each must report FAILED; each starting to PASS means the
+    # check it was built to violate has stopped detecting the violation, which
+    # makes the corresponding positive row evidence of nothing.
+
+    # A REGION LIMIT ONE GRANULE TOO GENEROUS -- the most valuable negative
+    # build in the suite, because it is the one whose absence would leave a
+    # plausible defect undetectable.  Partition A's window is stretched to
+    # swallow the ungranted granule immediately after it, so the adjacent-
+    # granule case must SURVIVE and the poison in that granule must be gone.
+    #
+    # Without it, a green run of that case shows only that the hole's address
+    # faults -- not that the limit is EXACT.  And a limit one granule too wide
+    # is the defect class that otherwise reads as a working system, because
+    # everything a partition legitimately touches still works.
+    #
+    # One granule and not a kilobyte: a wildly wrong limit would be caught by
+    # the manifest validator's own overlap rule, which would test the
+    # validator rather than the region programming.
+    zx_add_regression(zx_regression_widened.elf)
+    target_compile_definitions(zx_regression_widened.elf PRIVATE
+                               ZX_TEST_FAULT_CONTINUE ZX_REGRESSION_WIDENED)
+
+    # THE TIME FREEZE REMOVED.  Neither partition's virtual clock is frozen
+    # while it is descheduled, so each sees wall clock rather than its own
+    # windows -- and the critical partition's own tick count then depends on
+    # how long its neighbour spent on the core.
+    #
+    # IT BREAKS THE GUEST-SIDE HALF AND LEAVES THE HYPERVISOR-SIDE HALF
+    # INTACT, which is exactly why it is worth a build.  A's window PERIOD is
+    # still one frame -- the schedule is untouched -- so a regression that
+    # measured only the period would stay green.  What moves is A's own ticks
+    # per phase, and this build is the proof that the check on them can fail.
+    zx_add_regression(zx_regression_no_freeze.elf)
+    target_compile_definitions(zx_regression_no_freeze.elf PRIVATE
+                               ZX_TEST_FAULT_CONTINUE ZX_REGRESSION_NO_FREEZE)
+
+    # TEN TIMES LONGER, AND NOT REGISTERED WITH CTest.
+    #
+    # One question, asked once: does the critical partition's MAXIMUM period
+    # stop moving?  A regression that asserted a bound over sixty frames
+    # without ever having looked at six hundred would be asserting that its
+    # own sample was large enough, which is the thing in question.
+    #
+    # Not in the suite because sixty seconds of silicon is cheap and ten
+    # minutes of a functional model on every pull request is not.  Run it by
+    # hand -- on the board -- and record whether the maximum changed.
+    # AND THE REFUSAL PATH, which must FAIL.  The hypervisor's own timer PPI
+    # is deliberately left disabled at the GIC: the comparator still expires
+    # and the controller is simply never told, so no window can end.
+    #
+    # THE POINT IS THAT THIS IS A VERDICT AND NOT A HANG.  A frame started in
+    # that state runs its first partition until something outside the image
+    # stops it, and the log ends mid-sentence with nothing to point at -- the
+    # least informative outcome this suite can produce.  The regression
+    # refuses to start such a frame, and this build is the only one that
+    # reaches the refusal, because a branch nothing has ever taken is not
+    # evidence that it works.
+    #
+    # It is also the cheapest run in the suite: it stops before the frame.
+    zx_add_regression(zx_regression_no_tick.elf)
+    target_compile_definitions(zx_regression_no_tick.elf PRIVATE
+                               ZX_REGRESSION_NO_TICK)
+
+    zx_add_regression(zx_regression_long.elf)
+    target_compile_definitions(zx_regression_long.elf PRIVATE
+                               ZX_TEST_FAULT_CONTINUE ZX_REGRESSION_LONG)
+
     # And two overlapping windows, which the validator must refuse BY NAME
     # before a single region is programmed.  Two enabled regions on one
     # address is CONSTRAINED UNPREDICTABLE and aborts on the S32Z280, so
@@ -590,7 +765,7 @@ if(ZX_FVP_BASER_AEMV8R)
         # rule as above: each must report FAILED, and each starting to PASS
         # means the check it was built to violate has stopped detecting the
         # violation.
-        foreach(zx_negative widened overlap badattr)
+        foreach(zx_negative widened overlap badattr shared_rw)
             add_test(NAME zx-fvp-probe-${zx_negative}
                      COMMAND ${Python3_EXECUTABLE} ${ZX_FVP_RUNNER}
                              --elf $<TARGET_FILE:zx_probe_${zx_negative}.elf>
@@ -669,6 +844,57 @@ if(ZX_FVP_BASER_AEMV8R)
                                  --timeout 600
                                  --expect fail)
             endforeach()
+
+            # THE ISOLATION AND DETERMINISM REGRESSION.  Two that must pass and
+            # two that must fail.
+            #
+            # The timeout is generous because this image runs SIXTY major
+            # frames of simulated time with two kernels ticking through them,
+            # against the demonstration image's twenty -- sixty is what it
+            # takes for a maximum period per phase to be a maximum rather than
+            # a coin toss.  A timeout that had to be guessed is one that
+            # eventually fires on somebody's slower machine and is read as a
+            # hang, so it is set with room rather than trimmed to the run.
+            add_test(NAME zx-fvp-regression
+                     COMMAND ${Python3_EXECUTABLE} ${ZX_FVP_RUNNER}
+                             --elf $<TARGET_FILE:zx_regression.elf>
+                             --fvp ${ZX_FVP_BASER_AEMV8R}
+                             --timeout 1200)
+
+            # HALT ON FAULT, and it must PASS: halting is the correct outcome.
+            # Fast, because both partitions are stopped within the first
+            # frames and the run ends long before the frame limit.
+            add_test(NAME zx-fvp-regression-halt
+                     COMMAND ${Python3_EXECUTABLE} ${ZX_FVP_RUNNER}
+                             --elf $<TARGET_FILE:zx_regression_halt.elf>
+                             --fvp ${ZX_FVP_BASER_AEMV8R}
+                             --timeout 600)
+
+            # And the two negative verifications.  Each must report FAILED;
+            # each starting to PASS means the check it was built to violate
+            # has stopped detecting the violation, which makes the
+            # corresponding positive row evidence of nothing.
+            foreach(zx_negative widened no_freeze no_tick)
+                add_test(NAME zx-fvp-regression-${zx_negative}
+                         COMMAND ${Python3_EXECUTABLE} ${ZX_FVP_RUNNER}
+                                 --elf $<TARGET_FILE:zx_regression_${zx_negative}.elf>
+                                 --fvp ${ZX_FVP_BASER_AEMV8R}
+                                 --timeout 1200
+                                 --expect fail)
+            endforeach()
+
+            add_custom_target(zx-run-regression
+                COMMAND ${ZX_FVP_BASER_AEMV8R}
+                        -C cluster0.NUM_CORES=1
+                        -C bp.vis.disable_visualisation=1
+                        -C bp.terminal_0.start_telnet=0
+                        -C bp.pl011_uart0.out_file=-
+                        -C bp.pl011_uart0.unbuffered_output=1
+                        -a $<TARGET_FILE:zx_regression.elf>
+                DEPENDS zx_regression.elf
+                USES_TERMINAL
+                COMMENT "Running the ZoneX isolation and determinism regression on FVP_BaseR_AEMv8R..."
+            )
 
             add_custom_target(zx-run-two-partitions
                 COMMAND ${ZX_FVP_BASER_AEMV8R}

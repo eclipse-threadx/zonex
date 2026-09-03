@@ -35,6 +35,23 @@ taken from a manifest — on the Armv8-R AEM FVP and on the S32Z280-594EVB.
 Partition A holds seven ticks of every ten and partition B three, and each
 partition's clock advances by its own windows and by nothing else.
 
+**And that is now asserted rather than shown.** A regression sweeps fourteen
+isolation cases in one run — seven in each direction, each aimed at an address
+of its own — and measures the critical partition's window period continuously
+while the untrusted one is steered through five behaviours: idle, computing,
+computing with its own interrupts masked, storming the console, and violating
+its boundary on every iteration of its own loop. On the board A's period is
+800,000 counter counts and moves by **nine** counts while its neighbour idles,
+**fifteen** while it computes with interrupts masked, and **sixty-nine** while
+it commits a hundred and seventeen thousand boundary violations.
+
+Nothing a partition does *through the schedule* reaches its neighbour. One
+thing does, and it is the hypervisor's own doing: a guest's console is one
+hypercall per character through a polled UART, and a window that ends with a
+partial line has that line closed by the boundary handler — which delays the
+next partition's entry by 24,000 counts. It is measured, bounded by one line
+of output, and the fix is to buffer the console off that path.
+
 Three results, and these are mechanisms rather than measurements — they do not
 move when the numbers below do:
 
@@ -64,12 +81,18 @@ percentage. This one is a ratio of two readings of the system counter, whose
 frequency was established three independent ways, so it does not depend on the
 core clock, the caches or the optimisation level.
 
-**And one measurement, which will change.** A partition switch costs
-**5,672 / 5,715 / 5,862 cycles** min / mean / max on the S32Z280, and the
-guest's own EL1 MPU is 85% of it — on both a 32-region model and a 20-region
-part. A switch is not expensive because the hypervisor does much; its
-per-partition state is three register writes. It is expensive because a guest
-has a lot of registers.
+**And one measurement, which will change.** A partition switch costs **about
+6,000 cycles** on the S32Z280 — 6,030 / 6,078 / 6,370 min / mean / max on the
+most recent run — and the guest's own EL1 MPU is 85% of it, on both a
+32-region model and a 20-region part. A switch is not expensive because the
+hypervisor does much; its per-partition state is three register writes. It is
+expensive because a guest has a lot of registers.
+
+**Read that as ±4%, not as four significant figures.** The same code
+re-measured a day later, on the same bench, reads 3% higher — and the two
+reasons below are why: with no caches the cost depends on where the code sits
+in memory, so an unrelated change elsewhere in the hypervisor moves it, and
+the oscillator the core runs on drifts with temperature.
 
 Expect that figure to move, and to move for reasons already known. The EL2
 caches are off and the image is built `-Og`, which makes it an over-estimate.
@@ -90,16 +113,19 @@ polled-UART write and a product switch has no console in it, and boundaries
 that had to wait out a stopped partition's window, because a switch plus a
 wait is neither.
 
-`examples/` holds four experiments, each a separate image: the stage-2 probe,
+`examples/` holds five experiments, each a separate image: the stage-2 probe,
 one ThreadX guest confined by stage 2, one preempted by a timer of its own,
-and two under a frame. Run them with `scripts/test_fvp.sh` on the model, or
+two under a frame, and the isolation and determinism regression. Run them with
+`scripts/test_fvp.sh` on the model, or
 `examples/s32z280_evb/tools/run_zx_probe.sh` on the board.
 
 **The suite includes builds that must fail, registered as such**, because a
 check that has never been seen to fail is not evidence that it can: a
 violation aimed at an address the payload *is* granted, an image told it needs
-more MPU regions than exist, a manifest whose two windows overlap, and a
-hypervisor whose own tick cannot be delivered.
+more MPU regions than exist, a manifest whose two windows overlap, a
+hypervisor whose own tick cannot be delivered, a region limit one granule too
+generous, the per-partition time freeze removed, and a shared read-only
+granule its reader may write.
 
 Along the way it settled several things about this architecture that the
 Cortex-R52 TRM describes ambiguously, contradicts itself about, or states

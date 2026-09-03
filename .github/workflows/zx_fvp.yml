@@ -30,12 +30,13 @@ name: zx_fvp
 # repository-variable arrangement for the model, because Arm has no stable
 # unauthenticated download URL for it.
 #
-# WHAT IT RUNS.  Two families of image, and every one of them through CTest.
+# WHAT IT RUNS.  Five families of image, and every one of them through CTest.
 #
 # The stage-2 probes: zx_probe.elf, which must PASS, plus builds of the same
 # image that must FAIL -- a violation aimed at an address the payload is
 # granted, a region budget claimed larger than any implementation has, a window
-# widened by one granule, an overlapping manifest, and an unwritten MAIR index.
+# widened by one granule, an overlapping manifest, an unwritten MAIR index, and
+# a shared read-only granule given write permission to its READER.
 #
 # The one-partition images: a REAL ThreadX kernel booting at EL1 inside a
 # stage-2 confined partition, one build that stops it at its stage-2 boundary,
@@ -48,6 +49,25 @@ name: zx_fvp
 # under stage 2 -- plus two builds that must FAIL, one with the partition's
 # interrupt left disabled in a frame the guest cannot reach, and one where the
 # hypervisor does not give the partition back the time it spent descheduled.
+#
+# The two-partition images: two ThreadX kernels time-sharing one core under a
+# static major frame, a HOSTILE build in which one of them masks its own
+# interrupts and spins for ever and must be preempted anyway, a cross-partition
+# build in which one reaches into the other's window and is stopped while its
+# neighbour runs to the end of the frame untouched -- plus two that must FAIL.
+#
+# AND THE ISOLATION AND DETERMINISM REGRESSION, which is what this whole phase
+# exists to produce: fourteen violation cases swept in one run, seven in each
+# direction, each aimed at an address of its own; the critical partition's
+# window period measured continuously while the untrusted one is steered
+# through five behaviours; a build without the test-only continue mode that
+# must halt on its first violation, which is how the SHIPPING fault policy is
+# tested rather than assumed; and two builds that must FAIL -- a region limit
+# one granule too generous, and the per-partition time freeze removed.
+#
+# It is the slowest lane here by a wide margin and that is deliberate: sixty
+# major frames of simulated time with two kernels ticking through them, because
+# a maximum period taken over ten periods is not a maximum.
 #
 # The builds that must fail are registered with the runner's "--expect fail",
 # because a check that has never been seen to fail is not evidence that it can.
@@ -317,7 +337,7 @@ jobs:
         # it would mean half this suite quietly stopped running.  The stage-2
         # probes would still be green, and nothing would say that a real
         # kernel had not been booted at all.
-        if ! echo "$images" | grep -qE '^zx_(one_partition|preemptive)\.elf$'; then
+        if ! echo "$images" | grep -qE '^zx_(one_partition|preemptive|regression)\.elf$'; then
           echo "::error::The ThreadX guest images were not built. ZX_THREADX_SOURCE_DIR did not reach CMake, so no real kernel was booted and half this suite did not run."
           {
             echo "### ZoneX FVP execution: NO GUEST IMAGES"
@@ -329,12 +349,20 @@ jobs:
           exit 1
         fi
 
-        # BOTH guest families, named separately.  The check above catches a
-        # missing ThreadX checkout, which removes them together; this one
+        # EVERY guest family, named separately.  The check above catches a
+        # missing ThreadX checkout, which removes them all together; this one
         # catches an image being dropped from the CMake graph on its own,
         # which would leave the suite green while a whole claim stopped being
         # tested.
-        for required in zx_one_partition.elf zx_preemptive.elf; do
+        #
+        # THE REGRESSION IS ON THIS LIST BECAUSE IT IS THE DELIVERABLE.  It is
+        # also the image most likely to be dropped by accident: it is the
+        # slowest lane by a wide margin, so it is the one somebody under time
+        # pressure would reach for -- and its absence would leave every
+        # isolation and determinism claim in this repository untested while
+        # twenty other lanes stayed green.
+        for required in zx_one_partition.elf zx_preemptive.elf \
+                        zx_two_partitions.elf zx_regression.elf; do
           if ! echo "$images" | grep -qx "$required"; then
             echo "::error::$required is not in the CMake graph, so the claim it carries is no longer being tested."
             {

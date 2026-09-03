@@ -104,19 +104,24 @@
     .arm
 
 /**************************************************************************/
-/*  The readback mailbox: two granules at the window base.                 */
+/*  The readback mailbox: three granules at the window base.               */
 /*                                                                        */
-/*  Thirty-two words of zero, in its own loaded section.  The hypervisor   */
+/*  Forty-eight words of zero, in its own loaded section.  The hypervisor  */
 /*  writes the handover fields into it after copying the image and reads    */
 /*  the reported ones out afterwards; stage-2 AP cannot deny EL2 access to  */
 /*  a partition's memory, which is what makes the mailbox free.            */
 /*                                                                        */
-/*  The second granule is what a guest with a timer of its own has to say,  */
-/*  and it costs nothing at stage 2 -- the partition window is one region   */
-/*  covering the whole of it.  It does cost the guest's stage-1 region for  */
-/*  the mailbox 64 more bytes, and it moves the entry branch, which is why  */
-/*  the offsets in zx_guest_abi.h and the ASSERTs in the guest's linker     */
-/*  script both name 0x80 rather than 0x40.                                */
+/*  The second granule is what a guest with a timer of its own has to say   */
+/*  and the third is the isolation matrix -- the addresses a partition is   */
+/*  asked to reach for, and what it attempted.  Neither costs anything at   */
+/*  stage 2: the partition window is one region covering the whole of it.   */
+/*  Each costs the guest's stage-1 region for the mailbox 64 more bytes,    */
+/*  and each MOVES THE ENTRY BRANCH, which is why the offsets in            */
+/*  zx_guest_abi.h and the ASSERTs in the guest's linker script now name    */
+/*  0xC0 rather than 0x80 or 0x40 -- and why the image header carries a     */
+/*  version the loader refuses on a mismatch.  The size is taken from       */
+/*  ZX_GD_WINDOW_SIZE rather than written out, so this section cannot be    */
+/*  the copy that was forgotten.                                           */
 /**************************************************************************/
 
     .section .zx_guest_mailbox, "aw", %progbits
@@ -168,9 +173,14 @@ zx_guest_entry:
 /*  So the guest declares it.  Three words the loader can check before it  */
 /*  ERETs anywhere:                                                       */
 /*                                                                        */
-/*    +0x44  the window base this image was linked for                    */
-/*    +0x48  the window size it was linked to fit                         */
-/*    +0x4C  a magic number saying it is a ZoneX guest at all             */
+/*    +4     the window base this image was linked for                    */
+/*    +8     the window size it was linked to fit                         */
+/*    +12    a magic number saying it is a ZoneX guest at all, AND which  */
+/*           version of this contract it was built against                */
+/*                                                                        */
+/*  Offsets from the entry branch rather than from the window base, so     */
+/*  that this comment does not have to be edited every time the mailbox    */
+/*  grows.  It has been edited twice for that reason already.             */
 /*                                                                        */
 /*  The magic earns its four bytes twice over: a window that was never     */
 /*  written reads as zero, and an .incbin whose input pattern matched      */
@@ -332,3 +342,84 @@ zx_guest_trap_pabt_hang:
 zx_guest_trap_irq:
     b       el1_irq_entry
     .size   zx_guest_trap_irq, . - zx_guest_trap_irq
+
+/**************************************************************************/
+/*  guest_branch_probe -- branch somewhere the guest must not be able to   */
+/*                        execute, and survive being refused.             */
+/*                                                                        */
+/*    unsigned long guest_branch_probe(unsigned long target,              */
+/*                                     volatile unsigned long *resume);   */
+/*                                                                        */
+/*  r0 = the address to branch to, r1 = where to publish the resume point. */
+/*  Returns 1 if the branch RETURNED, which on a correct run it does not.  */
+/*                                                                        */
+/*  WHY THIS IS ASSEMBLY AND NOT C.                                        */
+/*                                                                        */
+/*  The isolation matrix's execute case needs the address of the           */
+/*  instruction AFTER a branch, and it needs it as data, before the branch */
+/*  is taken.  C has no portable way to name that: taking the address of a */
+/*  label is a GNU extension, and ZoneX builds with extensions off and     */
+/*  -Wpedantic precisely so that a construct like that fails the build     */
+/*  rather than the port.  Four instructions of assembly is the honest     */
+/*  answer.                                                                */
+/*                                                                        */
+/*  WHY THE GUEST PUBLISHES THE RESUME POINT AT ALL.                       */
+/*                                                                        */
+/*  A stage-2 PREFETCH abort cannot be continued the way a data abort can. */
+/*  "Step over the faulting instruction" needs the instruction's length,   */
+/*  and there is no instruction: the fetch is what failed.  Resuming at    */
+/*  ELR + 4 would resume INSIDE the neighbour's window and fault again on  */
+/*  the next word, and again, for the rest of the window -- a partition    */
+/*  walking through its neighbour's code taking one exception per          */
+/*  instruction.                                                           */
+/*                                                                        */
+/*  So the guest names where it wants to be put back, and the hypervisor's */
+/*  test-only continue path uses that and nothing else.  If the word is    */
+/*  zero the hypervisor declines and stops the partition, which is the     */
+/*  shipping behaviour and the safe default.  The address is published     */
+/*  with a DSB in front of the branch so that it is visible to EL2 before  */
+/*  the fault it is for can be taken.                                      */
+/*                                                                        */
+/*  BLX RATHER THAN BX, so that a branch which WRONGLY SUCCEEDED comes     */
+/*  back here and is reported instead of running the neighbour's code with */
+/*  this guest's stack.  It should not be possible; a test whose failure    */
+/*  mode is "the other partition's kernel starts up underneath us" is not  */
+/*  a test worth the risk when one letter avoids it.                       */
+/**************************************************************************/
+
+    .section .zx_guest_head, "ax", %progbits
+    .balign 4
+    .global guest_branch_probe
+    .type   guest_branch_probe, %function
+guest_branch_probe:
+    push    {r4, lr}                    @ r4 is padding: AAPCS wants SP at 8
+
+    @ The resume point, published BEFORE the branch and with a DSB behind
+    @ it, so that EL2 can read it while handling the fault the branch is
+    @ about to take.  r0 is not touched: it is the target.
+
+    adr     r2, guest_branch_probe_back
+    str     r2, [r1]
+    dsb
+    isb
+
+    blx     r0                          @ must be REFUSED at stage 2
+
+    @ Reached only if the branch SUCCEEDED and the target returned, which
+    @ is a failure of the isolation claim rather than of this routine.
+
+    mov     r0, #1
+    b       guest_branch_probe_done
+
+    @ Where the hypervisor's continue path puts the partition back.  SP is
+    @ exactly where the push left it -- a prefetch abort disturbs nothing
+    @ -- so the pop below is balanced on this path too.
+
+    .global guest_branch_probe_back
+guest_branch_probe_back:
+    mov     r0, #0
+
+guest_branch_probe_done:
+    pop     {r4, lr}
+    bx      lr
+    .size   guest_branch_probe, . - guest_branch_probe

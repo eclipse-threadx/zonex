@@ -22,6 +22,7 @@ target_sources(zonex_port PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/src/zx_context.S
     ${CMAKE_CURRENT_LIST_DIR}/src/zx_cache.c
     ${CMAKE_CURRENT_LIST_DIR}/src/zx_context.c
+    ${CMAKE_CURRENT_LIST_DIR}/src/zx_fault_continue.c
     ${CMAKE_CURRENT_LIST_DIR}/src/zx_frame.c
     ${CMAKE_CURRENT_LIST_DIR}/src/zx_console.c
     ${CMAKE_CURRENT_LIST_DIR}/src/zx_el2_cpu.c

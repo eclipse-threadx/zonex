@@ -292,7 +292,9 @@
  * the mailbox goes from 64 bytes to 128, and NOTHING at stage 2 changes,
  * because the partition window is one region covering the whole of it.  It
  * does move the entry branch, which is why ZX_GUEST_IMAGE_OFF_ENTRY below is
- * 0x80 and the guest's linker script asserts it.
+ * a compile-time constant every linker script asserts.  (It has since grown
+ * a THIRD granule, for the isolation matrix; the note there says what that
+ * cost and why the alternative was refused a second time.)
  *
  * The alternative -- overloading words that a kernel guest happens not to use
  * -- was rejected after ZX_GD_OPTIONS.  One alias, with one reader at each
@@ -383,7 +385,190 @@
 #define ZX_GD_PROBE_SCRATCH         0x58U   /* written by the probe, read by
                                                nobody                       */
 
-#define ZX_GD_WINDOW_SIZE           0x80U
+/**************************************************************************/
+/*        THE THIRD GRANULE: the isolation matrix and the behaviour        */
+/**************************************************************************/
+
+/* WHY THE MAILBOX IS THREE GRANULES AND NOT TWO.
+ *
+ * The same reason it went from one to two, and the note above says what that
+ * cost: the guest's stage-1 MPU region for the mailbox grows by 64 bytes,
+ * NOTHING at stage 2 changes because the partition window is one region
+ * covering the whole of it, and the entry branch moves -- so
+ * ZX_GUEST_IMAGE_OFF_ENTRY is 0xC0 and every linker script asserts it.
+ *
+ * THE ALTERNATIVE WAS OVERLOADING, AND IT WAS REJECTED FOR THE SECOND TIME.
+ * Five words of the second granule were spare, and the matrix needs six from
+ * the hypervisor and six back.  Aliasing eleven words onto the spares and
+ * onto fields "a kernel guest happens not to use" is precisely the layout
+ * this file already refused to build once: one alias with one reader at each
+ * end is explicable, eleven is a map only its author can read.  Sixty-four
+ * bytes of a 256 KB window is the cheaper price.
+ *
+ * THE IMAGE MAGIC IS BUMPED WITH IT, which is what the note beside
+ * ZX_GUEST_IMAGE_MAGIC asked for and the first occasion to use it.  Moving
+ * the entry branch is an ABI change: a guest built against the old layout
+ * and loaded by a hypervisor expecting the new one would be ERETed into the
+ * middle of its own mailbox, which is a jump to whatever the handover last
+ * wrote there.  A version in the header turns that into a refusal naming
+ * both numbers.  */
+
+/* WHAT THE HYPERVISOR ASKS FOR.  Six addresses and a mask, because the
+ * matrix is "one address per case, one case per bit" and the address IS the
+ * case's name -- it is what the fault log is searched by afterwards.
+ *
+ * EVERY ADDRESS COMES FROM EL2 AND NOT FROM THE GUEST'S OWN LINKER, with one
+ * exception noted below, and that is the point rather than an inconvenience.
+ * A guest computing its neighbour's window from its own base would be a
+ * guest that had been TOLD the layout; a guest handed an address it cannot
+ * derive is a guest being asked to reach somewhere it has no business
+ * knowing about, which is the situation the isolation claim is about.  */
+
+#define ZX_GD_M_CASES               0x80U   /* EL2 writes: ZX_MC_* to run   */
+#define ZX_GD_M_NEIGHBOUR           0x84U   /* EL2: the other partition's
+                                               data, read AND written       */
+#define ZX_GD_M_NEIGHBOUR_CODE      0x88U   /* EL2: the other partition's
+                                               code, BRANCHED to            */
+#define ZX_GD_M_HOLE                0x8CU   /* EL2: the ungranted granule
+                                               ADJACENT to this window      */
+#define ZX_GD_M_HYP_DATA            0x90U   /* EL2: hypervisor .data/.bss   */
+#define ZX_GD_M_HYP_MMIO            0x94U   /* EL2: the console or the GIC  */
+#define ZX_GD_M_MARK_BASE           0x98U   /* EL2: first granule to mark   */
+#define ZX_GD_M_MARK_COUNT          0x9CU   /* EL2: how many to mark        */
+
+/* WHAT THE GUEST REPORTS BACK.
+ *
+ * NONE OF THESE IS A CLAIM THAT A CASE WAS DENIED, and that is deliberate to
+ * the point of being the most important thing in this block.
+ *
+ * Under the test-only continue mode the hypervisor resumes a faulting
+ * partition PAST the faulting instruction -- so the store that would have
+ * recorded "this case survived" executes anyway, one instruction later, on
+ * a case that was refused.  A guest cannot report its own denial: it is not
+ * conscious of having been denied.  Every "it faulted" judgement therefore
+ * belongs to EL2 and comes out of the fault log, matched by address.
+ *
+ * What the guest CAN say honestly is what it ATTEMPTED, which EL2 cannot
+ * know -- a case skipped because the guest refused it and a case denied by
+ * stage 2 both leave a hypervisor with no fault to look at, and only the
+ * guest can tell them apart.  That asymmetry is why both halves exist.  */
+
+#define ZX_GD_M_ATTEMPTED           0xA0U   /* guest: ZX_MC_* it tried      */
+#define ZX_GD_M_REFUSED             0xA4U   /* guest: ZX_MC_* it would not  */
+#define ZX_GD_M_RESUME              0xA8U   /* guest: where to put it back
+                                               after a failed BRANCH        */
+#define ZX_GD_M_READ_VALUE          0xACU   /* guest: what the read case
+                                               returned, poison if denied   */
+#define ZX_GD_M_MARKS_WRITTEN       0xB0U   /* guest: marks it wrote        */
+#define ZX_GD_M_MARKS_OK            0xB4U   /* guest: its own readback      */
+
+/* What a partition is doing while its neighbour is being measured.
+ *
+ * A WORD AND NOT A BUILD OPTION, and the reason is the whole shape of the
+ * determinism run.  Six behaviours as six images is six boots, six epochs
+ * and six sets of switch measurements, and comparing the critical
+ * partition's period ACROSS them then compares runs rather than phases.
+ * Re-read on every iteration of the endless loop, so one run can put the
+ * untrusted partition through every behaviour in turn while the critical
+ * one is measured continuously -- which is a strictly stronger comparison
+ * and a sixth of the model time.  */
+
+#define ZX_GD_M_BEHAVIOUR           0xB8U   /* EL2 writes: ZX_GB_*          */
+#define ZX_GD_M_PHASE_SEEN          0xBCU   /* guest: behaviours it obeyed  */
+
+#define ZX_GD_WINDOW_SIZE           0xC0U
+
+/**************************************************************************/
+/*                     The isolation matrix, as bits                      */
+/**************************************************************************/
+
+/* One bit per case, in the order the sweep runs them.
+ *
+ * THE ORDER IS NOT ARBITRARY: the cases that must SUCCEED come last.  A
+ * sweep that marked its own window first and then went on to be denied six
+ * times would leave a reader unable to say whether the marks were written
+ * before or after the denials, and "the partition still owned its memory
+ * after being refused six times" is part of what case 7 asserts.
+ *
+ * THE BRANCH CASE IS LAST OF THE DENIALS for a different reason.  A
+ * prefetch abort cannot be resumed by stepping over the faulting
+ * instruction -- the instruction was never fetched -- so it is the one case
+ * whose continuation depends on the guest having published a resume
+ * address.  Running it after the data cases means a defect in that path
+ * costs the sweep one case rather than all of them.  */
+
+#define ZX_MC_NEIGHBOUR_READ        0x01U   /* case 1 */
+#define ZX_MC_NEIGHBOUR_WRITE       0x02U   /* case 2 */
+#define ZX_MC_HOLE_WRITE            0x04U   /* case 4 -- the ADJACENT one   */
+#define ZX_MC_HYP_DATA              0x08U   /* case 5 -- read and write     */
+#define ZX_MC_HYP_MMIO              0x10U   /* case 6 */
+#define ZX_MC_NEIGHBOUR_EXEC        0x20U   /* case 3 -- a BRANCH           */
+#define ZX_MC_OWN_MARKS             0x40U   /* case 7 -- must SUCCEED       */
+
+#define ZX_MC_ALL                   0x7FU
+
+/* Why the guest would refuse a case.  Reported in ZX_GD_M_REFUSED so that a
+   case which never ran is distinguishable from one that was denied, which
+   from EL2 look identical: both leave the guest reporting nothing.  */
+
+#define ZX_MR_NO_ADDRESS            0x0100U /* EL2 left the word zero       */
+#define ZX_MR_NO_REGION             0x0200U /* no spare stage-1 region      */
+#define ZX_MR_INSIDE_ITSELF         0x0400U /* the address is its own, so
+                                               the case would prove nothing */
+
+/* The mark a granule carries: whose window it is in the middle byte, and
+ * the granule's index in the low one.
+ *
+ * DISTINCT PER GRANULE, because five copies of one value in five granules
+ * proves one extent was programmed five times over -- a region whose base
+ * is wrong accepts every store and puts them all somewhere else, and every
+ * readback of an identical mark agrees.  Only distinct marks read back at
+ * distinct addresses catch it.
+ *
+ * AND DISTINCT PER PARTITION, from the SENTINEL the handover already gives
+ * each guest, so that a mark read out of the wrong window is attributable
+ * rather than merely present.  Its low byte is what varies -- 0x11 and
+ * 0x22 -- and folding the whole sentinel in would overflow the field for
+ * no gain.
+ *
+ * UNSIGNED LONG AND NOT uint32_t, because this header is the CONTRACT and
+ * both sides of it spell their types differently: the hypervisor is ZoneX
+ * C17 with stdint, the guest is ThreadX C99 with ULONG, and the file is
+ * also included by assembly, which has no types at all.  So it names the
+ * one spelling that is 32-bit and available on every side.  A uint32_t here
+ * failed the guest's build, which is the header doing its job.  */
+
+#define ZX_MARK_BASE                0x5A5A0000UL
+#define ZX_MARK_FOR(sentinel, index)                                          \
+    (ZX_MARK_BASE | (((unsigned long)(sentinel) & 0xFFUL) << 8)               \
+     | ((unsigned long)(index) & 0xFFUL))
+
+/* What EL2 writes into a granule that belongs to NOBODY, before the run.
+ * It has to be a value no mark can take and no zeroed window can hold: a
+ * hole reading as zero after the run is indistinguishable from a hole
+ * nobody looked at.  */
+
+#define ZX_HOLE_POISON              0xDEAD00FFU
+
+/* What the guest leaves in ZX_GD_M_READ_VALUE before it attempts the read,
+   so that a denied load -- whose destination register is never written --
+   reports this rather than a stale value that reads like an answer.  */
+
+#define ZX_READ_POISON              0xBAD0BAD0U
+
+/**************************************************************************/
+/*               What an untrusted partition is asked to do               */
+/**************************************************************************/
+
+/* Re-read on every iteration of the endless loop.  Each of these is one row
+   of the determinism table, and the critical partition's period is measured
+   across all of them in one run.  */
+
+#define ZX_GB_QUIET                 0x00U   /* republish, and nothing else  */
+#define ZX_GB_SPIN                  0x01U   /* compute, never yield         */
+#define ZX_GB_MASKED                0x02U   /* CPSID if, then compute       */
+#define ZX_GB_STORM                 0x03U   /* a hypercall per character    */
+#define ZX_GB_FAULT                 0x04U   /* violate, over and over       */
 
 /**************************************************************************/
 /*                            Progress bits                              */
@@ -444,6 +629,23 @@
 #define ZX_GP_PREEMPTED           0x010000U  /* a spinner was displaced     */
 #define ZX_GP_TIMESLICED          0x020000U  /* two spinners both advanced  */
 #define ZX_GP_NO_CLOCK            0x040000U  /* refused to block: no counter */
+
+/* THE ONE THING THE ISOLATION SWEEP CAN CLAIM FOR ITSELF, and it is inside
+   the seal because it is a claim about what the partition ACHIEVED rather
+   than about what it was refused.  Set when every granule of its own window
+   that the hypervisor pointed it at took a distinct mark and read that mark
+   back -- which is the sweep's one positive case, and the reason a
+   regression that only proved things fault would not pass with every region
+   disabled.
+ *
+   NOT a bit meaning "the sweep ran".  The sweep's attempted set is a word
+   of its own, ZX_GD_M_ATTEMPTED, and it is a word rather than a bit for the
+   reason the whole third granule exists: a guest cannot report having been
+   denied, so "ran" and "was refused" are the hypervisor's to distinguish
+   and only the attempted set helps it.  */
+
+#define ZX_GP_MARKS_OK            0x080000U  /* its own window, marked and
+                                                read back, every granule    */
 
 /* WHAT THE GUEST'S OWN VECTORS SAW, in ZX_GD_STAGE1.
  *
@@ -537,8 +739,8 @@
  * defined starting state rather than whatever the window held before.  The
  * hypervisor writes its handover fields after the copy, never before.  */
 
-#define ZX_GUEST_IMAGE_OFF_MAILBOX  0x00U   /* TWO granules, ZX_GD_* inside */
-#define ZX_GUEST_IMAGE_OFF_ENTRY    0x80U   /* the branch the ERET lands on */
+#define ZX_GUEST_IMAGE_OFF_MAILBOX  0x00U   /* THREE granules, ZX_GD_* in   */
+#define ZX_GUEST_IMAGE_OFF_ENTRY    0xC0U   /* the branch the ERET lands on */
 
 /* THE IMAGE HEADER, three words after the entry branch.
  *
@@ -555,16 +757,34 @@
  * an EMPTY section rather than an error, so "the header does not carry the
  * magic" catches both a missing guest and a wrong one.  */
 
-#define ZX_GUEST_IMAGE_OFF_LINK_BASE 0x84U  /* the window it was linked for */
-#define ZX_GUEST_IMAGE_OFF_LINK_SIZE 0x88U  /* the size it was linked to fit */
-#define ZX_GUEST_IMAGE_OFF_MAGIC     0x8CU  /* ZX_GUEST_IMAGE_MAGIC          */
+#define ZX_GUEST_IMAGE_OFF_LINK_BASE 0xC4U  /* the window it was linked for */
+#define ZX_GUEST_IMAGE_OFF_LINK_SIZE 0xC8U  /* the size it was linked to fit */
+#define ZX_GUEST_IMAGE_OFF_MAGIC     0xCCU  /* ZX_GUEST_IMAGE_MAGIC          */
+
+/* AND THE FIRST BYTE PAST THE HEADER, which is the smallest blob that can
+   carry one.  Every hypervisor linker script asserts its embedded guest is
+   at least this big, because a blob too small to hold its own header makes
+   the loader's magic check an out-of-bounds read of whatever follows the
+   section -- and an .incbin whose file was missing produces exactly that.
+   The number lived as a literal in four linker scripts and was WRONG in all
+   four the day the mailbox grew from one granule to two: it stayed at 0x50
+   while the header moved to 0x8C, so a blob of 0x51 to 0x8F bytes linked
+   cleanly and read past its own section.  It is a named constant now, and
+   the scripts still restate it -- a linker script cannot include a C header
+   -- but there is one place to look when it moves again.  */
+
+#define ZX_GUEST_IMAGE_MIN_SIZE      0xD0U
 
 /* "ZXG" and a version.  The version is here so that a later ABI change is a
    REFUSAL rather than a guest that starts and misbehaves: the loader can say
    "this image was built against a different contract" and name both
    numbers.  */
 
-#define ZX_GUEST_IMAGE_MAGIC        0x5A584731
+/* "ZXG2".  Version 1 had the entry branch at 0x80 and a two-granule
+   mailbox; a version-1 blob loaded by this hypervisor would be ERETed into
+   the middle of its own mailbox.  */
+
+#define ZX_GUEST_IMAGE_MAGIC        0x5A584732
 
 /* The verdict a kernel guest publishes into ZX_GD_VERDICT.  Distinct
    non-zero values, so that an unwritten word -- zero -- is neither a pass

@@ -101,6 +101,28 @@ target_compile_definitions(zx_probe_el2_fault.elf PRIVATE
 zx_add_s32z_probe(zx_probe_starved.elf)
 target_compile_definitions(zx_probe_starved.elf PRIVATE ZX_PROBE_STARVE_REGIONS)
 
+# THE SHARED GRANULE'S READ-ONLY HALF, BROKEN.  The reader's copy of the
+# shared range is given write permission, so its attempt to publish must
+# SURVIVE and the run must report FAILED.
+#
+# A shared granule is the one DECLARED EXCEPTION to isolation in this
+# component -- one range readable by both partitions and writable by one --
+# which makes it the place where "the check can fail" is least optional.  Its
+# passing condition is the ABSENCE of a successful write, and an absence
+# nobody has seen turn into a presence is not evidence of anything.
+#
+# Only the PERMISSION field changes.  The range, the attributes and the
+# declared publisher are untouched, so the manifest validator has nothing to
+# object to and the only thing that can catch it is the access itself.
+#
+# WORTH RUNNING ON THIS BOARD SPECIFICALLY.  The two DFSC values the check
+# rests on -- a region MISS against a region PERMISSION failure -- are what
+# separate "read-only" from "not mapped here at all", and they were measured
+# on this part as well as on the model.  A permission failure that reported
+# a miss would make the two halves of the shared granule indistinguishable.
+zx_add_s32z_probe(zx_probe_shared_rw.elf)
+target_compile_definitions(zx_probe_shared_rw.elf PRIVATE ZX_PROBE_SHARED_RW)
+
 ###############################################################################
 # The ThreadX guest, and the image that launches it
 ###############################################################################
@@ -346,6 +368,7 @@ if(ZX_THREADX_SOURCE_DIR)
     function(zx_add_s32z_two_partitions target_name)
         add_executable(${target_name} EXCLUDE_FROM_ALL
             ${ZX_COMMON_DIR}/zx_two_partitions.c
+            ${ZX_COMMON_DIR}/zx_frame_setup.c
             ${ZX_COMMON_DIR}/zx_guest_launch.c
             ${ZX_COMMON_DIR}/zx_report.c
             ${ZX_COMMON_DIR}/zx_guest_image.S
@@ -409,6 +432,112 @@ if(ZX_THREADX_SOURCE_DIR)
     zx_add_s32z_two_partitions(zx_two_partitions_overlap.elf)
     target_compile_definitions(zx_two_partitions_overlap.elf PRIVATE
                                ZX_TWO_OVERLAP)
+
+    ###########################################################################
+    # THE ISOLATION AND DETERMINISM REGRESSION, on silicon
+    ###########################################################################
+    #
+    # THIS IS THE BOARD THE NUMBERS COME FROM.  The model is functional, so a
+    # green run there proves the code is right and says nothing at all about
+    # timing; every period, every jitter figure and every cycle count in the
+    # regression's output has to come from here before it is quoted.
+    #
+    # Same sources, same linker script and same two windows as the
+    # demonstration image beside it -- a regression built on a different
+    # foundation would be a regression for a different hypervisor.
+    function(zx_add_s32z_regression target_name)
+        add_executable(${target_name} EXCLUDE_FROM_ALL
+            ${ZX_COMMON_DIR}/zx_regression.c
+            ${ZX_COMMON_DIR}/zx_frame_setup.c
+            ${ZX_COMMON_DIR}/zx_guest_launch.c
+            ${ZX_COMMON_DIR}/zx_report.c
+            ${ZX_COMMON_DIR}/zx_guest_image.S
+            ${ZX_S32Z_DIR}/zx_board.c
+        )
+
+        add_dependencies(${target_name} zx_guest_a zx_guest_b)
+
+        target_include_directories(${target_name} PRIVATE
+            ${ZX_S32Z_DIR}
+            ${ZX_COMMON_DIR}
+        )
+
+        set_source_files_properties(${ZX_COMMON_DIR}/zx_guest_image.S
+            PROPERTIES
+                COMPILE_OPTIONS
+                    "-Wa,-I${ZX_GUEST_A_BUILD};-Wa,-I${ZX_GUEST_B_BUILD};-DZX_GUEST_B_BLOB"
+                OBJECT_DEPENDS  "${ZX_GUEST_A_BLOB};${ZX_GUEST_B_BLOB}"
+                TARGET_DIRECTORY ${target_name}
+        )
+
+        target_link_libraries(${target_name} PRIVATE
+            eclipse-threadx::zonex
+            zonex::warnings
+        )
+
+        target_link_options(${target_name} PRIVATE
+            -T${ZX_S32Z_DIR}/zx_two_partitions.lds
+            -nostartfiles
+            -Wl,-Map=${target_name}.map
+            ${ZX_LINK_QUIET_RWX}
+        )
+
+        set_target_properties(${target_name} PROPERTIES
+            LINK_DEPENDS ${ZX_S32Z_DIR}/zx_two_partitions.lds
+        )
+    endfunction()
+
+    # THE REGRESSION.  ZX_TEST_FAULT_CONTINUE is what lets one image sweep
+    # fourteen violation cases; on this board the alternative is fourteen
+    # images and fourteen debug-probe sessions, which is most of a working
+    # day.  The option is set on this target and nowhere else in this file,
+    # which is the whole basis for saying the shipping policy is halt.
+    zx_add_s32z_regression(zx_regression.elf)
+    target_compile_definitions(zx_regression.elf PRIVATE ZX_TEST_FAULT_CONTINUE)
+
+    # HALT ON FAULT, tested on silicon as well as on the model, and it must
+    # PASS.  Both targets, because "the shipping default is halt" is a claim
+    # about behaviour on real hardware and a model cannot make it.
+    zx_add_s32z_regression(zx_regression_halt.elf)
+    target_compile_definitions(zx_regression_halt.elf PRIVATE
+                               ZX_REGRESSION_HALT_ONLY)
+
+    # The two negative verifications, exactly as on the model: a region limit
+    # one granule too generous, and the time freeze removed.  Each must report
+    # FAILED.
+    zx_add_s32z_regression(zx_regression_widened.elf)
+    target_compile_definitions(zx_regression_widened.elf PRIVATE
+                               ZX_TEST_FAULT_CONTINUE ZX_REGRESSION_WIDENED)
+
+    zx_add_s32z_regression(zx_regression_no_freeze.elf)
+    target_compile_definitions(zx_regression_no_freeze.elf PRIVATE
+                               ZX_TEST_FAULT_CONTINUE ZX_REGRESSION_NO_FREEZE)
+
+    # TEN TIMES LONGER, and THIS is the board it is for.  Six hundred major
+    # frames is sixty seconds of silicon and ten minutes of a functional
+    # model, so the question it answers -- does the critical partition's
+    # MAXIMUM period stop moving? -- is cheap here and expensive there.  Run
+    # it by hand and record whether the maximum changed.
+    # AND THE REFUSAL PATH, which must FAIL.  The hypervisor's own timer PPI
+    # is deliberately left disabled at the GIC: the comparator still expires
+    # and the controller is simply never told, so no window can end.
+    #
+    # THE POINT IS THAT THIS IS A VERDICT AND NOT A HANG.  A frame started in
+    # that state runs its first partition until something outside the image
+    # stops it, and the log ends mid-sentence with nothing to point at -- the
+    # least informative outcome this suite can produce.  The regression
+    # refuses to start such a frame, and this build is the only one that
+    # reaches the refusal, because a branch nothing has ever taken is not
+    # evidence that it works.
+    #
+    # It is also the cheapest run in the suite: it stops before the frame.
+    zx_add_s32z_regression(zx_regression_no_tick.elf)
+    target_compile_definitions(zx_regression_no_tick.elf PRIVATE
+                               ZX_REGRESSION_NO_TICK)
+
+    zx_add_s32z_regression(zx_regression_long.elf)
+    target_compile_definitions(zx_regression_long.elf PRIVATE
+                               ZX_TEST_FAULT_CONTINUE ZX_REGRESSION_LONG)
 
 else()
     message(STATUS

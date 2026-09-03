@@ -134,6 +134,17 @@ case "${command}" in
         # characters.  There is nowhere better than a workstation to assert
         # those, and nowhere worse than a model log read by eye.
         #
+        # THE FAULT DECODER AND THE FAULT LOG JOINED IT when the isolation
+        # matrix made them reachable in full.  Both were previously short of
+        # the floor for a reason that has now gone: the decoder's "on a
+        # READ" arm had never been printed, because every fault the suite
+        # provoked happened to be a write.  The matrix provokes a read and a
+        # write against the SAME address deliberately -- a region set that
+        # denied writes and permitted reads would pass a write-only sweep --
+        # so the arm is now exercised, and the file that decides which
+        # violation a log entry describes is held to the same standard as
+        # the validator that refused the manifest.
+        #
         # A file joins this list when it becomes reachable in full, not
         # when it is written.  Adding one that cannot be is how a floor
         # ends up lowered to whatever passes.
@@ -144,6 +155,8 @@ case "${command}" in
         echo ""
         echo "Enforcing the coverage floor on the fully reachable core:"
         gcovr --root "${ROOT}" \
+              --filter "${ROOT}/core/src/zx_fault.c" \
+              --filter "${ROOT}/core/src/zx_fault_log.c" \
               --filter "${ROOT}/core/src/zx_guest_console.c" \
               --filter "${ROOT}/core/src/zx_manifest_verify.c" \
               --filter "${ROOT}/core/src/zx_mm_setup.c" \

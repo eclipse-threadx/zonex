@@ -265,6 +265,34 @@ zx_el2_trap_not_hypercall:
     b       zx_el2_resume
 
 zx_el2_trap_guest_violation:
+
+    @ A GUEST OVERSTEPPED ITS PARTITION.  What happens next is a policy
+    @ decision, and it is made in C -- zx_el2_fault_continue -- rather than
+    @ here, because a vector has no context to decide anything with.  The
+    @ shipping answer is "stop the partition", which the call reports by
+    @ returning zero; a build compiled with the test-only continue mode can
+    @ instead be handed back the context to resume, so that one image sweeps
+    @ a whole matrix of violations rather than needing one run per case.
+    @
+    @ THE CALL IS UNCONDITIONAL AND THERE IS NO #ifdef HERE.  Every build
+    @ takes this path on every guest violation and the callee decides from a
+    @ compile-time constant.  A continue mode reached through a DIFFERENT
+    @ route through this vector would mean the shipping route was the less
+    @ exercised of the two, which is the wrong way round for the path that
+    @ matters -- and it would put a conditional in the one file where a
+    @ mistake is hardest to see.
+    @
+    @ The guest's fifteen words were captured before this, by
+    @ zx_el2_context_capture_from_stack, and the two words the vector pushed
+    @ are already off the stack.  SP_hyp is inside zx_el2_enter_partition's
+    @ frame, which is a valid Hyp stack at one fixed depth, so the BL costs
+    @ no more per fault than the boundary handler's does per boundary.
+
+    bl      zx_el2_fault_continue
+
+    cmp     r0, #0
+    bne     zx_el2_context_resume       @ resumed: r0 is the context
+
     mov     r0, #ZX_RUN_FAULTED
     b       zx_el2_resume
     .size   zx_el2_hyp_trap_entry, . - zx_el2_hyp_trap_entry

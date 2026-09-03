@@ -88,7 +88,7 @@ MEMORY
 
 SECTIONS
 {
-    /* +0x00  the mailbox, two granules: LOADED, outside .bss, at the
+    /* +0x00  the mailbox, three granules: LOADED, outside .bss, at the
        window base.  See
        the model's script for why all three of those are forced.  */
 
@@ -100,7 +100,7 @@ SECTIONS
         __zx_guest_mailbox_end = .;
     } > WINDOW
 
-    /* +0x80  the entry branch, then everything executable.  */
+    /* +0xC0  the entry branch, then everything executable.  */
 
     .zx_guest_head : ALIGN(64)
     {
@@ -191,15 +191,21 @@ SECTIONS
 
     ASSERT(__zx_guest_mailbox_start == __zx_guest_window_base,
            "the mailbox is not at the base of the partition window")
-    /* TWO granules, and the number is ZX_GD_WINDOW_SIZE in
+    /* THREE granules, and the number is ZX_GD_WINDOW_SIZE in
        examples/common/zx_guest_abi.h.  A linker script cannot include a
        C header, so the constant is restated here and asserted -- which
        is the point: a mailbox that grew past its slot fails the LINK
        rather than moving an entry point the hypervisor computes as a
-       compile-time constant.  */
-    ASSERT((__zx_guest_mailbox_end - __zx_guest_mailbox_start) == 128,
-           "the mailbox is not exactly two granules")
-    ASSERT(__zx_guest_code_start == (__zx_guest_window_base + 0x80),
+       compile-time constant.  It HAS grown, twice, and both times this
+       assert is what said so before anything ran.  */
+    ASSERT((__zx_guest_mailbox_end - __zx_guest_mailbox_start) == 192,
+           "the mailbox is not exactly three granules")
+    /* ZX_GUEST_IMAGE_OFF_ENTRY.  Restated for the same reason as the
+       mailbox size above, and it moves with it: three granules of mailbox
+       put the entry branch at 0xC0.  A guest whose branch is four bytes
+       out of place is invisible in a manifest and costs a hardware
+       session to find.  */
+    ASSERT(__zx_guest_code_start == (__zx_guest_window_base + 0xC0),
            "the entry branch is not at the offset the hypervisor ERETs to")
     ASSERT(_start >= __zx_guest_code_start,
            "the kernel's reset symbol is outside the guest's code region")

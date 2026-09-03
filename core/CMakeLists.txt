@@ -22,6 +22,7 @@
 
 target_sources(zonex_core PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/src/zx_fault.c
+    ${CMAKE_CURRENT_LIST_DIR}/src/zx_fault_log.c
     ${CMAKE_CURRENT_LIST_DIR}/src/zx_guest_console.c
     ${CMAKE_CURRENT_LIST_DIR}/src/zx_manifest_verify.c
     ${CMAKE_CURRENT_LIST_DIR}/src/zx_mm_setup.c
@@ -40,6 +41,7 @@ target_sources(zonex_core PUBLIC
     FILES     ${CMAKE_CURRENT_LIST_DIR}/../common/inc/zx_api.h
               ${CMAKE_CURRENT_LIST_DIR}/../common/inc/zx_console.h
               ${CMAKE_CURRENT_LIST_DIR}/inc/zx_fault.h
+              ${CMAKE_CURRENT_LIST_DIR}/inc/zx_fault_log.h
               ${CMAKE_CURRENT_LIST_DIR}/inc/zx_guest_console.h
               ${CMAKE_CURRENT_LIST_DIR}/inc/zx_manifest.h
               ${CMAKE_CURRENT_LIST_DIR}/inc/zx_mm.h

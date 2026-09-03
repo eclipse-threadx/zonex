@@ -731,6 +731,16 @@ void zx_context_time_reset(ZX_GUEST_CONTEXT *context_ptr)
     context_ptr->zx_ctx_resumed_at      = now;
     context_ptr->zx_ctx_virtual_at_stop = 0U;
     context_ptr->zx_ctx_time_on_core    = 0U;
+
+    /* AND THE FREEZE IS ON, established HERE rather than left to the
+       caller.  Every image calls this; an image that had to remember to
+       switch the freeze on would be an image that could forget, and a
+       forgotten freeze is a partition that can see its neighbour's time
+       while every other check in the suite stays green.  The one build
+       that wants it off clears the field after this returns, deliberately
+       and visibly.  */
+
+    context_ptr->zx_ctx_credit_time     = 1U;
 }
 
 
@@ -785,7 +795,8 @@ void zx_context_time_resume(ZX_GUEST_CONTEXT *context_ptr)
        entry -- which looks exactly like a working freeze and is in fact a
        partition whose time never advances at all.  */
 
-    if (now > context_ptr->zx_ctx_suspended_at)
+    if ((context_ptr->zx_ctx_credit_time != 0U)
+        && (now > context_ptr->zx_ctx_suspended_at))
     {
         offset += now - context_ptr->zx_ctx_suspended_at;
     }
@@ -852,4 +863,143 @@ void zx_context_report(const ZX_GUEST_CONTEXT *context_ptr,
     zx_console_putdec((uint32_t)(context_ptr->zx_ctx_virtual_at_stop
                                  & 0xFFFFFFFFU));
     zx_console_puts("\n");
+
+    if (context_ptr->zx_ctx_violations != 0U)
+    {
+        zx_console_puts("    stage-2 violations it was RESUMED past ");
+        zx_console_putdec(context_ptr->zx_ctx_violations);
+        zx_console_puts("\n");
+    }
+
+    if (context_ptr->zx_ctx_period_samples != 0U)
+    {
+        zx_console_puts("    window period, counts: min ");
+        zx_console_putdec((uint32_t)(context_ptr->zx_ctx_period_min
+                                     & 0xFFFFFFFFU));
+        zx_console_puts(" mean ");
+        zx_console_putdec((uint32_t)(zx_context_period_mean(context_ptr)
+                                     & 0xFFFFFFFFU));
+        zx_console_puts(" max ");
+        zx_console_putdec((uint32_t)(context_ptr->zx_ctx_period_max
+                                     & 0xFFFFFFFFU));
+        zx_console_puts(" over ");
+        zx_console_putdec(context_ptr->zx_ctx_period_samples);
+        zx_console_puts(" periods\n");
+    }
+}
+
+
+/**************************************************************************/
+/*                                                                        */
+/*  FUNCTION                                               RELEASE        */
+/*                                                                        */
+/*    zx_context_period_note                               Cortex-R52     */
+/*    zx_context_period_reset                                             */
+/*    zx_context_period_mean                                              */
+/*    zx_context_period_jitter                                            */
+/*                                                                        */
+/*  DESCRIPTION                                                           */
+/*                                                                        */
+/*    How often a partition's window came round, from the timestamps the   */
+/*    switch already takes.  The rationale is beside the fields in         */
+/*    zx_port.h; two properties are worth restating where they are         */
+/*    implemented.                                                        */
+/*                                                                        */
+/*    THE FIRST ENTRY YIELDS NO PERIOD, and it must not be allowed to.  A  */
+/*    partition's first window has no predecessor, so the difference       */
+/*    against zx_ctx_period_prev would be the interval since the CONTEXT   */
+/*    WAS INITIALISED -- a number with no meaning that is smaller than a   */
+/*    real period and would therefore become the minimum, and the reported */
+/*    jitter would be a whole frame wide on every run.  The sample count   */
+/*    guards it.                                                          */
+/*                                                                        */
+/*    AND THE JITTER OF ONE SAMPLE IS ZERO RATHER THAN max - min.  With    */
+/*    one period recorded the min and the max are the same reading, and    */
+/*    reporting their difference as "no jitter" would be the most          */
+/*    flattering possible description of a run too short to say anything.  */
+/*    Zero samples and one sample both report zero, and the sample count   */
+/*    is printed next to it so that a reader can tell which.              */
+/*                                                                        */
+/**************************************************************************/
+
+void zx_context_period_note(ZX_GUEST_CONTEXT *context_ptr, uint64_t now)
+{
+    if (context_ptr == (ZX_GUEST_CONTEXT *)0)
+    {
+        return;
+    }
+
+    if (context_ptr->zx_ctx_period_prev != 0U)
+    {
+        uint64_t period = now - context_ptr->zx_ctx_period_prev;
+
+        if ((context_ptr->zx_ctx_period_samples == 0U)
+            || (period < context_ptr->zx_ctx_period_min))
+        {
+            context_ptr->zx_ctx_period_min = period;
+        }
+
+        if (period > context_ptr->zx_ctx_period_max)
+        {
+            context_ptr->zx_ctx_period_max = period;
+        }
+
+        context_ptr->zx_ctx_period_total += period;
+        context_ptr->zx_ctx_period_samples++;
+    }
+
+    context_ptr->zx_ctx_period_prev = now;
+}
+
+
+void zx_context_period_reset(ZX_GUEST_CONTEXT *context_ptr)
+{
+    if (context_ptr == (ZX_GUEST_CONTEXT *)0)
+    {
+        return;
+    }
+
+    /* THE PREVIOUS TIMESTAMP GOES WITH THEM, so that the next period
+       measured begins a fresh chain and every sample a phase records lies
+       entirely inside it.  See zx_port.h for why the first version of this
+       kept it and why that was backwards: an absolute-deadline schedule
+       answers one late entry with one short correction, and keeping the
+       timestamp put the correction in the following phase.  */
+
+    context_ptr->zx_ctx_period_prev    = 0U;
+
+    context_ptr->zx_ctx_period_min     = 0U;
+    context_ptr->zx_ctx_period_max     = 0U;
+    context_ptr->zx_ctx_period_total   = 0U;
+    context_ptr->zx_ctx_period_samples = 0U;
+}
+
+
+uint64_t zx_context_period_mean(const ZX_GUEST_CONTEXT *context_ptr)
+{
+    uint64_t mean = 0U;
+
+    if ((context_ptr != (const ZX_GUEST_CONTEXT *)0)
+        && (context_ptr->zx_ctx_period_samples != 0U))
+    {
+        mean = context_ptr->zx_ctx_period_total
+               / (uint64_t)context_ptr->zx_ctx_period_samples;
+    }
+
+    return mean;
+}
+
+
+uint64_t zx_context_period_jitter(const ZX_GUEST_CONTEXT *context_ptr)
+{
+    uint64_t jitter = 0U;
+
+    if ((context_ptr != (const ZX_GUEST_CONTEXT *)0)
+        && (context_ptr->zx_ctx_period_samples > 1U))
+    {
+        jitter = context_ptr->zx_ctx_period_max
+                 - context_ptr->zx_ctx_period_min;
+    }
+
+    return jitter;
 }

@@ -383,6 +383,23 @@ ZX_TEST_MAIN("zx_fault",
     ZX_CHECK_EQ(zx_capture_contains("no\n[FAULT]   portable decode"), 1U);
     /* No spurious disagreement warning on a self-consistent record.  */
     ZX_CHECK_EQ(zx_capture_contains("DISAGREE"), 0U);
+
+    /* THE SAME VIOLATION ON A READ, because the report has to say which and
+       a report that only ever printed one of the two would be indetectable
+       from any run that only ever provoked one.  The isolation matrix
+       provokes both against the same address on purpose -- a region set
+       that denied writes and permitted reads would pass a write-only
+       sweep -- so the two words in this report carry a claim rather than
+       decoration.  ISS[6] is WnR; clearing it is the whole difference.  */
+
+    zx_capture_reset();
+    zx_fill_measured_guest_record(&record);
+    record.zx_fault_hsr &= ~ZX_ISS_WNR_MASK;
+    zx_fault_report(&record);
+
+    ZX_CHECK_EQ(zx_capture_contains("on a READ"), 1U);
+    ZX_CHECK_EQ(zx_capture_contains("on a WRITE"), 0U);
+    ZX_CHECK_EQ(zx_capture_contains("data abort ROUTED to Hyp"), 1U);
     ZX_CHECK_EQ(zx_capture_contains("CARRIES NO SYNDROME"), 0U);
 
     /* The hypervisor fault must read as a DIFFERENT event.  */

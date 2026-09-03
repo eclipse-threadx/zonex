@@ -453,6 +453,411 @@ static ULONG preemptive_phase(void)
 
 
 /**************************************************************************/
+/*  THE ISOLATION MATRIX -- one sweep, every case, inside one window.     */
+/*                                                                        */
+/*  WHAT THIS CAN AND CANNOT SAY, because getting that wrong is how a      */
+/*  swept matrix passes while proving nothing.                            */
+/*                                                                        */
+/*  IT CANNOT REPORT THAT A CASE WAS DENIED.  Under the hypervisor's       */
+/*  test-only continue mode a faulting partition is resumed PAST the       */
+/*  faulting instruction, so the very next store -- the one that would     */
+/*  have recorded "this case survived" -- executes anyway, one instruction */
+/*  later, on a case that was refused.  A guest is not conscious of having */
+/*  been refused.  Every "it faulted" judgement therefore belongs to EL2   */
+/*  and comes out of its fault log, matched by ADDRESS, which is why every */
+/*  case below aims at an address of its own.                              */
+/*                                                                        */
+/*  WHAT IT CAN SAY HONESTLY IS WHAT IT ATTEMPTED, and EL2 cannot know     */
+/*  that: a case the guest refused to run and a case stage 2 denied both   */
+/*  leave the hypervisor with no fault to look at.  Only the guest can     */
+/*  tell those two apart.  So it publishes the attempted set and the       */
+/*  refused set and leaves the judging alone.                              */
+/*                                                                        */
+/*  AND ONE CASE IS THE OTHER WAY ROUND.  Its own window must SUCCEED, and */
+/*  success is something a guest CAN demonstrate: distinct marks written   */
+/*  into distinct granules and read back.  It runs LAST, deliberately, so  */
+/*  that what the marks say is "this partition still owned every byte of   */
+/*  its own window after being refused six times".                        */
+/*                                                                        */
+/*  EVERY ADDRESS IS HANDED OVER RATHER THAN COMPUTED, and that is the     */
+/*  point rather than an inconvenience.  A guest deriving its neighbour's  */
+/*  window from its own base would be a guest that had been TOLD the       */
+/*  layout; a guest handed an address it could not have derived is a guest */
+/*  being asked to reach somewhere it has no business knowing about, which */
+/*  is the situation the isolation claim is actually about.                */
+/**************************************************************************/
+
+/* THE MARKS.  Written all of them, then read back all of them -- never one
+   at a time.  A region whose BASE is wrong accepts every store and puts
+   them all somewhere else, so a write-then-check of one granule reads its
+   own store back from the same wrong place and agrees.  Distinct marks at
+   distinct addresses, checked only after the last one is written, is what
+   makes the readback mean "these are five different extents".  */
+
+static ULONG matrix_write_marks(void)
+{
+    unsigned long base     = guest_mailbox_read(ZX_GD_M_MARK_BASE);
+    unsigned long count    = guest_mailbox_read(ZX_GD_M_MARK_COUNT);
+    unsigned long sentinel = guest_mailbox_read(ZX_GD_SCRATCH);
+    unsigned long index;
+    ULONG         agreed   = 1UL;
+
+    if ((base == 0UL) || (count == 0UL))
+    {
+        guest_mailbox_write(ZX_GD_M_MARKS_WRITTEN, 0UL);
+        guest_mailbox_write(ZX_GD_M_MARKS_OK, 0UL);
+
+        return 0UL;
+    }
+
+    if (guest_owns_range(base, count * 64UL) == 0U)
+    {
+        console_puts("REFUSING to mark: the range I was handed is not inside\n"
+                     "the writable part of my own window\n");
+        guest_mailbox_write(ZX_GD_M_MARKS_WRITTEN, 0UL);
+        guest_mailbox_write(ZX_GD_M_MARKS_OK, 0UL);
+
+        return 0UL;
+    }
+
+    for (index = 0UL; index < count; index++)
+    {
+        volatile ULONG *granule =
+            (volatile ULONG *)(void *)(base + (index * 64UL));
+
+        *granule = (ULONG) ZX_MARK_FOR(sentinel, index);
+    }
+
+    /* PUBLISHED BEFORE THE READBACK, so that a partition stopped between
+       the two is recorded as having written them rather than as having
+       written nothing.  */
+
+    guest_mailbox_write(ZX_GD_M_MARKS_WRITTEN, count);
+
+    for (index = 0UL; index < count; index++)
+    {
+        volatile const ULONG *granule =
+            (volatile const ULONG *)(const void *)(base + (index * 64UL));
+
+        if (*granule != (ULONG) ZX_MARK_FOR(sentinel, index))
+        {
+            agreed = 0UL;
+        }
+    }
+
+    guest_mailbox_write(ZX_GD_M_MARKS_OK, (unsigned long) agreed);
+
+    console_puts("marked ");
+    console_putdec(count);
+    console_puts(" granules of my own window, each with a different value,\n"
+                 "and read every one of them back: ");
+    console_puts((agreed != 0UL) ? "all agreed\n"
+                                 : "*** ONE DISAGREED ***\n");
+
+    return (ULONG) ZX_MC_OWN_MARKS;
+}
+
+
+/* One denial case: grant the granule at stage 1, then touch it.
+ *
+ * THE GRANT IS THE HALF THAT MAKES THIS A STAGE-2 TEST AT ALL.  Without it
+ * stage 1 refuses first, the abort is taken to EL1, and the hypervisor
+ * never hears about it -- so the run would demonstrate the guest's own MPU
+ * working and would say nothing whatever about the partition boundary.
+ *
+ * Returns the case's bit when the access may be attempted, and ORs a reason
+ * into *refused_ptr when it may not.  */
+
+static ULONG matrix_grant(unsigned long address, ULONG bit,
+                          unsigned int executable, ULONG *refused_ptr)
+{
+    unsigned int granted;
+
+    if (address == 0UL)
+    {
+        *refused_ptr |= (ULONG) ZX_MR_NO_ADDRESS;
+
+        return 0UL;
+    }
+
+    granted = guest_grant_scratch_region(address, executable);
+
+    if (granted == ZX_GRANT_ALREADY)
+    {
+        /* The hypervisor pointed this case at memory the guest genuinely
+           owns.  Reported rather than run: an access that succeeds because
+           it was always permitted is not evidence about anything, and a
+           sweep counting it as a pass would be counting its own mistake.  */
+
+        *refused_ptr |= (ULONG) ZX_MR_INSIDE_ITSELF;
+
+        return 0UL;
+    }
+
+    if (granted == ZX_GRANT_NO_REGION)
+    {
+        *refused_ptr |= (ULONG) ZX_MR_NO_REGION;
+
+        return 0UL;
+    }
+
+    return bit;
+}
+
+
+static ULONG isolation_matrix(void)
+{
+    ULONG cases     = (ULONG) guest_mailbox_read(ZX_GD_M_CASES);
+    ULONG attempted = 0UL;
+    ULONG refused   = 0UL;
+    ULONG progress  = 0UL;
+
+    if (cases == 0UL)
+    {
+        return 0UL;
+    }
+
+    console_puts("\nTHE ISOLATION MATRIX.  For every address below I grant\n"
+                 "MYSELF the granule in my own MPU first, so stage 1 permits\n"
+                 "the access and I genuinely believe I own the memory.\n"
+                 "Stage 2 has the last word, and I am not able to tell you\n"
+                 "whether it took it -- only the hypervisor can.\n");
+
+    /* CASE 1 -- the neighbour's data, READ.
+     *
+     * THE POISON GOES IN FIRST, AND IT IS NOT ENOUGH.  A denied load never
+     * writes its destination register -- but under the continue mode the
+     * hypervisor resumes this guest at the instruction AFTER the load, and
+     * that instruction is the store of the loaded value.  So the mailbox
+     * gets written with whatever the compiler happened to leave in that
+     * register, which on a real run was the number one.  The poison is
+     * still written because a word nobody wrote is worse than a word
+     * written with rubbish, but it CANNOT be what the check tests against.
+     *
+     * The hypervisor tests the reported value against what is REALLY at
+     * that address, which it can read and this guest cannot.  That is the
+     * claim anyway -- the neighbour's data did not reach this partition --
+     * rather than the proxy for it.  */
+
+    if ((cases & (ULONG) ZX_MC_NEIGHBOUR_READ) != 0UL)
+    {
+        unsigned long address = guest_mailbox_read(ZX_GD_M_NEIGHBOUR);
+        ULONG         bit     = matrix_grant(address,
+                                             (ULONG) ZX_MC_NEIGHBOUR_READ,
+                                             0U, &refused);
+
+        if (bit != 0UL)
+        {
+            volatile const ULONG *target =
+                (volatile const ULONG *)(const void *)address;
+
+            guest_mailbox_write(ZX_GD_M_READ_VALUE,
+                                (unsigned long) ZX_READ_POISON);
+            attempted |= bit;
+            guest_mailbox_write(ZX_GD_M_ATTEMPTED, (unsigned long) attempted);
+
+            console_puts("  reading my neighbour's data at ");
+            console_puthex(address);
+            console_puts("\n");
+
+            guest_mailbox_write(ZX_GD_M_READ_VALUE, (unsigned long) *target);
+        }
+    }
+
+    /* CASE 2 -- the neighbour's data, WRITTEN.  A DIFFERENT WORD of the same
+       granule, so that this case has an address of its own and the fault log
+       can name it.  Two cases sharing one address would be two log entries
+       the hypervisor could not tell apart -- and "the read was refused and
+       the write was not" is exactly the asymmetry worth being able to see,
+       since a region set with the wrong AP grants one and denies the
+       other.  */
+
+    if ((cases & (ULONG) ZX_MC_NEIGHBOUR_WRITE) != 0UL)
+    {
+        unsigned long neighbour = guest_mailbox_read(ZX_GD_M_NEIGHBOUR);
+        unsigned long address   = (neighbour != 0UL) ? (neighbour + 4UL) : 0UL;
+        ULONG         bit       = matrix_grant(address,
+                                               (ULONG) ZX_MC_NEIGHBOUR_WRITE,
+                                               0U, &refused);
+
+        if (bit != 0UL)
+        {
+            volatile ULONG *target = (volatile ULONG *)(void *)address;
+
+            attempted |= bit;
+            guest_mailbox_write(ZX_GD_M_ATTEMPTED, (unsigned long) attempted);
+
+            console_puts("  writing into my neighbour's data at ");
+            console_puthex(address);
+            console_puts("\n");
+
+            *target = (ULONG) ZX_GUEST_SENTINEL_A;
+        }
+    }
+
+    /* CASE 4 -- the ADJACENT ungranted granule, which is the case that
+       catches a region limit out by ONE granule.  That is the defect class
+       which otherwise reads as a working system: an address far from every
+       grant proves only that unmapped memory faults, and two region sets a
+       whole kilobyte apart would pass a test that only touched the
+       neighbour's data.  */
+
+    if ((cases & (ULONG) ZX_MC_HOLE_WRITE) != 0UL)
+    {
+        unsigned long address = guest_mailbox_read(ZX_GD_M_HOLE);
+        ULONG         bit     = matrix_grant(address, (ULONG) ZX_MC_HOLE_WRITE,
+                                             0U, &refused);
+
+        if (bit != 0UL)
+        {
+            volatile ULONG *target = (volatile ULONG *)(void *)address;
+
+            attempted |= bit;
+            guest_mailbox_write(ZX_GD_M_ATTEMPTED, (unsigned long) attempted);
+
+            console_puts("  writing into the granule immediately next door\n"
+                         "  to my own window, at ");
+            console_puthex(address);
+            console_puts(", which belongs to nobody\n");
+
+            *target = (ULONG) ZX_GUEST_SENTINEL_A;
+        }
+    }
+
+    /* CASE 5 -- the HYPERVISOR'S OWN memory, read and then written.  The
+       case a safety reviewer asks about first, and the one an "everything
+       is mapped, the guest just is not supposed to look" design fails.
+       Read BEFORE write, so that a denied read stepped over by the continue
+       path still leaves the write to be attempted.
+     *
+       THE READ LANDS IN ZX_GD_PROBE_SCRATCH, which is the word that exists
+       to be written by a probe and read by nobody.  It is there so the load
+       cannot be optimised away, and it is that word rather than any other
+       because a probe writing into a word something reports through was a
+       real defect once: the sentinel landed on the progress bits and the
+       seal then certified them.  */
+
+    if ((cases & (ULONG) ZX_MC_HYP_DATA) != 0UL)
+    {
+        unsigned long address = guest_mailbox_read(ZX_GD_M_HYP_DATA);
+        ULONG         bit     = matrix_grant(address, (ULONG) ZX_MC_HYP_DATA,
+                                             0U, &refused);
+
+        if (bit != 0UL)
+        {
+            volatile ULONG *target = (volatile ULONG *)(void *)address;
+
+            attempted |= bit;
+            guest_mailbox_write(ZX_GD_M_ATTEMPTED, (unsigned long) attempted);
+
+            console_puts("  reading and then writing the HYPERVISOR'S own\n"
+                         "  memory at ");
+            console_puthex(address);
+            console_puts("\n");
+
+            guest_mailbox_write(ZX_GD_PROBE_SCRATCH, (unsigned long) *target);
+            *(target + 1) = (ULONG) ZX_GUEST_SENTINEL_A;
+        }
+    }
+
+    /* CASE 6 -- hypervisor MMIO.  A partition that could reach the console
+       could print as its neighbour; one that could reach the interrupt
+       controller could switch off the interrupt that ends its own window.  */
+
+    if ((cases & (ULONG) ZX_MC_HYP_MMIO) != 0UL)
+    {
+        unsigned long address = guest_mailbox_read(ZX_GD_M_HYP_MMIO);
+        ULONG         bit     = matrix_grant(address, (ULONG) ZX_MC_HYP_MMIO,
+                                             0U, &refused);
+
+        if (bit != 0UL)
+        {
+            volatile ULONG *target = (volatile ULONG *)(void *)address;
+
+            attempted |= bit;
+            guest_mailbox_write(ZX_GD_M_ATTEMPTED, (unsigned long) attempted);
+
+            console_puts("  writing to hypervisor MMIO at ");
+            console_puthex(address);
+            console_puts("\n");
+
+            *target = (ULONG) ZX_GUEST_SENTINEL_A;
+        }
+    }
+
+    /* CASE 3 -- EXECUTE the neighbour's code.  Last of the denials, and the
+       only one whose continuation depends on the resume point the helper
+       publishes: a prefetch abort cannot be stepped over, because the
+       instruction that would be stepped over is the one that could not be
+       fetched.  Running it after the data cases means a defect in that path
+       costs the sweep one case rather than all of them.
+     *
+       THE GRANT IS EXECUTABLE HERE.  A branch into memory the guest's own
+       MPU marks execute-never is refused by STAGE 1, at EL1, and never
+       reaches the hypervisor -- so an execute case run through an ordinary
+       data grant would report a stage-1 fault and prove nothing at all
+       about stage 2.  */
+
+    if ((cases & (ULONG) ZX_MC_NEIGHBOUR_EXEC) != 0UL)
+    {
+        unsigned long address = guest_mailbox_read(ZX_GD_M_NEIGHBOUR_CODE);
+        ULONG         bit     = matrix_grant(address,
+                                             (ULONG) ZX_MC_NEIGHBOUR_EXEC,
+                                             1U, &refused);
+
+        if (bit != 0UL)
+        {
+            attempted |= bit;
+            guest_mailbox_write(ZX_GD_M_ATTEMPTED, (unsigned long) attempted);
+
+            console_puts("  BRANCHING into my neighbour's code at ");
+            console_puthex(address);
+            console_puts("\n");
+
+            if (guest_branch_probe(address,
+                                   guest_mailbox_slot(ZX_GD_M_RESUME)) != 0UL)
+            {
+                console_puts("  *** the branch SUCCEEDED and returned.  I\n"
+                             "  *** executed my neighbour's code.\n");
+            }
+        }
+    }
+
+    /* THE SCRATCH GRANT COMES OFF HERE, before the case that must succeed.
+       A stage-1 permission left standing after the sweep is a partition
+       carrying a grant nothing gave it into every window that follows, and
+       every later claim in the run would then be about a machine nobody
+       described.  */
+
+    guest_release_scratch_region();
+
+    /* CASE 7 -- ITS OWN WINDOW, and this one must SUCCEED.  A regression
+       that only proved things fault would pass with every region
+       disabled.  */
+
+    if ((cases & (ULONG) ZX_MC_OWN_MARKS) != 0UL)
+    {
+        if (matrix_write_marks() != 0UL)
+        {
+            attempted |= (ULONG) ZX_MC_OWN_MARKS;
+            progress  |= (ULONG) ZX_GP_MARKS_OK;
+        }
+    }
+
+    guest_mailbox_write(ZX_GD_M_ATTEMPTED, (unsigned long) attempted);
+    guest_mailbox_write(ZX_GD_M_REFUSED, (unsigned long) refused);
+
+    console_puts("the sweep is over.  I attempted ");
+    console_puthex((unsigned long) attempted);
+    console_puts(" and refused ");
+    console_puthex((unsigned long) refused);
+    console_puts("\n");
+
+    return progress;
+}
+
+
+/**************************************************************************/
 /*  endless_phase -- what a partition does when it has finished but the   */
 /*                   frame has not.                                       */
 /*                                                                        */
@@ -492,11 +897,79 @@ static ULONG preemptive_phase(void)
 /*  iteration would spend the partition's window computing a checksum      */
 /*  nobody reads.  These words are outside the seal and zx_guest_abi.h     */
 /*  says so.                                                              */
+/*                                                                        */
+/*  AND IT IS STEERABLE, WHICH IS WHAT MAKES THE DETERMINISM RUN ONE RUN.  */
+/*                                                                        */
+/*  ZX_GD_M_BEHAVIOUR is re-read on every iteration, so the hypervisor can */
+/*  change what this partition is DOING between phases of a single run:    */
+/*  quiet, then computing, then computing with its interrupts masked, then */
+/*  storming the console, then violating its boundary over and over.  Each */
+/*  is one row of the determinism table, and the critical partition's      */
+/*  period is measured continuously across all of them.                    */
+/*                                                                        */
+/*  SIX BUILDS WOULD HAVE BEEN THE OBVIOUS SHAPE AND IT IS THE WEAKER ONE. */
+/*  Six images is six boots, six epochs and six sets of switch             */
+/*  measurements, so comparing the critical partition's period across them */
+/*  compares RUNS rather than phases -- and a difference between two runs  */
+/*  has a dozen explanations that a difference between two phases of one   */
+/*  run does not.  It is also a sixth of the model time.                   */
+/*                                                                        */
+/*  RE-READING COSTS NOTHING THE MEASUREMENT CARES ABOUT.  It is one load  */
+/*  from a granule this partition already owns: no hypercall, no kernel    */
+/*  call, and nothing the masked phase could not do with its interrupts    */
+/*  off -- which is what lets the hypervisor steer a partition OUT of a    */
+/*  phase it entered by disabling interrupts.  A design that needed an     */
+/*  interrupt to end the masked phase could not have one.                  */
 /**************************************************************************/
+
+/* How much arithmetic one pass of a compute phase does.
+ *
+ * A BOUND AND NOT A DURATION.  Its only job is to be long enough that the
+ * partition is genuinely computing for a useful fraction of its window and
+ * short enough that the behaviour word is re-read often enough to steer.
+ * Nothing rests on the number: the phase is ended by the hypervisor
+ * changing the word, never by this loop finishing.  */
+
+#define GUEST_COMPUTE_PASS      4000UL
+
+static ULONG endless_compute(ULONG seed)
+{
+    ULONG index;
+    ULONG value = seed;
+
+    /* Arithmetic on a volatile-free local, so the compiler keeps it: a
+       compute phase optimised away would leave a partition that looked
+       busy in the log and was idle on the core, which is the one thing
+       this phase must not be.  The accumulator is returned and published
+       for the same reason.  */
+
+    for (index = 0UL; index < (ULONG) GUEST_COMPUTE_PASS; index++)
+    {
+        value = (value * 1103515245UL) + 12345UL;
+        value ^= (value >> 7);
+    }
+
+    return value;
+}
+
 
 static void endless_phase(ULONG options)
 {
-    ULONG live = 0UL;
+    ULONG live      = 0UL;
+    ULONG work      = 1UL;
+    ULONG seen      = 0UL;
+    ULONG masked    = 0UL;
+    ULONG behaviour = (ULONG) ZX_GB_QUIET;
+
+    /* A VALUE NO BEHAVIOUR TAKES, so that the FIRST pass through the loop
+       counts as a change and the opening behaviour is acknowledged like
+       every other one.  Initialising this to ZX_GB_QUIET instead left the
+       quiet phase unacknowledged -- the hypervisor's check that B had
+       obeyed every behaviour it was given saw four of five and failed,
+       which is the check working: a phase nobody entered and a phase
+       nobody recorded are the same thing from EL2.  */
+
+    ULONG previous  = 0xFFFFFFFFUL;
 
     guest_mailbox_write(ZX_GD_VCT_START, guest_virtual_count());
 
@@ -510,24 +983,137 @@ static void endless_phase(ULONG options)
 
         /* Both masks.  IRQ is this kernel's own tick; F is the one that
            does nothing, and it is set precisely so that the run
-           demonstrates it doing nothing.  */
+           demonstrates it doing nothing.
+
+           ZX_GO_HOG MASKS FOR THE WHOLE RUN and is not a phase.  It is the
+           build that turns the central design claim into a test result, so
+           it must not be steerable: a hog the hypervisor could talk out of
+           hogging would be proving something weaker.  */
 
         __asm__ volatile("cpsid if" ::: "memory");
+        masked = 1UL;
     }
     else
     {
         console_puts("finished, and staying runnable so that the frame has\n"
                      "something to preempt.  My tick count and my own\n"
-                     "virtual counter keep going into the mailbox.\n");
+                     "virtual counter keep going into the mailbox, and I do\n"
+                     "whatever the hypervisor's behaviour word asks of me.\n");
     }
 
     for (;;)
     {
         live++;
 
+        /* THE THREE WORDS FIRST, on every iteration and in every phase.
+           They are what the temporal claim is checked against from the
+           inside, and a phase that stopped publishing them would look
+           exactly like a partition that had stopped running.  Three stores
+           into a granule this partition owns: no hypercall, no kernel call,
+           and nothing the masked phase cannot do.  */
+
         guest_mailbox_write(ZX_GD_LIVE, live);
         guest_mailbox_write(ZX_GD_VCT_NOW, guest_virtual_count());
         guest_mailbox_write(ZX_GD_TICKS_NOW, tx_time_get());
+
+        if ((options & (ULONG) ZX_GO_HOG) != 0UL)
+        {
+            /* The hog build does its own thing and is not steered.  */
+            work = endless_compute(work);
+
+            continue;
+        }
+
+        behaviour = (ULONG) guest_mailbox_read(ZX_GD_M_BEHAVIOUR);
+
+        if (behaviour != previous)
+        {
+            /* LEAVING a phase, before entering the next one.  Each of the
+               three phases that changes the machine's state undoes it here
+               rather than at the point of entry, so that the state a phase
+               establishes is exactly the state that phase is measured
+               under -- and so that no two phases can ever be half in force
+               at once.  */
+
+            if ((previous == (ULONG) ZX_GB_MASKED) && (masked != 0UL))
+            {
+                __asm__ volatile("cpsie if" ::: "memory");
+                masked = 0UL;
+            }
+
+            if (previous == (ULONG) ZX_GB_STORM)
+            {
+                console_set_quiet(1U);
+            }
+
+            if (previous == (ULONG) ZX_GB_FAULT)
+            {
+                guest_release_scratch_region();
+            }
+
+            /* ENTERING the next one.  */
+
+            if (behaviour == (ULONG) ZX_GB_MASKED)
+            {
+                __asm__ volatile("cpsid if" ::: "memory");
+                masked = 1UL;
+            }
+
+            if (behaviour == (ULONG) ZX_GB_STORM)
+            {
+                console_set_quiet(0U);
+            }
+
+            if (behaviour == (ULONG) ZX_GB_FAULT)
+            {
+                /* THE GRANT IS WHAT MAKES THIS A STAGE-2 FAULT.  Without
+                   it the guest's own MPU refuses first, the abort is taken
+                   to EL1, and the hypervisor is never involved -- so the
+                   phase would measure a partition faulting on ITSELF,
+                   which costs its neighbour nothing for an entirely
+                   different reason.  */
+
+                (void) guest_grant_scratch_region(
+                    guest_mailbox_read(ZX_GD_M_NEIGHBOUR), 0U);
+            }
+
+            seen |= (ULONG) 1U << behaviour;
+            guest_mailbox_write(ZX_GD_M_PHASE_SEEN, (unsigned long) seen);
+            previous = behaviour;
+        }
+
+        if (behaviour == (ULONG) ZX_GB_STORM)
+        {
+            /* A hypercall per character, which on silicon is the slowest
+               thing a partition can do to itself.  Its neighbour must not
+               notice.  */
+
+            console_puts("B is talking, and talking, and talking, which is\n"
+                         "one hypercall per character through a console it\n"
+                         "does not own.\n");
+        }
+        else if (behaviour == (ULONG) ZX_GB_FAULT)
+        {
+            unsigned long address = guest_mailbox_read(ZX_GD_M_NEIGHBOUR);
+
+            if (address != 0UL)
+            {
+                volatile ULONG *target = (volatile ULONG *)(void *)address;
+
+                *target = (ULONG) ZX_GUEST_SENTINEL_A;
+            }
+        }
+        else if (behaviour != (ULONG) ZX_GB_QUIET)
+        {
+            /* SPIN and MASKED both compute; the difference between them is
+               the mask, which was set above and is the whole point.  */
+
+            work = endless_compute(work);
+        }
+        else
+        {
+            /* Quiet: the three words above and nothing else.  */
+        }
     }
 }
 
@@ -668,6 +1254,18 @@ static void consumer_entry(ULONG thread_input)
      * stopped it.  A check whose pass condition is the absence of something
      * has to be able to fail, which is what the granted-address build is
      * for.  */
+
+    /* THE SWEEP, if the hypervisor asked for one.  It and the single probe
+       below are alternatives rather than a sequence: the probe aims one
+       access at one address and ENDS the excursion when stage 2 refuses it,
+       which is the shipping fault policy and the right shape for an image
+       demonstrating one violation.  The sweep needs the hypervisor's
+       test-only continue mode to get past its first case at all, so an
+       image that set both would run the sweep and then have its probe cut
+       short by whichever case happened to be last.  The hypervisor sets one
+       or the other; this is where they part.  */
+
+    progress |= isolation_matrix();
 
     if (guest_mailbox_read(ZX_GD_TARGET) != 0UL)
     {

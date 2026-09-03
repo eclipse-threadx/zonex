@@ -172,6 +172,9 @@ void zx_frame_configure(ZX_FRAME *frame_ptr,
     frame_ptr->zx_frame_spurious     = 0U;
     frame_ptr->zx_frame_stopped_index = ZX_MANIFEST_NO_INDEX;
     frame_ptr->zx_frame_stop_outcome  = ZX_RUN_FRAME_DONE;
+    frame_ptr->zx_frame_hook          = (ZX_FRAME_HOOK_FN)0;
+    frame_ptr->zx_frame_hook_argument = (void *)0;
+    frame_ptr->zx_frame_hook_frames   = 0UL;
 
     zx_frame_active        = frame_ptr;
     zx_el2_current_context = (ZX_GUEST_CONTEXT *)0;
@@ -238,6 +241,96 @@ static void zx_frame_console_claim(const ZX_FRAME *frame_ptr, UINT index)
 /**************************************************************************/
 /*  zx_frame_stopped -- has this partition left its window for good?      */
 /**************************************************************************/
+
+/**************************************************************************/
+/*  zx_frame_current_partition -- whose window is this?                   */
+/*                                                                        */
+/*  THROUGH THE SCHEDULE, NOT THROUGH THE CONTEXT POINTER.  A caller could */
+/*  compare zx_el2_current_context against the contexts array and get the */
+/*  same answer nearly always -- and disagree exactly once, at a boundary  */
+/*  where one has been changed and the other has not.  The fault log's     */
+/*  attribution and the frame's own report then name different partitions  */
+/*  for one event, which is the least useful moment for two sources of     */
+/*  truth to exist.  One source: the schedule.                            */
+/**************************************************************************/
+
+UINT zx_frame_current_partition(void)
+{
+    if (zx_frame_active == (ZX_FRAME *)0)
+    {
+        return ZX_MANIFEST_NO_INDEX;
+    }
+
+    return zx_schedule_current_partition(zx_frame_active->zx_frame_schedule);
+}
+
+
+/**************************************************************************/
+/*  zx_frame_set_frame_hook                                               */
+/**************************************************************************/
+
+void zx_frame_set_frame_hook(ZX_FRAME *frame_ptr, ZX_FRAME_HOOK_FN hook_fn,
+                             void *argument)
+{
+    if (frame_ptr == (ZX_FRAME *)0)
+    {
+        return;
+    }
+
+    frame_ptr->zx_frame_hook          = hook_fn;
+    frame_ptr->zx_frame_hook_argument = argument;
+    frame_ptr->zx_frame_hook_frames   = 0UL;
+}
+
+
+/**************************************************************************/
+/*  zx_frame_after_switch -- the bookkeeping that is NOT a switch.        */
+/*                                                                        */
+/*  CALLED AFTER THE CYCLE COUNTER HAS BEEN READ THE SECOND TIME, always, */
+/*  and that placement is a requirement rather than a tidiness.  Both      */
+/*  things below are here because a determinism regression needs them and  */
+/*  a partition switch does not, and putting either inside the timed       */
+/*  bracket would add its cost to every switch figure this repository has  */
+/*  published -- so a measurement taken with this code present would stop  */
+/*  being comparable with the silicon figures taken before it existed.     */
+/*                                                                        */
+/*  THE PERIOD IS UNAFFECTED BY BEING MEASURED LATE.  It is the difference */
+/*  between two consecutive entry timestamps, and the offset between "the  */
+/*  core was given to the partition" and "the timestamp was taken" is the  */
+/*  same on both -- so it cancels.  That is what makes moving this out of  */
+/*  the bracket free rather than merely cheap, and it is why the timestamp */
+/*  used is the one the time freeze already took rather than a fresh read. */
+/**************************************************************************/
+
+static void zx_frame_after_switch(ZX_FRAME *frame_ptr, UINT index)
+{
+    ULONG frames;
+
+    zx_context_period_note(&frame_ptr->zx_frame_contexts[index],
+                           frame_ptr->zx_frame_contexts[index]
+                               .zx_ctx_resumed_at);
+
+    if (frame_ptr->zx_frame_hook == (ZX_FRAME_HOOK_FN)0)
+    {
+        return;
+    }
+
+    /* ONCE PER COMPLETED MAJOR FRAME, and the comparison is against the
+       count the hook was last called at rather than a modulo of the
+       boundary number.  A frame in which a partition was stopped takes
+       fewer boundaries per frame, so counting boundaries would drift out of
+       step with the schedule exactly on the runs where a phase change
+       matters most.  */
+
+    frames = frame_ptr->zx_frame_schedule->zx_schedule_frames;
+
+    if (frames != frame_ptr->zx_frame_hook_frames)
+    {
+        frame_ptr->zx_frame_hook_frames = frames;
+        frame_ptr->zx_frame_hook(frame_ptr->zx_frame_hook_argument, frames);
+    }
+}
+
 
 static uint32_t zx_frame_stopped(const ZX_FRAME *frame_ptr, UINT index)
 {
@@ -586,6 +679,12 @@ ZX_GUEST_CONTEXT *zx_el2_window_boundary(void)
         }
     }
 
+    /* THE PERIOD AND THE PHASE HOOK, both of them after the cycle counter
+       has been read for the second time.  Neither is part of a switch and
+       neither may be allowed to cost one -- see zx_frame_after_switch.  */
+
+    zx_frame_after_switch(frame_ptr, index);
+
     if (frame_ptr->zx_frame_schedule->zx_schedule_missed
             >= (ULONG)ZX_FRAME_MISS_LIMIT)
     {
@@ -667,6 +766,16 @@ uint32_t zx_frame_run(ZX_FRAME *frame_ptr)
         {
             zx_schedule_note_missed(frame_ptr->zx_frame_schedule);
         }
+
+        /* THE COLD START AND EVERY RE-ENTRY AFTER AN EARLY DEPARTURE.  This
+           loop body runs once per partition that LEFT ITS WINDOW EARLY, and
+           once at the beginning; every ordinary boundary is handled in the
+           vector and never comes back here.  Both paths have to record the
+           entry, or the first period of the run and every period after a
+           yield would be missing -- and the periods either side of a gap
+           are the ones a reader looks at first.  */
+
+        zx_frame_after_switch(frame_ptr, index);
 
         zx_frame_console_claim(frame_ptr, index);
 

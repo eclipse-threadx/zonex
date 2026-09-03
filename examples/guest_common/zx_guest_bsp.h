@@ -204,6 +204,74 @@ unsigned int guest_mpu_is_enabled(void);
 
 unsigned int guest_grant_probe_region(unsigned long target);
 
+/* THE SAME THING, FOR A SWEEP, and it costs ONE region rather than one per
+ * case.
+ *
+ * guest_grant_probe_region above allocates a fresh region per call, which is
+ * right for a single probe and wrong for the isolation matrix: six cases
+ * would consume six of the sixteen regions an Armv8-R part is allowed to
+ * have, and a part at the low end of that range would run out mid-sweep and
+ * report the remaining cases as denied when they had simply never been
+ * attempted.  A sweep whose length is bounded by the region budget is a
+ * sweep that silently shortens on the smallest target.
+ *
+ * So this REPROGRAMS one dedicated scratch region instead.  The cost is
+ * fixed at one region however many cases there are, and the region is
+ * DISABLED again by guest_release_scratch_region -- because a stale grant
+ * left enabled at the end of a sweep is a guest carrying a permission
+ * nothing granted it into every window that follows.
+ *
+ * `executable` asks for XN clear, which case 3 needs and nothing else does.
+ * A branch into memory the guest's own MPU marks execute-never is refused by
+ * STAGE 1, at EL1, and never reaches the hypervisor -- so an execute case
+ * run through a non-executable grant would report a stage-1 fault and prove
+ * nothing whatever about stage 2.
+ *
+ * Returns one of the ZX_GRANT_* codes below, because "already covered" and
+ * "no region to spare" are different facts and the matrix reports them
+ * differently: the first makes a case meaningless, the second makes it
+ * unattempted.  */
+
+#define ZX_GRANT_PROGRAMMED     0U  /* the scratch region now covers it     */
+#define ZX_GRANT_ALREADY        1U  /* the guest's own regions cover it     */
+#define ZX_GRANT_NO_REGION      2U  /* nothing to spare -- not attempted    */
+
+unsigned int guest_grant_scratch_region(unsigned long target,
+                                        unsigned int executable);
+
+void guest_release_scratch_region(void);
+
+/* Is this range inside the part of the window the guest can freely write --
+ * above its own image and below the window's end?
+ *
+ * ASKED BECAUSE THE HYPERVISOR COMPUTES THE MARK RANGE, from the manifest,
+ * which is the right source: the guest must not be the one deciding which
+ * of its granules count as evidence.  But a hypervisor that had computed it
+ * wrongly would have the guest scribble over its own kernel, and the run
+ * would then fail somewhere with no visible connection to the mistake.  Two
+ * independent statements of the same geometry, checked against each other,
+ * cost four comparisons.  */
+
+unsigned int guest_owns_range(unsigned long base, unsigned long size);
+
+/* Branch to an address the guest must not be able to execute, publishing
+ * where it wants to be resumed if the branch is refused.
+ *
+ * Implemented in zx_guest_head.S, for a reason worth knowing before reading
+ * the call: the address of the instruction after a branch is not something
+ * C can name portably, and taking the address of a label is a GNU extension
+ * this project builds with extensions OFF specifically to reject.
+ *
+ * Returns 0 when the hypervisor put the guest back at the published point --
+ * which is what a REFUSED branch looks like from here -- and 1 when the
+ * branch succeeded and the target returned, which is an isolation failure.
+ * It cannot report the branch succeeding and NOT returning: that is the
+ * other partition's kernel starting up on this guest's stack, and no code
+ * here would run again to say so.  */
+
+unsigned long guest_branch_probe(unsigned long target,
+                                 volatile unsigned long *resume_slot);
+
 /* Install the guest's own EL1 vector table.  Called before anything can
    fault at EL1 with an opinion worth recording.  */
 
@@ -228,5 +296,15 @@ void guest_report(unsigned long progress_bits);
 
 unsigned long guest_mailbox_read(unsigned long offset);
 void guest_mailbox_write(unsigned long offset, unsigned long value);
+
+/* THE ADDRESS of one mailbox word, for the one caller that needs to hand a
+   mailbox slot to something else rather than read or write it here: the
+   execute case's assembly helper, which publishes its resume point.  Kept
+   to that one purpose deliberately -- a pointer into the mailbox handed
+   around freely would make "who writes this word" unanswerable, and the
+   whole layout in zx_guest_abi.h is built on that question having one
+   answer per word.  */
+
+volatile unsigned long *guest_mailbox_slot(unsigned long offset);
 
 #endif /* ZX_GUEST_BSP_H */
