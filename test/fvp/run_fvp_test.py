@@ -64,6 +64,35 @@ PASS_MARK = "ZONEX RESULT: ALL CHECKS PASSED"
 FAIL_MARK = "ZONEX RESULT: FAILED"
 
 
+def verdict_line(output, mark):
+    """True when `mark` appears as a VERDICT and not merely as prose.
+
+    A verdict is printed alone on its own line.  An image is also free to
+    talk ABOUT its verdict -- a negative build explains what it expects
+    before it does anything -- and a substring search cannot tell the two
+    apart.
+
+    That distinction is not pedantic; it was a hole.  The negative probe
+    build's opening banner contained the literal fail mark inside a
+    sentence, and the fail mark is exactly what proves a negative run
+    REPORTED its failure rather than crashing.  Every negative run therefore
+    satisfied that condition in its first few lines, so an image that
+    hung, faulted, or reset immediately afterwards was judged a correct
+    negative result.
+
+    Matching at the START OF A LINE closes it at the reader rather than at
+    the writer, which is the right end: the next explanatory paragraph that
+    happens to quote a verdict cannot reopen it.
+
+    A prefix and not an exact match, because some verdicts carry a reason
+    -- "ZONEX RESULT: FAILED -- the target cannot host stage 2 as this
+    image needs it" is a real one, and it is a verdict rather than prose.
+    What that still excludes is the case this exists for: a mark quoted
+    INSIDE a sentence, which never begins the line it is on.
+    """
+    return any(line.strip().startswith(mark) for line in output.splitlines())
+
+
 def as_text(stream):
     """Normalise a captured stream to str.
 
@@ -87,14 +116,14 @@ def judge(output, expect):
     printing both is reported as broken rather than as whichever came first.
     """
     if expect == "pass":
-        if FAIL_MARK in output:
+        if verdict_line(output, FAIL_MARK):
             print("FAIL: the image reported failing checks.", file=sys.stderr)
             for line in output.splitlines():
                 if line.startswith("  [FAIL]"):
                     print("   " + line.strip(), file=sys.stderr)
             return 1
 
-        if PASS_MARK not in output:
+        if not verdict_line(output, PASS_MARK):
             print(
                 "FAIL: no ZoneX verdict line was found. The image neither "
                 "passed nor reported failure, so it did not reach its "
@@ -108,7 +137,7 @@ def judge(output, expect):
 
     # expect == "fail": this image was built to violate something, and the
     # run is judged on whether the violation was DETECTED and NAMED.
-    if PASS_MARK in output:
+    if verdict_line(output, PASS_MARK):
         print(
             "FAIL: the image reported ALL CHECKS PASSED, but it was built to "
             "fail. The check it was built to violate has stopped detecting "
@@ -118,7 +147,7 @@ def judge(output, expect):
         )
         return 1
 
-    if FAIL_MARK not in output:
+    if not verdict_line(output, FAIL_MARK):
         print(
             "FAIL: no ZoneX verdict line was found. A negative build must "
             "REPORT its own failure, not merely fail to run: an image that "

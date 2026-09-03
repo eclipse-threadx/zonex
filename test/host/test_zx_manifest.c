@@ -416,6 +416,38 @@ static void test_runnability(void)
     partitions[1].zx_partition_entry        = P1_TINY_CODE_BASE;
     partitions[1].zx_partition_image_end    = IMAGE_START + 0x20U;
     EXPECT(ZX_MANIFEST_SUCCESS, ZX_MANIFEST_NO_INDEX, ZX_MANIFEST_NO_INDEX);
+
+    /* AN IMAGE THAT EXACTLY FILLS ITS WINDOW, which is the boundary the two
+       halves of this rule disagreed about.
+
+       The tiny region runs from P1_TINY_CODE_BASE to P1_TINY_CODE_LIMIT
+       INCLUSIVE, so it holds 0x40 bytes.  An image of exactly 0x40 must be
+       accepted: zx_partition_prepare accepts it, copies it, and leaves not
+       one byte spare, which is a perfectly good guest.  The validator used
+       to compare the length against (limit - base) -- 0x3F -- and refused
+       it, so a manifest the loader would have loaded was rejected at boot
+       with a message saying the image was too large for a window it fits.
+
+       Both sides of the boundary are here on purpose.  A one-sided test
+       cannot tell a rule that is off by one from a rule that is right: it
+       is the pair -- 0x40 accepted, 0x41 refused -- that pins the
+       comparison to the exact byte.  */
+
+    reset_manifest();
+    set_region(&p1_regions[3], P1_TINY_CODE_BASE, P1_TINY_CODE_LIMIT,
+               ZX_AP_EL2_RW_GUEST_RW, ZX_XN_EXECUTABLE, ATTR_NORMAL);
+    partitions[1].zx_partition_region_count = 4U;
+    partitions[1].zx_partition_entry        = P1_TINY_CODE_BASE;
+    partitions[1].zx_partition_image_end    = IMAGE_START + 0x40U;
+    EXPECT(ZX_MANIFEST_SUCCESS, ZX_MANIFEST_NO_INDEX, ZX_MANIFEST_NO_INDEX);
+
+    reset_manifest();
+    set_region(&p1_regions[3], P1_TINY_CODE_BASE, P1_TINY_CODE_LIMIT,
+               ZX_AP_EL2_RW_GUEST_RW, ZX_XN_EXECUTABLE, ATTR_NORMAL);
+    partitions[1].zx_partition_region_count = 4U;
+    partitions[1].zx_partition_entry        = P1_TINY_CODE_BASE;
+    partitions[1].zx_partition_image_end    = IMAGE_START + 0x41U;
+    EXPECT(ZX_MANIFEST_IMAGE_TOO_LARGE, 1U, ZX_MANIFEST_NO_INDEX);
 }
 
 static void test_time_partitioning(void)

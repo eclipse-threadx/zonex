@@ -41,6 +41,15 @@
 #include "zx_console_capture.h"
 #include "zx_test.h"
 
+/* A part whose HPRENR implements every bit, which is what most of the cases
+   below want: they are about the region BUDGET, and a narrow enable mask
+   would fail them for a second reason and hide the first.  The cases that
+   are about the enable mask pass their own value, and they are the only
+   ones that should.  Both ZoneX targets measure 0x000FFFFF -- twenty bits
+   for twenty regions -- so neither extreme is the real hardware, which is
+   exactly why both are exercised here rather than on a board.  */
+#define ZX_HPRENR_ALL   0xFFFFFFFFU
+
 static ZX_REGION    p_regions[ZX_MAX_PARTITIONS][ZX_MAX_REGIONS_PER_PARTITION];
 static ZX_PARTITION partitions[ZX_MAX_PARTITIONS];
 static ZX_MANIFEST  manifest;
@@ -74,7 +83,7 @@ static void test_plan_with_mmio(void)
     /* Two hypervisor MMIO regions -- the silicon case -- and two
        partitions of three regions each.  */
     reset_manifest(2U, 3U);
-    ZX_CHECK_EQ(zx_mm_plan(&manifest, 2U, 20U, &layout),
+    ZX_CHECK_EQ(zx_mm_plan(&manifest, 2U, 20U, ZX_HPRENR_ALL, &layout),
                 ZX_MANIFEST_SUCCESS);
 
     ZX_CHECK_EQ(layout.zx_layout_mmio_count, 2U);
@@ -99,7 +108,7 @@ static void test_plan_without_mmio(void)
        down, which is exactly why the layout is printed at boot: region 3
        is a different window on the two targets.  */
     reset_manifest(2U, 3U);
-    ZX_CHECK_EQ(zx_mm_plan(&manifest, 0U, 32U, &layout),
+    ZX_CHECK_EQ(zx_mm_plan(&manifest, 0U, 32U, ZX_HPRENR_ALL, &layout),
                 ZX_MANIFEST_SUCCESS);
 
     ZX_CHECK_EQ(layout.zx_layout_always_mask, 0U);
@@ -120,7 +129,7 @@ static void test_masks_are_disjoint(void)
        partition that can reach its neighbour's memory while it runs, which
        faults nothing and prints nothing.  */
     reset_manifest(ZX_MAX_PARTITIONS, 2U);
-    ZX_CHECK_EQ(zx_mm_plan(&manifest, 2U, 32U, &layout),
+    ZX_CHECK_EQ(zx_mm_plan(&manifest, 2U, 32U, ZX_HPRENR_ALL, &layout),
                 ZX_MANIFEST_SUCCESS);
 
     for (first = 0U; first < layout.zx_layout_partitions; first++)
@@ -146,32 +155,34 @@ static void test_masks_are_disjoint(void)
 static void test_plan_rejections(void)
 {
     reset_manifest(2U, 3U);
-    ZX_CHECK_EQ(zx_mm_plan((const ZX_MANIFEST *)0, 2U, 20U, &layout),
+    ZX_CHECK_EQ(zx_mm_plan((const ZX_MANIFEST *)0, 2U, 20U, ZX_HPRENR_ALL,
+                           &layout),
                 ZX_MANIFEST_NULL_POINTER);
 
     reset_manifest(2U, 3U);
-    ZX_CHECK_EQ(zx_mm_plan(&manifest, 2U, 20U, (ZX_MM_LAYOUT *)0),
+    ZX_CHECK_EQ(zx_mm_plan(&manifest, 2U, 20U, ZX_HPRENR_ALL,
+                           (ZX_MM_LAYOUT *)0),
                 ZX_MANIFEST_NULL_POINTER);
 
     reset_manifest(2U, 3U);
     manifest.zx_manifest_partitions = (const ZX_PARTITION *)0;
-    ZX_CHECK_EQ(zx_mm_plan(&manifest, 2U, 20U, &layout),
+    ZX_CHECK_EQ(zx_mm_plan(&manifest, 2U, 20U, ZX_HPRENR_ALL, &layout),
                 ZX_MANIFEST_NULL_POINTER);
 
     reset_manifest(0U, 3U);
-    ZX_CHECK_EQ(zx_mm_plan(&manifest, 2U, 20U, &layout),
+    ZX_CHECK_EQ(zx_mm_plan(&manifest, 2U, 20U, ZX_HPRENR_ALL, &layout),
                 ZX_MANIFEST_NO_PARTITIONS);
 
     reset_manifest(ZX_MAX_PARTITIONS + 1U, 3U);
-    ZX_CHECK_EQ(zx_mm_plan(&manifest, 2U, 20U, &layout),
+    ZX_CHECK_EQ(zx_mm_plan(&manifest, 2U, 20U, ZX_HPRENR_ALL, &layout),
                 ZX_MANIFEST_TOO_MANY_PARTITIONS);
 
     reset_manifest(2U, 0U);
-    ZX_CHECK_EQ(zx_mm_plan(&manifest, 2U, 20U, &layout),
+    ZX_CHECK_EQ(zx_mm_plan(&manifest, 2U, 20U, ZX_HPRENR_ALL, &layout),
                 ZX_MANIFEST_NO_REGIONS);
 
     reset_manifest(2U, ZX_MAX_REGIONS_PER_PARTITION + 1U);
-    ZX_CHECK_EQ(zx_mm_plan(&manifest, 2U, 20U, &layout),
+    ZX_CHECK_EQ(zx_mm_plan(&manifest, 2U, 20U, ZX_HPRENR_ALL, &layout),
                 ZX_MANIFEST_TOO_MANY_REGIONS);
 }
 
@@ -182,40 +193,143 @@ static void test_budget(void)
        region at an index the part does not have, and only the first of
        those is visible without hardware.  */
     reset_manifest(2U, 3U);
-    ZX_CHECK_EQ(zx_mm_plan(&manifest, 2U, 8U, &layout),
+    ZX_CHECK_EQ(zx_mm_plan(&manifest, 2U, 8U, ZX_HPRENR_ALL, &layout),
                 ZX_MANIFEST_SUCCESS);
 
     reset_manifest(2U, 3U);
-    ZX_CHECK_EQ(zx_mm_plan(&manifest, 2U, 7U, &layout),
+    ZX_CHECK_EQ(zx_mm_plan(&manifest, 2U, 7U, ZX_HPRENR_ALL, &layout),
                 ZX_MANIFEST_REGION_BUDGET);
 
     /* The model's 32 EL2 regions are not an architecturally legal
        Cortex-R52 value, so a plan that fits the model can still be too big
        for silicon.  Same manifest, two budgets, two answers.  */
     reset_manifest(ZX_MAX_PARTITIONS, ZX_MAX_REGIONS_PER_PARTITION);
-    ZX_CHECK_EQ(zx_mm_plan(&manifest, 2U, 32U, &layout),
+    ZX_CHECK_EQ(zx_mm_plan(&manifest, 2U, 32U, ZX_HPRENR_ALL, &layout),
                 ZX_MANIFEST_SUCCESS);
 
     reset_manifest(ZX_MAX_PARTITIONS, ZX_MAX_REGIONS_PER_PARTITION);
-    ZX_CHECK_EQ(zx_mm_plan(&manifest, 2U, 20U, &layout),
+    ZX_CHECK_EQ(zx_mm_plan(&manifest, 2U, 20U, ZX_HPRENR_ALL, &layout),
                 ZX_MANIFEST_REGION_BUDGET);
 
     /* HPRENR has 32 bits, so an index with no enable bit is refused even
        when a caller claims a larger budget.  A region that cannot be
        enabled is a hole in the memory map with no diagnostic.  */
     reset_manifest(2U, 3U);
-    ZX_CHECK_EQ(zx_mm_plan(&manifest, 33U, 64U, &layout),
+    ZX_CHECK_EQ(zx_mm_plan(&manifest, 33U, 64U, ZX_HPRENR_ALL, &layout),
                 ZX_MANIFEST_REGION_BUDGET);
 
     reset_manifest(2U, 3U);
-    ZX_CHECK_EQ(zx_mm_plan(&manifest, 30U, 64U, &layout),
+    ZX_CHECK_EQ(zx_mm_plan(&manifest, 30U, 64U, ZX_HPRENR_ALL, &layout),
                 ZX_MANIFEST_REGION_BUDGET);
+}
+
+static void test_enable_bit_budget(void)
+{
+    /* THE SECOND BUDGET, AND WHY IT IS NOT THE FIRST ONE.
+     *
+     * A part can have more region DESCRIPTORS than HPRENR has enable BITS.
+     * The Cortex-R52 TRM says so twice and disagrees with itself: its prose
+     * gives HPRENR "regions 0 to 15" while its own bit tables give [19:0]
+     * on a 20-region implementation.  Both ZoneX targets measured twenty
+     * bits, so the two budgets agree on the hardware this suite can reach
+     * -- which is exactly why the disagreement has to be tested HERE, on a
+     * workstation, with a mask no board would produce.
+     *
+     * What the defect looks like on a part where they differ: a partition
+     * seated at an index above the mask gets its descriptor programmed with
+     * HPRLAR.EN set, the one-write partition switch leaves that bit alone
+     * because HPRENR has nothing there, and the outgoing partition's window
+     * stays reachable underneath the incoming one.  No fault, no
+     * diagnostic, and an isolation claim that is simply untrue.
+     */
+
+    /* 2 MMIO + 3 + 3 = 8 regions on a part with twenty descriptors and a
+       SIXTEEN-bit HPRENR.  Every index used is below 16, so this fits and
+       must be accepted -- the narrow mask on its own is not an error.  */
+    reset_manifest(2U, 3U);
+    ZX_CHECK_EQ(zx_mm_plan(&manifest, 2U, 20U, 0x0000FFFFU, &layout),
+                ZX_MANIFEST_SUCCESS);
+    ZX_CHECK_EQ(layout.zx_layout_enable_bits, 0x0000FFFFU);
+
+    /* The same narrow part with four partitions of four regions each:
+       2 + 16 = 18 indices, which the descriptors have room for and the
+       enable mask does not.  Index 16 and 17 would be programmed and could
+       never be switched off.  */
+    reset_manifest(4U, 4U);
+    ZX_CHECK_EQ(zx_mm_plan(&manifest, 2U, 20U, 0x0000FFFFU, &layout),
+                ZX_MANIFEST_NO_ENABLE_BIT);
+
+    /* And the SAME manifest on a part whose mask is as wide as its region
+       count -- which is what both ZoneX targets actually measured -- is
+       accepted.  The pair is the point: a rule that rejects everything is
+       indistinguishable from one that is right until it is seen to
+       accept.  */
+    reset_manifest(4U, 4U);
+    ZX_CHECK_EQ(zx_mm_plan(&manifest, 2U, 20U, 0x000FFFFFU, &layout),
+                ZX_MANIFEST_SUCCESS);
+
+    /* The exact boundary, both sides.  Eight indices need bits 0 to 7, so a
+       mask of 0xFF is exactly enough and 0x7F is one short.  An off-by-one
+       here would either refuse a plan that fits or accept the defect above,
+       and only a two-sided test can tell those apart.  */
+    reset_manifest(2U, 3U);
+    ZX_CHECK_EQ(zx_mm_plan(&manifest, 2U, 20U, 0x000000FFU, &layout),
+                ZX_MANIFEST_SUCCESS);
+
+    reset_manifest(2U, 3U);
+    ZX_CHECK_EQ(zx_mm_plan(&manifest, 2U, 20U, 0x0000007FU, &layout),
+                ZX_MANIFEST_NO_ENABLE_BIT);
+
+    /* A HOLE in the middle of the mask, which no real part is likely to
+       have and which the check must still catch: the rule is "every index
+       assigned has a bit", not "enough bits exist".  Bit 5 missing with
+       eight indices in use has to be refused, and a count-based check
+       would pass it.  */
+    reset_manifest(2U, 3U);
+    ZX_CHECK_EQ(zx_mm_plan(&manifest, 2U, 20U, 0xFFFFFFDFU, &layout),
+                ZX_MANIFEST_NO_ENABLE_BIT);
+
+    /* And a part with no HPRENR at all.  Nothing could ever be switched,
+       so nothing may be planned -- including the hypervisor's own MMIO,
+       which is in every mask.  */
+    reset_manifest(2U, 3U);
+    ZX_CHECK_EQ(zx_mm_plan(&manifest, 2U, 20U, 0U, &layout),
+                ZX_MANIFEST_NO_ENABLE_BIT);
+
+    /* ALL THIRTY-TWO INDICES IN USE, which is the one case where the mask
+       cannot be built by shifting.
+     *
+     * 29 hypervisor MMIO regions and one partition of three take indices 0
+     * to 31 inclusive, so every bit of HPRENR is needed.  Computing that
+     * mask as ((1 << 32) - 1) is UNDEFINED BEHAVIOUR -- a shift by the
+     * width of the type -- and on this architecture it is not even reliably
+     * zero: Arm's shifter takes the count modulo 256 while x86's takes it
+     * modulo 32, so the same expression yields 0 on the target and 1 on the
+     * host that tests it.  The planner spells the all-ones case out instead,
+     * and this is the case that reaches that spelling.
+     *
+     * No real board looks like this.  It is here because the alternative is
+     * a branch nothing exercises in a file with a 100% floor, and a floor
+     * with an exception in it is a floor nobody trusts.  */
+
+    reset_manifest(1U, 3U);
+    ZX_CHECK_EQ(zx_mm_plan(&manifest, 29U, 32U, ZX_HPRENR_ALL, &layout),
+                ZX_MANIFEST_SUCCESS);
+    ZX_CHECK_EQ(layout.zx_layout_regions_used, 32U);
+    ZX_CHECK_EQ(layout.zx_layout_partition_mask[0], 0xFFFFFFFFU);
+
+    /* The same geometry one enable bit short, so that the all-ones mask is
+       seen to REJECT as well as to accept.  Bit 31 is the one missing, and
+       it is partition 0's last region.  */
+    reset_manifest(1U, 3U);
+    ZX_CHECK_EQ(zx_mm_plan(&manifest, 29U, 32U, 0x7FFFFFFFU, &layout),
+                ZX_MANIFEST_NO_ENABLE_BIT);
 }
 
 static void test_partition_mask_lookup(void)
 {
     reset_manifest(2U, 3U);
-    ZX_CHECK_EQ(zx_mm_plan(&manifest, 2U, 20U, &layout),
+    ZX_CHECK_EQ(zx_mm_plan(&manifest, 2U, 20U, ZX_HPRENR_ALL, &layout),
                 ZX_MANIFEST_SUCCESS);
 
     ZX_CHECK_EQ(zx_mm_partition_mask(&layout, 0U), 0x0000001FU);
@@ -233,7 +347,7 @@ static void test_partition_mask_lookup(void)
 static void test_report(void)
 {
     reset_manifest(2U, 3U);
-    ZX_CHECK_EQ(zx_mm_plan(&manifest, 2U, 20U, &layout),
+    ZX_CHECK_EQ(zx_mm_plan(&manifest, 2U, 20U, ZX_HPRENR_ALL, &layout),
                 ZX_MANIFEST_SUCCESS);
 
     zx_capture_reset();
@@ -246,10 +360,11 @@ static void test_report(void)
     ZX_CHECK_EQ(zx_capture_contains("2..4"), 1U);
     ZX_CHECK_EQ(zx_capture_contains("5..7"), 1U);
     ZX_CHECK_EQ(zx_capture_contains("regions used"), 1U);
+    ZX_CHECK_EQ(zx_capture_contains("HPRENR bits implemented"), 1U);
 
     /* On a board with none, say so rather than printing "0..-1".  */
     reset_manifest(2U, 3U);
-    ZX_CHECK_EQ(zx_mm_plan(&manifest, 0U, 20U, &layout),
+    ZX_CHECK_EQ(zx_mm_plan(&manifest, 0U, 20U, ZX_HPRENR_ALL, &layout),
                 ZX_MANIFEST_SUCCESS);
 
     zx_capture_reset();
@@ -259,7 +374,7 @@ static void test_report(void)
     /* An unnamed partition must not print a null pointer.  */
     reset_manifest(2U, 3U);
     partitions[1].zx_partition_name = (const CHAR *)0;
-    ZX_CHECK_EQ(zx_mm_plan(&manifest, 2U, 20U, &layout),
+    ZX_CHECK_EQ(zx_mm_plan(&manifest, 2U, 20U, ZX_HPRENR_ALL, &layout),
                 ZX_MANIFEST_SUCCESS);
 
     zx_capture_reset();
@@ -277,6 +392,7 @@ ZX_TEST_MAIN("test_zx_mm",
     test_masks_are_disjoint();
     test_plan_rejections();
     test_budget();
+    test_enable_bit_budget();
     test_partition_mask_lookup();
     test_report();
 )

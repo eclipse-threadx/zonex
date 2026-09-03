@@ -454,7 +454,8 @@ void zx_phase_two_partitions(uint32_t board_regions, uint32_t el2_regions)
     /*  The plan.                                                      */
     /* ---------------------------------------------------------------- */
 
-    status = zx_mm_plan(&zx_manifest, board_regions, el2_regions, &zx_layout);
+    status = zx_mm_plan(&zx_manifest, board_regions, el2_regions,
+                        zx_hprenr_implemented_bits, &zx_layout);
     zx_note("zx_mm_plan", status);
 
     if (status != ZX_MANIFEST_SUCCESS)

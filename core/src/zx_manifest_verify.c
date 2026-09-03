@@ -636,10 +636,29 @@ static UINT zx_manifest_partition_check(const ZX_MANIFEST *manifest_ptr,
                        above.  No guard is added for them on purpose -- a
                        condition that cannot be false is dead code, and
                        dead code in a function with a coverage floor is a
-                       branch nobody can ever cover.  */
+                       branch nobody can ever cover.
 
-                    if ((partition_ptr->zx_partition_image_end
-                         - partition_ptr->zx_partition_image_start)
+                       THE LENGTH IS REDUCED BY ONE AND THE LIMIT IS NOT,
+                       and getting that backwards is worth a paragraph
+                       because it was wrong here and right in the loader.
+                       The limit is INCLUSIVE, so a window holds
+                       limit - base + 1 bytes; a rule written as
+                       length <= (limit - base) therefore refuses an image
+                       that EXACTLY FILLS its window.  That is a manifest
+                       the loader accepts -- zx_partition_prepare asks
+                       whether (length - 1) > (limit - base) -- so the two
+                       disagreed about one byte, and the disagreement had
+                       the validator refusing at boot with a message saying
+                       the image was too large for a window it fits
+                       perfectly.  The forms are now identical on purpose:
+                       the subtraction moves to the LENGTH, where it cannot
+                       overflow (length >= 1 above), rather than to the
+                       limit, where base + length - 1 would wrap for a
+                       window reaching the top of the address space and
+                       report a real overrun as a fit.  */
+
+                    if (((partition_ptr->zx_partition_image_end
+                          - partition_ptr->zx_partition_image_start) - 1U)
                             <= (region_ptr->zx_region_limit
                                 - region_ptr->zx_region_base))
                     {

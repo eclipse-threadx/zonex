@@ -330,7 +330,8 @@ ZX_NORETURN void zx_el2_main(void)
 
     zx_check("the manifest passes every rule", 1U);
 
-    status = zx_mm_plan(&zx_manifest, board_regions, el2_regions, &zx_layout);
+    status = zx_mm_plan(&zx_manifest, board_regions, el2_regions,
+                        zx_hprenr_implemented_bits, &zx_layout);
     zx_note("zx_mm_plan", status);
     zx_check("the layout fits this part's region budget",
              (status == ZX_MANIFEST_SUCCESS) ? 1U : 0U);

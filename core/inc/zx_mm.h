@@ -100,6 +100,13 @@ typedef struct zx_mm_layout_struct
        D19 keeps a fixed width exactly where the width is the point.  */
     uint32_t    zx_layout_always_mask;
     uint32_t    zx_layout_partition_mask[ZX_MAX_PARTITIONS];
+
+    /* WHICH HPRENR BITS THE PART ACTUALLY IMPLEMENTS, carried through so
+       that the report can print it beside the masks built from it.  A
+       number nobody can see is a check nobody can repeat, and this is the
+       one number that says whether a partition switch can reach every
+       region the plan assigned.  */
+    uint32_t    zx_layout_enable_bits;
 } ZX_MM_LAYOUT;
 
 /**************************************************************************/
@@ -120,11 +127,33 @@ typedef struct zx_mm_layout_struct
  * at an index the implementation does not have is UNPREDICTABLE rather than
  * an error -- the model reports 32 EL2 regions, which is not an
  * architecturally legal Cortex-R52 value, so a plan that fits the model
- * proves nothing about a real part.  */
+ * proves nothing about a real part.
+ *
+ * TWO BUDGETS, NOT ONE, AND THE SECOND IS THE PARTITION SWITCH'S.
+ *
+ * region_budget is HMPUIR: how many region DESCRIPTORS the part has, which
+ * is what decides whether every window can be programmed at all.
+ * enable_bits is the mask of HPRENR bits the part IMPLEMENTS, measured by
+ * the reset path writing all ones and reading back what stuck, and it is a
+ * different question with a different answer: it decides whether a region,
+ * once programmed, can be turned OFF again.
+ *
+ * They can disagree, and the TRM says so twice in incompatible ways -- its
+ * prose gives HPRENR "regions 0 to 15" while its own bit tables give [19:0]
+ * on a 20-region part.  Both ZoneX targets came out 20 bits wide, so today
+ * the two budgets agree; on a part where they do not, a plan checked only
+ * against HMPUIR would put a partition's window at an index with no enable
+ * bit.  Its descriptor would be programmed with HPRLAR.EN set, the
+ * one-write partition switch would leave that bit alone, and the OUTGOING
+ * partition's window would stay live underneath the incoming one -- an
+ * isolation failure with no fault, no diagnostic, and nothing in the log to
+ * suggest it.  That is why the two are separate parameters rather than one
+ * number the caller reconciles.  */
 
 ZX_NODISCARD UINT zx_mm_plan(const ZX_MANIFEST *manifest_ptr,
                              UINT mmio_region_count,
                              UINT region_budget,
+                             uint32_t enable_bits,
                              ZX_MM_LAYOUT *layout_ptr);
 
 /* The HPRENR image that must be in force while a partition runs: its own

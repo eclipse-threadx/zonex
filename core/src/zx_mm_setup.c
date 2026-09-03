@@ -57,16 +57,26 @@
 /*    exactly the difference a boot-time printout should make visible     */
 /*    rather than hide.                                                   */
 /*                                                                        */
+/*    AND IT CHECKS TWO BUDGETS, WHICH IS THE HALF THAT WAS MISSING.      */
+/*    HMPUIR says how many region DESCRIPTORS exist; HPRENR's implemented */
+/*    width says how many of them the partition switch can turn OFF.  A   */
+/*    plan checked only against the first can seat a partition's window   */
+/*    at an index with no enable bit, and a one-write switch then leaves  */
+/*    the outgoing partition's memory reachable while the incoming one    */
+/*    runs.  Nothing faults and nothing is logged.  See zx_mm.h.          */
+/*                                                                        */
 /**************************************************************************/
 
 UINT zx_mm_plan(const ZX_MANIFEST *manifest_ptr,
                 UINT mmio_region_count,
                 UINT region_budget,
+                uint32_t enable_bits,
                 ZX_MM_LAYOUT *layout_ptr)
 {
-    UINT next_index;
-    UINT partition_index;
-    UINT bit_index;
+    UINT     next_index;
+    UINT     partition_index;
+    UINT     bit_index;
+    uint32_t used_mask;
 
     if (manifest_ptr == (const ZX_MANIFEST *)0)
     {
@@ -101,6 +111,7 @@ UINT zx_mm_plan(const ZX_MANIFEST *manifest_ptr,
     layout_ptr->zx_layout_mmio_count     = 0U;
     layout_ptr->zx_layout_regions_used   = 0U;
     layout_ptr->zx_layout_always_mask    = 0U;
+    layout_ptr->zx_layout_enable_bits    = enable_bits;
 
     for (partition_index = 0U; partition_index < ZX_MAX_PARTITIONS;
          partition_index++)
@@ -178,6 +189,34 @@ UINT zx_mm_plan(const ZX_MANIFEST *manifest_ptr,
     if (next_index > region_budget)
     {
         return ZX_MANIFEST_REGION_BUDGET;
+    }
+
+    /* AND AGAINST THE OTHER BUDGET: every index assigned above must have an
+       HPRENR bit, or the partition switch cannot turn its region off.
+
+       The mask is built from next_index rather than ORed together as the
+       loops ran, because the MMIO block and the partition blocks are
+       contiguous by construction and one shift is cheaper to read than an
+       accumulator threaded through two loops.  next_index is at most 32
+       here -- every path that could make it larger has already returned --
+       so the shift is defined; a count of exactly 32 is spelled as the
+       all-ones constant rather than as a shift by 32, which is undefined
+       behaviour and the reason this is not written as the obvious
+       one-liner.
+
+       ZX_MANIFEST_NO_ENABLE_BIT and not ZX_MANIFEST_REGION_BUDGET, because
+       these are different faults with different fixes: the budget is fixed
+       by asking for fewer regions, and this one is fixed by moving to a
+       part whose HPRENR is wide enough.  A shared code would send a reader
+       to shrink a manifest that is already small enough.  */
+
+    used_mask = (next_index >= 32U)
+                    ? 0xFFFFFFFFU
+                    : (uint32_t)(((uint32_t)1U << next_index) - 1U);
+
+    if ((used_mask & ~enable_bits) != 0U)
+    {
+        return ZX_MANIFEST_NO_ENABLE_BIT;
     }
 
     return ZX_MANIFEST_SUCCESS;
@@ -297,5 +336,15 @@ void zx_mm_report(const ZX_MM_LAYOUT *layout_ptr,
 
     zx_console_puts("    regions used ");
     zx_console_putdec(layout_ptr->zx_layout_regions_used);
+    zx_console_puts(", HPRENR bits implemented ");
+    zx_console_puthex(layout_ptr->zx_layout_enable_bits);
     zx_console_puts("\n");
+    zx_console_puts("      Two budgets, not one.  The count is how many\n"
+                    "      region descriptors the part has; the mask is\n"
+                    "      which of them a ONE-WRITE partition switch can\n"
+                    "      turn off.  A region seated past the mask would be\n"
+                    "      programmed with its own enable bit set and left\n"
+                    "      there, so the outgoing partition's window would\n"
+                    "      stay live under the incoming one, with nothing\n"
+                    "      to fault on.\n");
 }

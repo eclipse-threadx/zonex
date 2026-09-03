@@ -320,6 +320,7 @@ _Static_assert((ZX_MAX_PARTITIONS * ZX_MAX_REGIONS_PER_PARTITION) <= 24U,
 #define ZX_MANIFEST_SHARED_BAD_AP           0x1CU
 #define ZX_MANIFEST_REGION_BUDGET           0x1DU
 #define ZX_MANIFEST_IMAGE_EMPTY             0x1EU
+#define ZX_MANIFEST_NO_ENABLE_BIT           0x1FU
 
 /**************************************************************************/
 /*                          What the validator saw                        */

@@ -592,10 +592,19 @@ static void zx_phase_violation(void)
         "  FAILED.  That is the point: it proves the check can fail.\n"
         "\n"
         "  Expected here: ATTEMPTED set, SURVIVED set, two failing checks,\n"
-        "  no stage-2 fault from this phase, and ZONEX RESULT: FAILED.  The\n"
-        "  CTest entry for this build expects FAILED, so this build\n"
-        "  starting to PASS -- meaning the violation stopped being detected\n"
-        "  -- fails the suite.\n");
+        "  no stage-2 fault from this phase, and a FAILED verdict at the end\n"
+        "  of the run.  The CTest entry for this build expects that verdict,\n"
+        "  so this build starting to PASS -- meaning the violation stopped\n"
+        "  being detected -- fails the suite.\n"
+        "\n"
+        "  THIS PARAGRAPH DELIBERATELY DOES NOT SPELL THE VERDICT LINE OUT.\n"
+        "  The runner judges a negative build on TWO things: that the pass\n"
+        "  mark is absent AND that the fail mark is present, and the second\n"
+        "  is what distinguishes a violation that was detected from an image\n"
+        "  that was never built, a model that would not start, or a hang.\n"
+        "  A banner carrying the literal fail mark satisfies that condition\n"
+        "  before the run has done anything, so a crash anywhere below here\n"
+        "  would have been judged a correct negative result.\n");
 #endif
 
     zx_console_puts("  target address ");
