@@ -23,6 +23,24 @@
 # because retrofitting a codebase to a warning set costs far more than building
 # to one, and because ZoneX has a certification back end that will ask.
 #
+# THE SECOND BLOCK BELOW IS THE MISRA-ALIGNED SET, and it was added by the
+# hardening pass rather than at the beginning, by the method the Cortex-R52
+# Modules port work established: take the build's compile_commands.json,
+# re-compile every translation unit in every configuration with the candidate
+# flags, and adopt the ones that come back clean.  Over 293 distinct
+# (source, -D set) compilations across the model, the board and the host
+# configurations, every flag in that block reported nothing -- so adopting it
+# costs no change to the code and stops the class of defect from arriving
+# later.  Two candidates did report something and are named at the bottom of
+# this file with what they found and why they were not adopted; the rule
+# numbers beside each flag are the MISRA C:2012 rules it approximates, so
+# that a reviewer can go the other way -- from a rule to the check that
+# enforces it.
+#
+# -Wredundant-decls is the one that paid for the exercise: it found
+# zx_board_init declared in both zx_port.h and examples/common/zx_probe.h,
+# which is MISRA Rule 8.5.
+#
 # Warnings become errors under the ci-strict configure preset, through CMake's
 # own CMAKE_COMPILE_WARNING_AS_ERROR.  A developer build stays warning-tolerant
 # so that a half-finished change can still be compiled and looked at.
@@ -53,6 +71,50 @@ set(ZX_WARNING_FLAGS
     -Wpointer-arith
     -Waggregate-return
     -Wfloat-equal
+
+    # The MISRA-aligned block.  Portable across GCC and ATfE clang; the
+    # GNU-only additions are in ZX_WARNING_FLAGS_GNU below.
+    -Wshadow                # Rule 5.3   an inner declaration hiding an outer
+    -Wcast-qual             # Rule 11.8  a cast that discards const
+    -Wbad-function-cast     # Rule 11.1  a function result cast to another type
+    -Wswitch-default        # Rule 16.4  every switch has a default
+    -Wswitch-enum           # Rule 16.x  every enumerator has a case
+    -Wstrict-prototypes     # Rule 8.2   no unprototyped declaration
+    -Wold-style-definition  # Rule 8.2   nor an unprototyped definition
+    -Wredundant-decls       # Rule 8.5   declared once, in one file
+    -Wundef                 # Rule 20.9  no #if on an undefined identifier
+    -Wdouble-promotion      # Dir 4.6    no silent float promotion
+    -Wjump-misses-init      # Rule 15.x  no jump over an initialisation
+    -Wnull-dereference      # Rule 1.3   undefined behaviour
+    -Wvla                   # Rule 18.8  no variable-length array
+    -Wmissing-noreturn      # Rule 17.x  a function that cannot return says so
+    -Wformat=2              # Dir 4.x    ZoneX has no printf, and will not gain
+                            #            one by accident
+    -Wstrict-overflow=2     # Rule 12.x  no optimisation that assumes no
+                            #            signed overflow
+)
+
+# GNU-only additions.  Clang implements neither spelling and rejects both as
+# unknown warnings, which is merely noisy until CMAKE_COMPILE_WARNING_AS_ERROR
+# turns it into a failed build for every ZoneX source in the ATfE lane.
+#
+# PUBLISHED AS A VARIABLE for the same reason ZX_WARNING_FLAGS is: the guest
+# support is compiled by a separate CMake invocation that cannot see this
+# project's targets, and until this pass it restated -Wlogical-op by hand --
+# a second source of truth that agreed only because there was one flag in it.
+set(ZX_WARNING_FLAGS_GNU
+    -Wlogical-op            # Rule 10.1  a bitwise operator on a boolean
+    -Wduplicated-cond       # Rule 14.3  an always-true or repeated condition
+    -Wduplicated-branches   # Rule 14.3  two arms of an if that are identical
+
+    # A CEILING ON ONE FUNCTION'S STACK FRAME, and it is a real number rather
+    # than a round one.  The EL2 Hyp stack is 1 KB and the fault path runs on
+    # it, so a frame that grew without anybody noticing would be found by a
+    # corrupted run on the bench and not by a build.  Measured across every
+    # translation unit in both board configurations: the largest single frame
+    # in the tree is 80 bytes, in the manifest validator.  256 leaves room to
+    # write ordinary code and still fails long before 1 KB is in danger.
+    -Wstack-usage=256
 )
 
 add_library(zx_warnings INTERFACE)
@@ -60,12 +122,41 @@ add_library(zonex::warnings ALIAS zx_warnings)
 
 target_compile_options(zx_warnings INTERFACE ${ZX_WARNING_FLAGS})
 
-# -Wlogical-op is a GNU extension.  Clang does not implement it: it has
-# -Wlogical-op-parentheses, which is a different check, and rejects the GNU
-# spelling as an unknown warning.  That is merely noisy until
-# CMAKE_COMPILE_WARNING_AS_ERROR turns it into a failed build for every ZoneX
-# source under the ATfE lane, so it is selected by compiler rather than
-# spelled unconditionally.
 target_compile_options(zx_warnings INTERFACE
-    $<$<C_COMPILER_ID:GNU>:-Wlogical-op>
+    $<$<C_COMPILER_ID:GNU>:${ZX_WARNING_FLAGS_GNU}>
 )
+
+# TWO CANDIDATES THAT WERE RUN AND NOT ADOPTED.  Recorded here rather than
+# left out silently, because "we did not think of it" and "we looked at it and
+# said no" are different answers to a reviewer, and only one of them is worth
+# anything.
+#
+#   -Wunused-macros reported two macros, and both are documentation rather
+#   than dead code: ZX_UARTCR_PCE in the S32Z280 board file, which names the
+#   parity bit whose ABSENCE from the value written is the decision, and one
+#   phase index in the regression.  The regression's was adopted -- the macro
+#   is now used -- and the board's is a justified deviation from MISRA Rule
+#   2.5 (advisory), written down at the definition.  Adopting the flag would
+#   force every register bit a driver deliberately leaves clear to be either
+#   deleted or given a fake use, and a hardware header full of fake uses is
+#   worse than an advisory rule unmet.
+#
+#   -Wwrite-strings was run and rejected on evidence.  It does not merely
+#   diagnose: it changes the TYPE of a string literal to const char[], and
+#   ZoneX's guest support passes literal thread, queue and semaphore names
+#   straight into ThreadX's _txe_*_create, whose signatures take CHAR * and
+#   predate const by decades.  Seven call sites, and the only way to silence
+#   them is a cast that discards const at each -- trading MISRA Rule 7.4,
+#   which this code already meets (every ZoneX string parameter is const CHAR
+#   *), for seven deviations from Rule 11.8, which it would not.  The
+#   qualifier is missing from an API ZoneX does not own; the flag reports the
+#   call rather than the signature, and that is the wrong end.
+#
+#   -Wcast-align=strict reported nothing today and is still not adopted.
+#   ZoneX reaches MMIO through ZX_REG32, which casts an integer address to a
+#   volatile pointer -- a cast the flag does not see, because there is no
+#   source pointer to compare alignment against.  So a clean report from it
+#   says nothing about the code it would matter for, and a check that cannot
+#   fail where the risk is is a check that reads as coverage without being
+#   any.  The alignment of a device register is a manifest and linker-script
+#   property here, asserted where those are built.

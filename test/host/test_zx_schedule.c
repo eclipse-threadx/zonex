@@ -199,6 +199,29 @@ static void test_build_rejections(void)
 }
 
 
+/**************************************************************************/
+/*  advance_for_its_side_effect                                           */
+/*                                                                        */
+/*  zx_schedule_advance is ZX_NODISCARD, and a (void) cast does NOT       */
+/*  silence GCC's warn_unused_result -- deliberately, because an          */
+/*  attribute that a cast could switch off would not be worth having.     */
+/*  Three tests below turn the schedule over for its effect on the FRAME  */
+/*  -- the drift arithmetic, the frame count, the frame limit -- and have */
+/*  no business asserting which partition comes next; the ones that do    */
+/*  assert it call zx_schedule_advance directly, a few lines above.       */
+/*                                                                        */
+/*  So the value is consumed here, once, where the reason is written      */
+/*  down, rather than four times where it would read as an oversight.     */
+/**************************************************************************/
+
+static void advance_for_its_side_effect(ZX_SCHEDULE *schedule_ptr)
+{
+    UINT next = zx_schedule_advance(schedule_ptr);
+
+    (void) next;
+}
+
+
 static void test_round_robin(void)
 {
     UINT index;
@@ -248,7 +271,7 @@ static void test_round_robin(void)
         ZX_CHECK_EQ(zx_schedule_current_partition(&schedule), index);
         ZX_CHECK_EQ(zx_schedule_deadline(&schedule),
                     (uint64_t)(index + 1U) * FVP_TICK_COUNTS);
-        (void)zx_schedule_advance(&schedule);
+        advance_for_its_side_effect(&schedule);
     }
 
     ZX_CHECK_EQ(zx_schedule_current_partition(&schedule), 0U);
@@ -293,8 +316,8 @@ static void test_no_drift_over_many_frames(void)
 
     for (frame = 0UL; frame < 10000UL; frame++)
     {
-        (void)zx_schedule_advance(&schedule);
-        (void)zx_schedule_advance(&schedule);
+        advance_for_its_side_effect(&schedule);
+        advance_for_its_side_effect(&schedule);
     }
 
     ZX_CHECK_EQ(schedule.zx_schedule_frames, 10000UL);
@@ -399,7 +422,7 @@ static void test_frame_limit(void)
 
         for (step = 0UL; step < 1000UL; step++)
         {
-            (void)zx_schedule_advance(&schedule);
+            advance_for_its_side_effect(&schedule);
         }
     }
 

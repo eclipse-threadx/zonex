@@ -73,11 +73,21 @@
 #define ZX_LINCR1_INIT          0x00000001U     /* initialisation mode       */
 
 /* UARTCR.  PCE at bit 2 and TxEn at bit 4 are the two that matter here and
-   are easy to transpose.  */
+   are easy to transpose.
+
+   ZX_UARTCR_PCE IS DEFINED AND NEVER USED, and that is deliberate.  MISRA
+   C:2012 Rule 2.5 (advisory) says a project should contain no unused macro
+   declaration; -Wunused-macros reports this one.  The deviation is taken
+   because the bit's ABSENCE from the value written below is the decision --
+   the BootROM leaves parity enabled and this console has to clear it (see
+   the note at the write) -- and a bit that has to be off is worth naming at
+   the same place as the bits that have to be on.  Naming it here is also
+   what makes the transposition this comment warns about visible: PCE at
+   bit 2 next to TXEN at bit 4, in one list, in register order.  */
 
 #define ZX_UARTCR_UART          0x00000001U     /* UART rather than LIN mode */
 #define ZX_UARTCR_WL0           0x00000002U     /* with WL1 clear: 8-bit     */
-#define ZX_UARTCR_PCE           0x00000004U     /* parity enable             */
+#define ZX_UARTCR_PCE           0x00000004U     /* parity enable -- see above */
 #define ZX_UARTCR_TXEN          0x00000010U
 #define ZX_UARTCR_RXEN          0x00000020U
 

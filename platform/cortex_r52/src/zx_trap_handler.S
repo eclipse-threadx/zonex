@@ -110,6 +110,32 @@
     .endm
 
 /**************************************************************************/
+/*  ZX_FATAL_STACK -- put SP_hyp somewhere known before calling C.        */
+/*                                                                        */
+/*  USED ONLY BY THE VECTORS THAT DO NOT RESUME, and it is safe there for  */
+/*  exactly that reason: nothing below is coming back, so the stack the    */
+/*  exception was taken on is not needed and discarding it costs nothing.  */
+/*                                                                        */
+/*  WHAT IT BUYS.  The reporting path is C, and C needs a stack.  Until    */
+/*  this macro existed it ran on whatever SP_hyp happened to hold when the */
+/*  exception was taken -- which, for the one class of fault these vectors */
+/*  exist to report, is a value that may be the reason for the fault.  A   */
+/*  hypervisor whose stack has run away then faults again inside its own   */
+/*  fault report, and the run ends with nothing said.  This is the vector  */
+/*  bracket rule from the other side: a handler may not assume the state   */
+/*  it was entered with is usable, and here the caller is ZoneX itself.    */
+/*                                                                        */
+/*  It does not make the path re-entrant.  A second fault taken INSIDE the */
+/*  report would come back here, reset the same stack and call the same    */
+/*  function -- so the C side counts its own depth and stops reporting on  */
+/*  the second entry.  See zx_el2_fault_path.c.                            */
+/**************************************************************************/
+
+    .macro  ZX_FATAL_STACK
+    ldr     sp, =__zx_hyp_stack_top
+    .endm
+
+/**************************************************************************/
 /*  The EL2 vector table.  32-byte aligned, as HVBAR requires.            */
 /*                                                                        */
 /*  Offsets 0x00-0x10 are exceptions taken FROM Hyp mode itself.  Offset   */
@@ -371,12 +397,14 @@ zx_el2_resume:
     .type   zx_el2_vector_pabt, %function
 zx_el2_vector_pabt:
     ZX_CAPTURE ZX_ASM_VEC_PABT_HYP
+    ZX_FATAL_STACK
     bl      zx_el2_hypervisor_fault
     .size   zx_el2_vector_pabt, . - zx_el2_vector_pabt
 
     .type   zx_el2_vector_dabt, %function
 zx_el2_vector_dabt:
     ZX_CAPTURE ZX_ASM_VEC_DABT_HYP
+    ZX_FATAL_STACK
     bl      zx_el2_hypervisor_fault
     .size   zx_el2_vector_dabt, . - zx_el2_vector_dabt
 
@@ -393,24 +421,28 @@ zx_el2_vector_dabt:
     .type   zx_el2_vector_reset, %function
 zx_el2_vector_reset:
     ZX_CAPTURE ZX_ASM_VEC_RESET
+    ZX_FATAL_STACK
     bl      zx_el2_unexpected_vector
     .size   zx_el2_vector_reset, . - zx_el2_vector_reset
 
     .type   zx_el2_vector_undef, %function
 zx_el2_vector_undef:
     ZX_CAPTURE ZX_ASM_VEC_UNDEF
+    ZX_FATAL_STACK
     bl      zx_el2_unexpected_vector
     .size   zx_el2_vector_undef, . - zx_el2_vector_undef
 
     .type   zx_el2_vector_svc, %function
 zx_el2_vector_svc:
     ZX_CAPTURE ZX_ASM_VEC_SVC
+    ZX_FATAL_STACK
     bl      zx_el2_unexpected_vector
     .size   zx_el2_vector_svc, . - zx_el2_vector_svc
 
     .type   zx_el2_vector_irq, %function
 zx_el2_vector_irq:
     ZX_CAPTURE ZX_ASM_VEC_IRQ
+    ZX_FATAL_STACK
     bl      zx_el2_unexpected_vector
     .size   zx_el2_vector_irq, . - zx_el2_vector_irq
 
@@ -418,6 +450,7 @@ zx_el2_vector_irq:
     .type   zx_el2_vector_fiq, %function
 zx_el2_vector_fiq:
     ZX_CAPTURE ZX_ASM_VEC_FIQ
+    ZX_FATAL_STACK
     bl      zx_el2_unexpected_vector
     .size   zx_el2_vector_fiq, . - zx_el2_vector_fiq
 

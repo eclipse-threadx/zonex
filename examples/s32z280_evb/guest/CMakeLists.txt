@@ -124,11 +124,14 @@ else()
         "compiled with ThreadX's warning settings alone.")
 endif()
 
-# -Wlogical-op is GNU-only; ATfE clang rejects the spelling outright, which is
-# merely noisy until warnings are errors.  Selected by compiler, exactly as
-# cmake/zx_warnings.cmake does it for the hypervisor.
+# The GNU-only half of the set, which ATfE clang rejects outright as unknown
+# warnings -- merely noisy until warnings are errors.  Selected by compiler,
+# exactly as cmake/zx_warnings.cmake does it for the hypervisor, and read from
+# the SAME module rather than restated: the list used to be spelled here as
+# "-Wlogical-op" and agreed with the hypervisor's only because there was one
+# flag in it.
 if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
-    list(APPEND ZX_WARNING_FLAGS -Wlogical-op)
+    list(APPEND ZX_WARNING_FLAGS ${ZX_WARNING_FLAGS_GNU})
 endif()
 
 if(ZX_GUEST_WARNINGS_AS_ERRORS)

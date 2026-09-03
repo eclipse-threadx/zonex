@@ -953,7 +953,19 @@ static ULONG endless_compute(ULONG seed)
 }
 
 
-static void endless_phase(ULONG options)
+/* _Noreturn, AND IT IS A CLAIM RATHER THAN A HINT.  The loop below has no
+   exit: a partition that reached its window's end and stopped being runnable
+   would spend every later window being idled through, and the schedule would
+   have nothing left to demonstrate.  ATfE clang proved the function cannot
+   return and asked for the declaration (-Wmissing-noreturn); GCC did not.
+   Saying it out loud makes a future edit that adds an exit fail to compile
+   instead of quietly ending the phase.
+
+   The spelling is the C keyword and not ZX_NORETURN: this file is guest code
+   compiled into a ThreadX image and does not include zx_api.h -- see the
+   header of zx_guest_bsp.h.  */
+
+static _Noreturn void endless_phase(ULONG options)
 {
     ULONG live      = 0UL;
     ULONG work      = 1UL;
@@ -1269,11 +1281,20 @@ static void consumer_entry(ULONG thread_input)
 
     if (guest_mailbox_read(ZX_GD_TARGET) != 0UL)
     {
-        volatile ULONG *target =
-            (volatile ULONG *)(void *)(unsigned long)
-                guest_mailbox_read(ZX_GD_TARGET);
+        /* READ ONCE, THEN CAST THE VALUE.  The mailbox was read three times
+           here -- once for the test above and twice more to build these two
+           -- and the address the guest probed was therefore not provably the
+           address it printed.  The hypervisor does not rewrite the mailbox
+           under a running partition today, so the three reads did agree;
+           "did agree" is not the property this line needs.
 
-        unsigned long address = guest_mailbox_read(ZX_GD_TARGET);
+           And casting the READ rather than the CALL is what -Wbad-function-
+           cast asks for, which is MISRA C:2012 Rule 11.4's territory: an
+           integer-to-pointer conversion is worth a name and a line of its
+           own, not a cast stack in the middle of an initialiser.  */
+
+        unsigned long   address = guest_mailbox_read(ZX_GD_TARGET);
+        volatile ULONG *target  = (volatile ULONG *)(void *)address;
 
         console_puts("probing ");
         console_puthex(address);

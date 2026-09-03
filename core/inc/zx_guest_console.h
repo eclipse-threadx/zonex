@@ -92,6 +92,29 @@ void zx_guest_console_attach(UINT partition_id, const CHAR *name_ptr);
 
 void zx_guest_console_detach(void);
 
+/* Hand the console back WITHOUT WRITING ANYTHING.  What a WINDOW BOUNDARY
+   calls, where detach is what everything else calls.
+
+   The difference is timing and it was measured rather than reasoned about.
+   Closing a partial line is two characters -- CR and LF -- through a polled
+   UART, and a boundary that did it wrote them at EL2 with FIQ masked, on
+   the switch path, with a trip count decided by what the OUTGOING guest had
+   been printing.  On the S32Z280 that moved the critical partition's window
+   period by 24,000 counts of an 8 MHz counter while the same partition
+   violating its boundary a hundred and seventeen thousand times moved it by
+   sixty-nine.
+
+   So a release records that a line is owed and writes nothing.  The next
+   party to speak -- the incoming partition's first character, or the
+   hypervisor through detach -- writes the newline first, inside a window it
+   owns.  The character stream is identical either way; only the moment the
+   newline is written moves.
+
+   Use detach wherever the HYPERVISOR is about to print, and this wherever
+   the console is simply changing hands.  */
+
+void zx_guest_console_release(void);
+
 /* One character from the running guest.  Called from the hypercall path, so
    it must be safe to call with a guest's registers still live and must not
    itself be able to fault: it touches no guest memory at all -- the

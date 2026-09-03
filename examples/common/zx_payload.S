@@ -238,6 +238,74 @@ zx_payload_violation:
     hvc     #ZX_ASM_HVC_IMM_YIELD
     .size   zx_payload_violation, . - zx_payload_violation
 
+/**************************************************************************/
+/*  zx_payload_read_id_register -- read MPUIR, which EL2 has trapped.     */
+/*                                                                        */
+/*  AN EXCEPTION CLASS ZONEX DOES NOT HANDLE, provoked so that the arm of  */
+/*  the trap vector that returns ZX_RUN_TRAPPED is a path something has    */
+/*  actually taken.  HCR.TID1 traps EL1 READS of TCMTR, AIDR, MPUIR,       */
+/*  TLBTR and REVIDR to EL2 (TRM Table 3-65), and the syndrome is EC 0x03  */
+/*  -- a trapped MCR/MRC on coprocessor 15.                                */
+/*                                                                        */
+/*  MPUIR IS THE RIGHT ONE TO READ, and not merely a convenient one.  It   */
+/*  is the register that tells a partition how many EL1 MPU regions it     */
+/*  has, so trapping it is what a later ZoneX would do to virtualise that  */
+/*  number rather than let a guest read the part's.  The probe therefore   */
+/*  exercises a trap the design has a reason to want, not one invented to  */
+/*  make an exception happen.                                              */
+/*                                                                        */
+/*  AND IT CANNOT HANG OR GO UNDEFINED IN EITHER DIRECTION, which is what  */
+/*  makes it fit for a suite that runs unattended on a bench.  If the trap */
+/*  fires, EL2 gets the exception; if it does not, the MRC simply reads    */
+/*  MPUIR and the payload yields normally and the phase reports that the   */
+/*  trap did not fire.  Two other routes were tried and rejected: WFI      */
+/*  under HCR.TWI hangs the run if the trap is absent, and a               */
+/*  floating-point instruction under HCPTR is UNDEFINED AT EL1 on the      */
+/*  Armv8-R AEM FVP -- measured -- so it never reaches EL2 there at all.   */
+/*  That measurement is recorded in docs/armv8r-el2-reference.md, because  */
+/*  it also qualifies what the FPU-denial argument can be shown to prove.  */
+/**************************************************************************/
+
+    .global zx_payload_read_id_register
+    .type   zx_payload_read_id_register, %function
+zx_payload_read_id_register:
+    ZX_PAYLOAD_ENTER
+
+    @ ATTEMPTED AND SURVIVED ARE CLEARED FIRST, and this is not tidiness.
+    @ The progress word is CUMULATIVE across every phase of the image, and
+    @ zx_payload_violation sets both of these bits before this payload ever
+    @ runs -- SURVIVED in the negative build, where the violation is aimed
+    @ somewhere the payload is granted and therefore does succeed.  Without
+    @ this, the phase at EL2 read that build's leftover SURVIVED and
+    @ reported that a trapped MPUIR read had completed at EL1, which it had
+    @ not.  The negative build caught it, which is what negative builds are
+    @ for.  zx_payload_probe_read clears PROBE_OK on entry for exactly the
+    @ same reason.
+
+    ldr     r3, [r2]
+    bic     r3, r3, #(ZX_PAYLOAD_ATTEMPTED | ZX_PAYLOAD_SURVIVED)
+    orr     r3, r3, #ZX_PAYLOAD_ATTEMPTED
+    str     r3, [r2]
+    dsb
+
+    mrc     p15, 0, r1, c0, c0, 4           @ MPUIR -- must trap, EC 0x03
+
+    @ Reached only if HCR.TID1 did NOT trap the read.  SURVIVED says so,
+    @ and the value read is published so that the log can show the trap was
+    @ genuinely absent rather than merely unrecorded.  The bit means the
+    @ same thing as it does in zx_payload_violation: the access this
+    @ payload exists to have refused went through.
+
+    ldr     r0, =zx_payload_probe_value
+    str     r1, [r0]
+
+    ldr     r3, [r2]
+    orr     r3, r3, #ZX_PAYLOAD_SURVIVED
+    str     r3, [r2]
+    dsb
+    hvc     #ZX_ASM_HVC_IMM_YIELD
+    .size   zx_payload_read_id_register, . - zx_payload_read_id_register
+
     .balign 64
 
 /**************************************************************************/

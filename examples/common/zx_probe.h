@@ -93,7 +93,12 @@ void zx_probe_fail(void);
 
 void zx_phase_two_partitions(uint32_t board_regions, uint32_t el2_regions);
 
-void zx_board_init(void);
+/* zx_board_init is NOT declared here.  It is the reset path's entry into the
+   board, so it belongs to zx_port.h -- which this header includes -- and a
+   second declaration of it here was one, in violation of MISRA C:2012
+   Rule 8.5 (an external function shall be declared in one and only one
+   file).  Two declarations of the same function agree until somebody
+   changes one of them.  */
 
 /* How many EL2 regions the hypervisor's own MMIO needs on this board, and
    the code that programs them starting at first_index.
@@ -214,6 +219,7 @@ extern char zx_payload_grant_check[];
 extern char zx_payload_hvc_check[];
 extern char zx_payload_probe_read[];
 extern char zx_payload_violation[];
+extern char zx_payload_read_id_register[];
 
 extern uint32_t zx_payload_result;
 extern uint32_t zx_payload_scratch;

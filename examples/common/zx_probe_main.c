@@ -727,6 +727,151 @@ static void zx_phase_violation(void)
 
 
 /**************************************************************************/
+/*  zx_phase_unexpected_ec -- the trap vector's LAST arm, taken on purpose.*/
+/*                                                                        */
+/*  EVERY HSR.EC VALUE MUST HAVE A DEFINED OUTCOME, and three of the four  */
+/*  classes ZoneX recognises are provoked somewhere in this suite: a guest */
+/*  violation (EC 0x24 in this image, EC 0x20 in the regression), a        */
+/*  hypercall (EC 0x12), and ZoneX faulting on itself (EC 0x25, in the     */
+/*  build below this one).  The fourth -- "routed to EL2 and not handled"  */
+/*  -- had never been taken by anything, so the arm of the trap vector     */
+/*  that returns ZX_RUN_TRAPPED and the last branch of the fault           */
+/*  classifier were both dead code.  A branch nothing has ever taken is    */
+/*  not evidence that it works.                                            */
+/*                                                                        */
+/*  HOW.  HCR.TID1 traps EL1 reads of the ID group that includes MPUIR to  */
+/*  EL2 (TRM Table 3-65), with EC 0x03 -- a trapped MCR/MRC on             */
+/*  coprocessor 15.  ZoneX handles neither the class nor the register, so  */
+/*  this is a genuine unhandled exception rather than a simulated one, and */
+/*  it is the exact shape a later phase would use to virtualise the region */
+/*  count a partition sees.  See zx_payload_read_id_register for why this  */
+/*  route was chosen over the two that were tried first.                   */
+/*                                                                        */
+/*  WHAT IS ASSERTED.  That the excursion comes BACK -- an unhandled class */
+/*  that halted silently would be indistinguishable from a hang -- that it */
+/*  comes back classified as an unexpected trap, that the vector and the   */
+/*  syndrome agree, and that the decoder NAMES the class instead of        */
+/*  falling through to its own "not documented" string.  The EC value      */
+/*  itself is printed rather than asserted: what Phase 0 is claiming is    */
+/*  that an unhandled exception is diagnosable, and pinning 0x03 would     */
+/*  turn a part's documented freedom into a suite failure.                 */
+/**************************************************************************/
+
+/* HCR.TID1, bit 16.  Spelled here rather than in zx_port.h because it is a
+   TEST facility and not a hypervisor policy: ZoneX traps no ID register in
+   any shipping configuration, and a constant in the port's header would
+   read as though it did.  */
+
+#define ZX_PROBE_HCR_TID1   0x00010000U
+
+static void zx_probe_set_hcr_tid1(uint32_t enable)
+{
+    uint32_t hcr = zx_read_hcr();
+
+    if (enable != 0U)
+    {
+        hcr |= ZX_PROBE_HCR_TID1;
+    }
+    else
+    {
+        hcr &= ~(uint32_t)ZX_PROBE_HCR_TID1;
+    }
+
+    __asm__ volatile("mcr p15, 4, %0, c1, c1, 0" : : "r"(hcr) : "memory");
+    __asm__ volatile("isb" ::: "memory");
+}
+
+
+static void zx_phase_unexpected_ec(void)
+{
+    uint32_t                 outcome;
+    const zx_fault_record_t *record;
+    uint32_t                 ec;
+
+    zx_console_puts("\n=========================================================\n"
+                    " AN EXCEPTION CLASS ZONEX DOES NOT HANDLE\n"
+                    "=========================================================\n"
+                    "  HCR.TID1 is set below, so an EL1 read of MPUIR is\n"
+                    "  trapped to EL2.  ZoneX handles neither that class nor\n"
+                    "  that register, which is the point: the run must come\n"
+                    "  back with the exception NAMED, and must carry on\n"
+                    "  afterwards -- an unhandled class that stopped without\n"
+                    "  saying so would look exactly like a hang.\n");
+
+    zx_probe_set_hcr_tid1(1U);
+
+    outcome = zx_run_phase("read MPUIR at EL1 with HCR.TID1 set",
+                           zx_payload_read_id_register, 0U);
+    record  = zx_el2_fault_record();
+
+    /* Cleared again immediately, and BEFORE anything is asserted.  Later
+       phases in this image are entitled to the machine they were written
+       against, and a check failing here would otherwise leave the trap
+       armed and take a second phase down with it.  */
+
+    zx_probe_set_hcr_tid1(0U);
+
+    zx_check("the payload got as far as the trapped read",
+             ((zx_payload_result & ZX_PAYLOAD_ATTEMPTED) != 0U) ? 1U : 0U);
+
+    if ((zx_payload_result & ZX_PAYLOAD_SURVIVED) != 0U)
+    {
+        zx_console_puts(
+            "\n  *** THE READ WAS NOT TRAPPED.  HCR.TID1 was set and an EL1\n"
+            "  *** read of MPUIR returned ");
+        zx_console_puthex(zx_payload_probe_value);
+        zx_console_puts(" instead of reaching EL2,\n"
+            "  *** so this phase provoked nothing and the vector's\n"
+            "  *** unhandled-class arm is still untested.\n");
+    }
+
+    zx_check("the read did NOT complete at EL1",
+             ((zx_payload_result & ZX_PAYLOAD_SURVIVED) == 0U) ? 1U : 0U);
+
+    zx_check("the excursion came BACK, as ZX_RUN_TRAPPED -- neither a\n"
+             "         violation nor a hypercall, and not a hang",
+             (outcome == ZX_RUN_TRAPPED) ? 1U : 0U);
+
+    if (outcome != ZX_RUN_TRAPPED)
+    {
+        return;
+    }
+
+    zx_fault_report(record);
+
+    ec = zx_fault_ec(record->zx_fault_hsr);
+
+    zx_note("HSR.EC as this part reported it", ec);
+
+    zx_check("it is classified as an UNEXPECTED TRAP, which is the class\n"
+             "         whose whole job is to be neither of the other three",
+             (zx_fault_classify(record->zx_fault_hsr)
+              == ZX_FAULT_UNEXPECTED_TRAP) ? 1U : 0U);
+
+    zx_check("it arrived at the Hyp trap entry, +0x14, like everything else\n"
+             "         routed from EL1",
+             (record->zx_fault_vector == ZX_VECTOR_HYP_TRAP) ? 1U : 0U);
+
+    zx_check("the vector taken and HSR.EC agree with each other",
+             zx_fault_vector_agrees(record->zx_fault_vector,
+                                    record->zx_fault_hsr));
+
+    /* THE CHECK THIS PHASE EXISTS FOR.  A class ZoneX does not handle must
+       still be REPORTED BY NAME.  An exception that reached EL2, was not
+       recognised and printed "not a documented exception class" would be a
+       hypervisor telling its operator nothing at the one moment it has
+       something to say.  Comparing against the decoder's OWN fallback
+       string is deliberate: it asks the question a reader of the log would
+       ask, rather than re-listing the table here and drifting from it.  */
+
+    zx_check("and the decoder NAMES it rather than falling back on\n"
+             "         \"not a documented exception class\"",
+             (zx_fault_ec_name(ec)
+              != zx_fault_ec_name(0xFFFFFFFFU)) ? 1U : 0U);
+}
+
+
+/**************************************************************************/
 /*  zx_phase_provoke_el2_fault                                            */
 /*                                                                        */
 /*  Deliberately makes ZONEX ITSELF fault, to prove the EC 0x25 path       */
@@ -919,6 +1064,7 @@ ZX_NORETURN void zx_el2_main(void)
     zx_phase_hypercall();
     zx_phase_hprenr(el2_regions);
     zx_phase_violation();
+    zx_phase_unexpected_ec();
 
     /* Last, because it reprograms the region set from a manifest and the
        single-payload phases above depend on the set they were given.  */

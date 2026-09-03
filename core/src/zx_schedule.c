@@ -460,8 +460,21 @@ void zx_schedule_report(const ZX_SCHEDULE *schedule_ptr,
         return;
     }
 
+    /* ULONG NARROWED TO uint32_t, EXPLICITLY, HERE AND TWICE BELOW.
+       zx_console_putdec takes a uint32_t and ULONG is the suite's "natural
+       word": 32 bits on every ZoneX target and 64 on the workstation that
+       runs the host suite.  So the narrowing is a no-op where this code
+       ships and is real only in a host test, whose tick counts are
+       fixtures of a few thousand.
+
+       MISRA C:2012 Rule 10.3 (assigning to a narrower essential type) is
+       deviated from by making the conversion explicit, which turns it into
+       a Rule 10.8 cast the reader can see and account for.  The alternative
+       -- a 64-bit console primitive -- would put a 64-bit divide in the
+       hypervisor's console driver to print a number that never needs one.  */
+
     zx_console_puts("  major frame: ");
-    zx_console_putdec(schedule_ptr->zx_schedule_frame_ticks);
+    zx_console_putdec((uint32_t)schedule_ptr->zx_schedule_frame_ticks);
     zx_console_puts(" ticks, ");
     zx_console_putdec(schedule_ptr->zx_schedule_window_count);
     zx_console_puts(" windows, tick = ");
@@ -490,7 +503,7 @@ void zx_schedule_report(const ZX_SCHEDULE *schedule_ptr,
         }
 
         zx_console_puts(", ");
-        zx_console_putdec(
+        zx_console_putdec((uint32_t)
             schedule_ptr->zx_schedule_windows[index].zx_window_ticks);
         zx_console_puts(" ticks = ");
         zx_console_putdec((uint32_t)(
@@ -506,7 +519,7 @@ void zx_schedule_report(const ZX_SCHEDULE *schedule_ptr,
     else
     {
         zx_console_puts("    stopping after ");
-        zx_console_putdec(schedule_ptr->zx_schedule_frame_limit);
+        zx_console_putdec((uint32_t)schedule_ptr->zx_schedule_frame_limit);
         zx_console_puts(" frames, so a test can assert on a total rather\n"
                         "      than on a run the harness had to kill\n");
     }

@@ -186,6 +186,126 @@ static void test_carriage_return_is_dropped(void)
 }
 
 
+/**************************************************************************/
+/*  The DEFERRED close, which is the boundary path.                       */
+/*                                                                        */
+/*  zx_guest_console_release exists so that a WINDOW BOUNDARY writes no    */
+/*  characters -- see the header for the silicon measurement that made it  */
+/*  necessary.  What has to be true of it is that the text a reader ends   */
+/*  up with is the text detach would have produced, character for          */
+/*  character: the whole point is that only the MOMENT the newline is      */
+/*  written moves, and a fix for a timing problem that quietly changed the */
+/*  log would be a worse bug than the one it fixed.                       */
+/*                                                                        */
+/*  So each case below is asserted against the stream, not against the     */
+/*  flag.                                                                 */
+/**************************************************************************/
+
+static void test_release_writes_nothing_and_still_closes_the_line(void)
+{
+    zx_guest_console_reset();
+    zx_capture_reset();
+
+    zx_guest_console_attach(1U, "guest A");
+    guest_says("mid-sentenc");
+
+    /* THE BOUNDARY.  Not one character may come out of it: this is the
+       instant the switch cost and the incoming partition's period are both
+       measured across.  */
+
+    zx_capture_reset();
+    zx_guest_console_release();
+    ZX_CHECK_EQ((int)(zx_capture_text()[0]), (int)'\0');
+
+    /* And the incoming partition pays for it, on its first character,
+       inside its own window -- newline first, then its own tag.  */
+
+    zx_guest_console_attach(2U, "guest B");
+    ZX_CHECK_EQ((int)(zx_capture_text()[0]), (int)'\0');
+
+    guest_says("mine\n");
+    ZX_CHECK(zx_capture_contains("\n[P2 guest B] mine\n") != 0U);
+
+    /* The forged-continuation failure this must not have: guest B's text
+       must never appear on guest A's line.  */
+    ZX_CHECK(zx_capture_contains("mid-sentenc[P2") == 0U);
+    ZX_CHECK(zx_capture_contains("mid-sentencmine") == 0U);
+}
+
+
+static void test_a_release_at_a_line_start_owes_nothing(void)
+{
+    zx_guest_console_reset();
+    zx_capture_reset();
+
+    /* The ordinary boundary: the outgoing partition finished its line.
+       Nothing is owed, so the incoming partition's first character must
+       NOT be preceded by a blank line -- which in a two-partition log is a
+       reader wondering what was lost.  */
+
+    zx_guest_console_attach(1U, "guest A");
+    guest_says("complete\n");
+    zx_guest_console_release();
+    zx_guest_console_attach(2U, "guest B");
+    guest_says("mine\n");
+
+    ZX_CHECK(zx_capture_contains("[P1 guest A] complete\n[P2 guest B] mine\n")
+             != 0U);
+}
+
+
+static void test_the_hypervisor_settles_the_debt_before_it_speaks(void)
+{
+    zx_guest_console_reset();
+    zx_capture_reset();
+
+    /* A window ends mid-line and the FRAME ends with it, so the next thing
+       to print is the hypervisor rather than another partition.  detach is
+       what the run loop calls there, and it has to close a line that
+       RELEASE left owed -- otherwise the fault report or the verdict is
+       appended to a guest's unfinished sentence and read as part of it,
+       which is the exact failure the eager close existed to prevent.  */
+
+    zx_guest_console_attach(1U, "guest A");
+    guest_says("about to fau");
+    zx_guest_console_release();
+
+    zx_capture_reset();
+    zx_guest_console_detach();
+    ZX_CHECK_EQ((int)(zx_capture_text()[0]), (int)'\n');
+
+    /* And only once.  A second detach must add no further blank line.  */
+    zx_capture_reset();
+    zx_guest_console_detach();
+    ZX_CHECK_EQ((int)(zx_capture_text()[0]), (int)'\0');
+}
+
+
+static void test_attaching_over_a_released_partial_line(void)
+{
+    zx_guest_console_reset();
+    zx_capture_reset();
+
+    /* release then attach then release then attach, with nothing printed in
+       between: a partition that is scheduled and says nothing must not turn
+       one owed newline into two, and must not lose it either.  The debt
+       survives an idle window and is paid by whoever finally speaks.  */
+
+    zx_guest_console_attach(1U, "guest A");
+    guest_says("owed");
+    zx_guest_console_release();
+
+    zx_guest_console_attach(2U, "guest B");
+    zx_guest_console_release();          /* B printed nothing at all */
+
+    zx_guest_console_attach(1U, "guest A");
+    guest_says("again\n");
+
+    ZX_CHECK(zx_capture_contains("[P1 guest A] owed\n[P1 guest A] again\n")
+             != 0U);
+}
+
+
 static void test_an_orphan_character_is_named(void)
 {
     zx_guest_console_reset();
@@ -217,5 +337,9 @@ ZX_TEST_MAIN("test_zx_guest_console",
     test_an_unterminated_line_is_closed();
     test_attaching_over_a_partial_line();
     test_carriage_return_is_dropped();
+    test_release_writes_nothing_and_still_closes_the_line();
+    test_a_release_at_a_line_start_owes_nothing();
+    test_the_hypervisor_settles_the_debt_before_it_speaks();
+    test_attaching_over_a_released_partial_line();
     test_an_orphan_character_is_named();
 )

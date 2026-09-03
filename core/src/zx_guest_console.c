@@ -65,6 +65,35 @@ static const CHAR *zx_console_guest_name;
 
 static UINT        zx_console_guest_at_line_start = 1U;
 
+/* AND WHETHER A LINE IS STILL OWED A NEWLINE.  Set by
+   zx_guest_console_release when a partition hands the console back
+   mid-sentence; cleared by whoever next writes, which pays for it.
+
+   THIS EXISTS FOR A TIMING REASON AND NOT A FORMATTING ONE, and it is the
+   one number in this file that was measured on silicon.  Closing the line
+   EAGERLY, at the window boundary, was two characters -- CR and LF -- into
+   a polled UART, on the switch path, at EL2, with FIQ masked.  Two
+   characters back to back is also the exact case the board driver's
+   DTF-clear guard exists for, so the pair is the write most likely to spin
+   there.  With the untrusted partition storming the console, the CRITICAL
+   partition's window period moved by 24,000 counts of an 8 MHz counter --
+   two and a half per cent of a major frame -- while that same partition
+   violating its boundary a hundred and seventeen thousand times moved it by
+   sixty-nine.  Nothing a partition did through the SCHEDULE reached its
+   neighbour; the hypervisor's own console driver did.
+
+   Deferring the newline costs the same two characters, but charges them to
+   whoever writes next -- inside a window that party owns -- and takes the
+   console off the boundary path entirely.
+
+   THE CHARACTER STREAM IS UNCHANGED, and that is what makes this safe: the
+   newline still appears in exactly the same place relative to every other
+   character, because the only thing that can follow it is a tag or a
+   hypervisor message, and both go through code that closes the line first.
+   What moves is WHEN it is written, not WHERE it appears.  */
+
+static UINT        zx_console_guest_line_owed;
+
 static UINT        zx_console_guest_characters;
 static UINT        zx_console_guest_orphans;
 
@@ -87,8 +116,27 @@ static UINT        zx_console_guest_orphans;
 /*                                                                        */
 /**************************************************************************/
 
+static void zx_guest_console_close_owed_line(void)
+{
+    if (zx_console_guest_line_owed != 0U)
+    {
+        zx_console_guest_line_owed = 0U;
+        zx_console_puts("\n");
+    }
+}
+
+
 static void zx_guest_console_tag(void)
 {
+    /* THE DEBT IS PAID BEFORE THE TAG, by the party about to speak.  A
+       partition that handed the console back mid-sentence left a line open;
+       whoever opens the next one closes it first, so no two partitions ever
+       share a physical line and no tag is ever written into the middle of
+       one.  Same characters, same order -- and none of them on the switch
+       path.  */
+
+    zx_guest_console_close_owed_line();
+
     if (zx_console_guest_attached == 0U)
     {
         /* Not a formatting choice.  A character arriving with no partition
@@ -124,11 +172,18 @@ void zx_guest_console_attach(UINT partition_id, const CHAR *name_ptr)
     /* Any partial line belongs to whoever was attached before, so it is
        closed here as well as in detach.  Attaching twice without detaching
        is a caller error, and the honest response to it is to keep the two
-       partitions' text on separate lines rather than to refuse.  */
+       partitions' text on separate lines rather than to refuse.
+
+       A line left owed by zx_guest_console_release is NOT closed here.  It
+       is closed by the tag, on the incoming partition's first character --
+       so a partition that is scheduled and prints nothing costs nothing,
+       and the newline is charged to the window whose output needs it.  */
+
     if (zx_console_guest_at_line_start == 0U)
     {
-        zx_console_puts("\n");
+        zx_console_guest_line_owed     = 0U;
         zx_console_guest_at_line_start = 1U;
+        zx_console_puts("\n");
     }
 
     zx_console_guest_attached = 1U;
@@ -158,7 +213,55 @@ void zx_guest_console_detach(void)
 {
     if (zx_console_guest_at_line_start == 0U)
     {
+        zx_console_guest_line_owed     = 0U;
+        zx_console_guest_at_line_start = 1U;
         zx_console_puts("\n");
+    }
+    else
+    {
+        /* Nothing is open now, but an earlier RELEASE may have left a line
+           owed -- and the hypervisor is the next thing to speak, which is
+           precisely the case this rule exists for.  Settle it here, where
+           the cost is not on any switch path: detach is called when a
+           partition has left its window early or the frame has ended, and
+           in both the run is about to print rather than to schedule.  */
+
+        zx_guest_console_close_owed_line();
+    }
+
+    zx_console_guest_attached = 0U;
+    zx_console_guest_name     = (const CHAR *)0;
+}
+
+
+/**************************************************************************/
+/*                                                                        */
+/*  FUNCTION                                               RELEASE        */
+/*                                                                        */
+/*    zx_guest_console_release                             PORTABLE C     */
+/*                                                                        */
+/*  DESCRIPTION                                                           */
+/*                                                                        */
+/*    Hand the console back WITHOUT writing anything.                     */
+/*                                                                        */
+/*    The window-boundary version of detach, and the difference between   */
+/*    them is a measured one rather than a stylistic one -- see the note  */
+/*    on zx_console_guest_line_owed above.  A boundary must not write to  */
+/*    a polled UART: it runs at EL2 with FIQ masked, on the path whose    */
+/*    cost the whole determinism claim is about, and what it would write  */
+/*    depends on what the outgoing GUEST happened to be printing.         */
+/*                                                                        */
+/*    Use detach, not this, wherever the hypervisor is about to speak.    */
+/*    The distinction is which side of the switch the two characters are  */
+/*    charged to, and both callers are in zx_frame.c a few lines apart.   */
+/*                                                                        */
+/**************************************************************************/
+
+void zx_guest_console_release(void)
+{
+    if (zx_console_guest_at_line_start == 0U)
+    {
+        zx_console_guest_line_owed     = 1U;
         zx_console_guest_at_line_start = 1U;
     }
 
@@ -261,6 +364,7 @@ void zx_guest_console_reset(void)
     zx_console_guest_id            = 0U;
     zx_console_guest_name          = (const CHAR *)0;
     zx_console_guest_at_line_start = 1U;
+    zx_console_guest_line_owed     = 0U;
     zx_console_guest_characters    = 0U;
     zx_console_guest_orphans       = 0U;
 }

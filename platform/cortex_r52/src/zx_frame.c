@@ -225,6 +225,29 @@ static void zx_frame_console_release(const ZX_FRAME *frame_ptr)
 }
 
 
+/* THE BOUNDARY'S VERSION, AND IT WRITES NOTHING.  See
+   zx_guest_console_release: a partial line closed here is CR and LF into a
+   polled UART, on the switch path, at EL2, with FIQ masked -- measured at
+   24,000 counts of the S32Z280's 8 MHz counter on the critical partition's
+   window period, against 69 counts for the same partition violating its
+   boundary a hundred and seventeen thousand times.
+
+   The line is still closed, and with the same two characters in the same
+   place in the stream; it is closed by whoever speaks next, inside a window
+   that party owns.  The one above stays, and is what the RUN LOOP calls --
+   a partition that left its window early, or a frame that has ended, is
+   followed by the hypervisor printing, and there the two characters are on
+   nobody's switch.  */
+
+static void zx_frame_console_hand_over(const ZX_FRAME *frame_ptr)
+{
+    if (frame_ptr->zx_frame_manifest != (const ZX_MANIFEST *)0)
+    {
+        zx_guest_console_release();
+    }
+}
+
+
 static void zx_frame_console_claim(const ZX_FRAME *frame_ptr, UINT index)
 {
     if (frame_ptr->zx_frame_manifest != (const ZX_MANIFEST *)0)
@@ -587,12 +610,15 @@ ZX_GUEST_CONTEXT *zx_el2_window_boundary(void)
 
     intid = zx_gic_el2_acknowledge();
 
-    /* The console is handed back BEFORE the measurement starts.  See
-       zx_frame_console_release: closing a partial line is a polled-UART
-       write on silicon, and a switch cost that included it would depend on
-       what a guest had been printing.  */
+    /* The console changes hands BEFORE the measurement starts, and hands
+       over WITHOUT WRITING.  Both matter and they are different points.
+       The first keeps the switch figure from depending on what a guest had
+       been printing; the second keeps the partition's PERIOD from doing so,
+       which the first never could -- a period is measured from entry to
+       entry and everything between the boundary and the entry is inside it,
+       measured or not.  See zx_frame_console_hand_over.  */
 
-    zx_frame_console_release(frame_ptr);
+    zx_frame_console_hand_over(frame_ptr);
 
     start = zx_pmu_cycles();
 
@@ -877,6 +903,51 @@ uint32_t zx_frame_run(ZX_FRAME *frame_ptr)
 /*                                                                        */
 /**************************************************************************/
 
+/**************************************************************************/
+/*  zx_frame_measure_per_round                                            */
+/*                                                                        */
+/*  ONE COUNTER READ IS PAID PER LOOP, NOT PER ITERATION, and getting     */
+/*  that wrong is what every row below used to do.                        */
+/*                                                                        */
+/*  Each row brackets a loop of `rounds` operations between two reads of  */
+/*  the cycle counter, so the span holds `rounds` operations and ONE      */
+/*  extra read -- the closing one.  The arithmetic here was               */
+/*                                                                        */
+/*      per_round = span / rounds;   cost = per_round - counter_read;     */
+/*                                                                        */
+/*  which subtracts a WHOLE counter read from every iteration and         */
+/*  therefore over-subtracts by very nearly one read from each row.       */
+/*                                                                        */
+/*  IT WAS FOUND BY TWO IMAGES DISAGREEING, and the disagreement had been */
+/*  carried as unexplained since the switch was first measured.  The      */
+/*  probe image times the same HPRENR mask write with the same alternating*/
+/*  loop and subtracts the overhead the other way round -- from the span, */
+/*  before dividing -- and reported 235 cycles on the S32Z280 where this  */
+/*  function reported 117, and 13 on the model where this reported 9.     */
+/*  Half on one target and two thirds on the other is not noise, and the  */
+/*  two differences are each almost exactly this function's own           */
+/*  zx_cost_counter_read: 118 cycles on the board and 4 on the model.     */
+/*  That is the whole of it.                                              */
+/*                                                                        */
+/*  WHAT IT DOES NOT AFFECT.  The published END-TO-END switch figure is   */
+/*  taken around the real boundary in zx_el2_window_boundary, with two    */
+/*  reads and no loop, and is untouched by this.  What was understated is */
+/*  every COMPONENT row -- the save, the restore, the EL1 MPU either way, */
+/*  the region mask, the time freeze and the deadline -- each by about    */
+/*  one counter read, and all by the SAME amount, which is why their sum  */
+/*  fell short of the end-to-end figure by a constant rather than looking */
+/*  wrong.                                                                */
+/**************************************************************************/
+
+static uint32_t zx_frame_measure_per_round(uint32_t span, uint32_t rounds,
+                                           uint32_t counter_read)
+{
+    uint32_t net = (span > counter_read) ? (span - counter_read) : 0U;
+
+    return net / rounds;
+}
+
+
 void zx_frame_measure_switch(ZX_GUEST_CONTEXT *scratch_a,
                              ZX_GUEST_CONTEXT *scratch_b,
                              uint32_t mask_a, uint32_t mask_b,
@@ -925,6 +996,14 @@ void zx_frame_measure_switch(ZX_GUEST_CONTEXT *scratch_a,
     total = zx_pmu_cycles() - start;
     cost_ptr->zx_cost_counter_read = total / rounds;
 
+    /* WHAT THIS ROW IS, PRECISELY, because every row below subtracts it.
+       It is the cost of ONE zx_pmu_cycles() plus the loop control around
+       it, and it is subtracted ONCE FROM THE SPAN of each row rather than
+       once from each iteration -- see zx_frame_measure_per_round.  Being an
+       over-estimate of a bare read is the right way to be wrong here: the
+       loop control it carries is also present in the rows it is subtracted
+       from, so it cancels rather than accumulating.  */
+
     /* ---- the full save ---------------------------------------------- */
 
     start = zx_pmu_cycles();
@@ -934,10 +1013,9 @@ void zx_frame_measure_switch(ZX_GUEST_CONTEXT *scratch_a,
         zx_context_save(((round & 1U) == 0U) ? scratch_a : scratch_b);
     }
 
-    total = (zx_pmu_cycles() - start) / rounds;
-    cost_ptr->zx_cost_save_full =
-        (total > cost_ptr->zx_cost_counter_read)
-            ? (total - cost_ptr->zx_cost_counter_read) : 0U;
+    total = zx_pmu_cycles() - start;
+    cost_ptr->zx_cost_save_full = zx_frame_measure_per_round(
+        total, rounds, cost_ptr->zx_cost_counter_read);
 
     /* ---- the full restore ------------------------------------------- */
 
@@ -948,10 +1026,9 @@ void zx_frame_measure_switch(ZX_GUEST_CONTEXT *scratch_a,
         zx_context_restore(((round & 1U) == 0U) ? scratch_a : scratch_b);
     }
 
-    total = (zx_pmu_cycles() - start) / rounds;
-    cost_ptr->zx_cost_restore_full =
-        (total > cost_ptr->zx_cost_counter_read)
-            ? (total - cost_ptr->zx_cost_counter_read) : 0U;
+    total = zx_pmu_cycles() - start;
+    cost_ptr->zx_cost_restore_full = zx_frame_measure_per_round(
+        total, rounds, cost_ptr->zx_cost_counter_read);
 
     /* ---- the EL1 MPU alone, both directions ------------------------- */
 
@@ -962,10 +1039,9 @@ void zx_frame_measure_switch(ZX_GUEST_CONTEXT *scratch_a,
         zx_context_save_mpu(((round & 1U) == 0U) ? scratch_a : scratch_b);
     }
 
-    total = (zx_pmu_cycles() - start) / rounds;
-    cost_ptr->zx_cost_save_mpu =
-        (total > cost_ptr->zx_cost_counter_read)
-            ? (total - cost_ptr->zx_cost_counter_read) : 0U;
+    total = zx_pmu_cycles() - start;
+    cost_ptr->zx_cost_save_mpu = zx_frame_measure_per_round(
+        total, rounds, cost_ptr->zx_cost_counter_read);
 
     start = zx_pmu_cycles();
 
@@ -974,10 +1050,9 @@ void zx_frame_measure_switch(ZX_GUEST_CONTEXT *scratch_a,
         zx_context_restore_mpu(((round & 1U) == 0U) ? scratch_a : scratch_b);
     }
 
-    total = (zx_pmu_cycles() - start) / rounds;
-    cost_ptr->zx_cost_restore_mpu =
-        (total > cost_ptr->zx_cost_counter_read)
-            ? (total - cost_ptr->zx_cost_counter_read) : 0U;
+    total = zx_pmu_cycles() - start;
+    cost_ptr->zx_cost_restore_mpu = zx_frame_measure_per_round(
+        total, rounds, cost_ptr->zx_cost_counter_read);
 
     /* ---- the stage-2 region set: one HPRENR write ------------------- */
 
@@ -988,10 +1063,9 @@ void zx_frame_measure_switch(ZX_GUEST_CONTEXT *scratch_a,
         zx_stage2_enable_set(((round & 1U) == 0U) ? mask_a : mask_b);
     }
 
-    total = (zx_pmu_cycles() - start) / rounds;
-    cost_ptr->zx_cost_region_mask =
-        (total > cost_ptr->zx_cost_counter_read)
-            ? (total - cost_ptr->zx_cost_counter_read) : 0U;
+    total = zx_pmu_cycles() - start;
+    cost_ptr->zx_cost_region_mask = zx_frame_measure_per_round(
+        total, rounds, cost_ptr->zx_cost_counter_read);
 
     /* ---- the freeze: a suspend and a resume, which is CNTVOFF ------- */
 
@@ -1005,10 +1079,9 @@ void zx_frame_measure_switch(ZX_GUEST_CONTEXT *scratch_a,
         zx_context_time_resume(which);
     }
 
-    total = (zx_pmu_cycles() - start) / rounds;
-    cost_ptr->zx_cost_time_freeze =
-        (total > cost_ptr->zx_cost_counter_read)
-            ? (total - cost_ptr->zx_cost_counter_read) : 0U;
+    total = zx_pmu_cycles() - start;
+    cost_ptr->zx_cost_time_freeze = zx_frame_measure_per_round(
+        total, rounds, cost_ptr->zx_cost_counter_read);
 
     /* ---- arming the next boundary ----------------------------------- */
 
@@ -1023,10 +1096,9 @@ void zx_frame_measure_switch(ZX_GUEST_CONTEXT *scratch_a,
             armed = zx_el2_hyp_timer_arm(far_away + (uint64_t)round);
         }
 
-        total = (zx_pmu_cycles() - start) / rounds;
-        cost_ptr->zx_cost_deadline =
-            (total > cost_ptr->zx_cost_counter_read)
-                ? (total - cost_ptr->zx_cost_counter_read) : 0U;
+        total = zx_pmu_cycles() - start;
+        cost_ptr->zx_cost_deadline = zx_frame_measure_per_round(
+            total, rounds, cost_ptr->zx_cost_counter_read);
 
         /* Consumed rather than discarded: every deadline above is far in
            the future, so `armed` is non-zero by construction, and reading

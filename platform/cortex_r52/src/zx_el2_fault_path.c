@@ -46,6 +46,32 @@
 /*    an implementation detail: a handler that prints before it captures  */
 /*    can lose the syndrome to its own console driver faulting.           */
 /*                                                                        */
+/*  AND NEITHER MAY BE ALLOWED TO RECURSE                                 */
+/*                                                                        */
+/*    Everything below this point is code that runs AFTER ZoneX has       */
+/*    already failed once, so the ordinary assumption -- that the         */
+/*    hypervisor's own memory and its own console work -- is the          */
+/*    assumption most in doubt.  If reporting the first fault takes a     */
+/*    second one, the vector captures again and calls back in here, and   */
+/*    a path whose entire purpose is to be unmistakable becomes a loop     */
+/*    that says nothing.  That is the same failure the trap handler's     */
+/*    header warns about from the other side: a vector that falls through */
+/*    is how a fault becomes a hang.                                       */
+/*                                                                        */
+/*    So the depth is counted, in .bss, and the SECOND entry does not     */
+/*    print at all.  It stores a verdict and parks, which is the one      */
+/*    action left that cannot itself fault: the console is the most       */
+/*    likely thing to have failed and is certainly the most likely thing  */
+/*    to fail again.  The exit code says so, so that a silicon harness    */
+/*    reading zx_run_failures with no console at all can tell "ZoneX      */
+/*    faulted at EL2" from "ZoneX faulted at EL2 while reporting a fault  */
+/*    at EL2" -- which are different bugs and point at different code.     */
+/*                                                                        */
+/*    The vector also puts SP_hyp back to the top of the Hyp stack before  */
+/*    calling either of these, so that a stack that had run away is not    */
+/*    the stack the report runs on.  See ZX_FATAL_STACK in                 */
+/*    zx_trap_handler.S.                                                   */
+/*                                                                        */
 /**************************************************************************/
 
 #include "zx_port.h"
@@ -57,6 +83,45 @@
 
 #define ZX_EXIT_HYPERVISOR_FAULT    0x5AU
 #define ZX_EXIT_UNEXPECTED_VECTOR   0x5BU
+#define ZX_EXIT_FAULT_WHILE_FAULTING 0x5CU
+
+/* HOW DEEP INTO THE UNRESUMABLE PATH THIS RUN IS.  In .bss, so it is zero
+   before anything can read it and no initialiser has to be trusted -- the
+   same argument the fault-continue policy is built on.  Shared by both
+   functions below rather than one each: a data abort taken while reporting
+   an unexpected VECTOR is the same problem as one taken while reporting a
+   data abort, and counting them separately would let the pair alternate for
+   ever.  */
+
+static uint32_t zx_el2_fault_path_depth;
+
+
+/**************************************************************************/
+/*  zx_el2_fault_path_enter                                               */
+/*                                                                        */
+/*  Returns non-zero on the FIRST entry, when reporting is still worth     */
+/*  attempting.  On any later entry it does not return at all: it parks    */
+/*  with the verdict that says the report itself faulted.                  */
+/**************************************************************************/
+
+static uint32_t zx_el2_fault_path_enter(void)
+{
+    if (zx_el2_fault_path_depth != 0U)
+    {
+        /* NOT ONE CHARACTER IS PRINTED HERE.  Reaching this line means
+           something between the vector and here has already faulted once,
+           and the console driver is both the largest part of that and a
+           polled device write on silicon.  zx_console_exit stores the
+           verdict, executes a DSB and parks on the symbol a debug harness
+           breaks on; none of that touches a device.  */
+
+        zx_console_exit(ZX_EXIT_FAULT_WHILE_FAULTING);
+    }
+
+    zx_el2_fault_path_depth++;
+
+    return 1U;
+}
 
 
 /**************************************************************************/
@@ -65,6 +130,8 @@
 
 ZX_NORETURN void zx_el2_hypervisor_fault(void)
 {
+    (void) zx_el2_fault_path_enter();
+
     zx_console_puts("\n"
         "=========================================================\n"
         " ZONEX FAULTED AT EL2.  This is a HYPERVISOR bug.\n"
@@ -88,6 +155,8 @@ ZX_NORETURN void zx_el2_hypervisor_fault(void)
 
 ZX_NORETURN void zx_el2_unexpected_vector(void)
 {
+    (void) zx_el2_fault_path_enter();
+
     zx_console_puts("\n"
         "=========================================================\n"
         " UNEXPECTED EL2 VECTOR.  An exception nothing was expecting\n"
