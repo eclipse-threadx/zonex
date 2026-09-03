@@ -1008,3 +1008,293 @@ business enabling.
 Verified on both targets: the partition receives INTID 27 and no other, and the
 hypervisor's own timer PPI reads back disabled.
 
+---
+
+## D25 — How a partition's window ENDS · **settled, and run on both targets**
+
+**`HCR.FMO` set, `IMO` and `AMO` clear. The hypervisor's own timer, CNTHP,
+in GIC Group 0 — delivered as an FIQ, taken at EL2 — armed with an
+ABSOLUTE deadline in `CNTHP_CVAL`. Every partition interrupt stays Group 1,
+stays an IRQ, and is still delivered straight to EL1 with no injection and
+no List Register.**
+
+This is D24's Design A, built and measured. D24 established who owns the GIC
+and corrected its own first answer about how a hypervisor tick reaches EL2;
+this entry is what happened when that was implemented, and what it turned out
+to cost.
+
+### Why FIQ, and not injection
+
+Routing is by exception **type**, not by INTID. So the choice is not between
+"the hypervisor gets interrupts" and "the guest does" — both can be true at
+once, and the whole of interrupt virtualization is avoidable in Phase 0.
+
+It is also **better** than injection rather than merely cheaper, and the
+reason is one sentence: with `FMO` set, `PSTATE.F` is IGNORED at EL0 and EL1,
+so **a partition cannot mask the interrupt that ends its own window.** A tick
+delivered as an IRQ to EL1 could be deferred by any guest that disabled
+interrupts, which is precisely the property temporal partitioning is bought
+to have.
+
+That is now a test result and not a claim. `zx_two_partitions_hog.elf` runs a
+partition that masks IRQ **and** FIQ at EL1 and then spins for ever, making
+no kernel call and asking the hypervisor for nothing. On the model it is
+preempted six times out of six, exactly on schedule; what its masking costs
+it is its own kernel's tick, which stops at 4 while its liveness counter
+reaches 229,233. A frame driven by an interrupt taken at EL1 would hang on
+that build, which is why it exists as a build rather than as a paragraph.
+
+### The two things this cost that the design did not predict
+
+**`ICC_PMR` moves to the virtual CPU interface the moment `FMO` is set.**
+TRM 9.3.5: an EL1 access to any register COMMON to both interrupt groups is
+redirected to `ICV_*` when `FMO` **or** `IMO` is 1, and `ICC_PMR` is one of
+the common ones. Every guest writes `ICC_PMR = 0xFF` at start-up to unmask
+its interrupts; from the instant FMO is set that write lands in `ICV_PMR` and
+changes nothing about physical delivery, while the physical mask — which
+resets to **zero, masking everything** — is left closed. A partition that was
+receiving its timer end to end a moment earlier stops receiving anything,
+with no fault and nothing in the log.
+
+So the physical priority mask becomes the hypervisor's, and that turns out to
+be the right owner for the same reason the redistributor is: a partition able
+to raise the physical mask could refuse the interrupt that ends its own
+window. Priority ORDER still does the work it always did — the tick at `0x20`
+preempts a partition's timer at `0xA0`, with four implemented steps between
+them on both targets.
+
+**And the same redirection closes the last hole in D24's argument.**
+`ICC_IGRPEN0` is redirected too, so a partition cannot reach the physical
+Group 0 enable at all: it writes `ICV_IGRPEN0` and nothing happens. Before
+`FMO` was set, that register was genuinely shared with EL1 and D24 could only
+argue that a partition had no Group 0 interrupt worth enabling. Now it cannot
+reach the enable even in principle.
+
+### `HCR.AMO` stays clear, and that is a decision rather than an oversight
+
+The design sketch this work came from listed `AMO = 1` beside `FMO = 1`.
+It is not set, for a reason specific to this codebase: an asynchronous abort
+routed to EL2 arrives at `HVBAR + 0x10`, the vector that today means *"ZoneX
+faulted on its own access"* and reports a hypervisor bug. Setting `AMO`
+without reworking that vector would report a **guest's** abort as a
+hypervisor bug — a worse diagnosis than the one it replaces.
+
+Nothing about ending a window needs it. Distinguishing the two cases needs
+`SPSR_hyp.M` checked in that vector, which is small and belongs with the
+fault-path hardening rather than with the schedule.
+
+### An absolute deadline, and the drift it prevents
+
+`CNTHP_CVAL`, not `CNTHP_TVAL`. A relative countdown re-armed inside the
+handler adds the handler's own latency to every window: a frame declared as
+10 ms becomes 10 ms plus the switch, cumulatively, for the life of the run.
+The schedule still looks fixed, the windows stay in the right proportion, and
+the frame slowly stops being the length it was declared to be. It is
+invisible in any run short enough to read, which is why the host suite runs
+ten thousand frames of the arithmetic and asserts the last boundary is exact.
+
+The opposite choice is right one level down: a guest re-arming its own
+virtual timer inside its own handler wants `TVAL`, because that is one
+register write with no counter read and no 64-bit arithmetic. Two timers, two
+registers, and the reasoning inverts between them.
+
+### What a partition switch turned out to cost
+
+**Measured 2 September 2026. The S32Z280 figures are the ones to quote; the
+model is functional, not cycle-accurate, and its numbers are reported only so
+that the measurement path is exercised on a machine with no board attached.**
+
+Twenty major frames, thirty-nine window boundaries, no missed deadlines and
+no unexplained interrupts on either target.
+
+| | Armv8-R AEM FVP | **S32Z280-594EVB** |
+|---|---|---|
+| EL1 MPU regions a switch carries | 32 | **20** |
+| whole switch, min / mean / max | 1,401 / 1,405 / 1,411 | **5,630 / 5,684 / 5,944** |
+| spread | 10 | **314** |
+| save, everything | 537 | **1,702** |
+| — of which the EL1 MPU | 458 | **1,460** |
+| restore, everything | 537 | **2,087** |
+| — of which the EL1 MPU | 458 | **1,729** |
+| stage-2 region set, one `HPRENR` write | 9 | **117** |
+| the time freeze, `CNTVOFF` | 75 | **404** |
+| arming the next boundary, `CNTHP_CVAL` | 24 | **90** |
+| counter-read overhead, subtracted from every row | 8 | **122** |
+
+**The guest's EL1 MPU is 85% of each direction on both targets**, and that
+proportion holding across a 32-region model and a 20-region part is the more
+useful half of the result. It is the answer to the question a safety customer
+asks, and it is the opposite of the intuitive one: a partition switch is not
+expensive because the hypervisor does much — its own per-partition state is
+three register writes — but because a **guest** has a lot of registers, and
+most of them are its memory protection unit.
+
+**Report the maximum.** A schedule has to be built to survive the worst switch
+it will ever take, so a mean quoted alone hides the excursion a reviewer is
+asking about. The spread is the shape that matters: 314 cycles in 5,600 is
+5.6%, and a switch whose cost depended on what a guest had been doing would
+show it here.
+
+⚠ **The spread was 9,562 cycles until the guest CONSOLE came out of the
+measured span.** Releasing the console closes a partial line, which on
+silicon is characters through a polled UART — thousands of cycles, and only
+on the switches that happened to leave a partition mid-sentence. A partition
+switch in a product has no console in it; the tag is a demonstration
+facility, so it is now taken and given back outside the two counter readings.
+Left inside, the published number would have described what a guest had been
+printing rather than what a switch costs.
+
+⚠ **The `HPRENR` figure disagrees with D4's and the disagreement is not
+explained.** D4 measured the same function by the same method — eight
+operations, alternating between two masks, with the counter-read cost
+measured separately and subtracted — and reported **235** cycles on the
+S32Z280 and **13** on the model. This measurement gets **117** and **9**:
+about half, on both targets, which is too consistent to be noise and points
+at a difference in method or in surroundings rather than in the hardware.
+Both figures are recorded rather than one quietly replacing the other. **The
+decision D4 rests on is unaffected either way** — it rests on the region
+write's cost GROWING with the incoming partition's region count while the
+mask's does not, and both readings agree that the mask is much the cheaper.
+Settling which number is right belongs with the hardening work, and it should
+start by running both measurements in one image.
+
+The way to make the switch cheaper is known and is not taken: `HSTR` traps a
+guest's own CP15 accesses by register group, so a hypervisor could shadow the
+guest's MPU writes and skip the save half entirely. That trades a bounded
+cost at every switch for an unbounded number of traps while a guest runs —
+the wrong trade for a static frame. The naive version is measured first so
+that a later phase has a number to beat.
+
+### And what the two partitions' clocks did
+
+The number the whole step exists to produce, measured on the S32Z280 over
+twenty frames with partition A holding seven ticks of every ten and B three:
+
+| | counts on the core | its own ticks |
+|---|---|---|
+| partition A | 11,157,245 | 139 |
+| partition B | 4,822,000 | 51 |
+| total | 15,979,245 | — |
+
+The frame is 20 × 10 × 80,000 = **16,000,000 counts**, so the 20,755 counts
+unaccounted for are the thirty-nine switches themselves — charged to neither
+partition, which is what makes each partition's figure its own.
+
+**A × 3 = 33,471,735 against B × 7 = 33,754,000: within 0.84% of exact.**
+That equality *is* the temporal claim rather than a symptom of it. A
+partition that could see wall clock would be out by a FACTOR of three here,
+not by a percentage; the residue is the first window, entered from a cold
+start rather than from a switch, and the last, cut short by the frame limit
+rather than by a boundary.
+
+**And it is measured from both sides, which is the only way it means
+anything.** ZoneX knows how much of the physical counter each partition was
+given; only the guest can say what its OWN counter did over the same span,
+and each publishes its tick count from inside its own window. A guest whose
+virtual time matched wall clock would be a system that runs perfectly and
+lies about time — invisible to every other check in this suite.
+
+### Where the switch is, and why it is mostly C
+
+The fifteen words that cannot wait — `r0`-`r12`, `ELR_hyp`, `SPSR_hyp` — are
+captured in the vector, in assembly, because Hyp mode SHARES `r0`-`r12` with
+EL1 and the first C instruction would destroy them. Everything else a
+partition owns is still in the machine while the hypervisor runs: its banked
+SPs and LRs, its EL1 system registers, its whole EL1 MPU. Those are C.
+
+The plan this work came from expected one large assembly routine. The split
+is better, and the reason is the twenty-region loop: as C it is eight lines a
+reader can check against the region count the part reported, and unrolled in
+assembly it is a hundred and twenty coprocessor moves in which one transposed
+operand hands a partition its neighbour's permissions. Nothing is given up —
+the loop's trip count is read from `MPUIR` once at boot and depends on
+nothing a guest did, which is the only property a worst-case-execution-time
+argument actually needs.
+
+### One defect this step found in ZoneX's own foundations
+
+`HCR`'s routing bits are `FMO[3]`, `IMO[4]`, `AMO[5]`. This port had `FMO`
+and `AMO` defined the other way round from its first commit, because the
+mnemonic order a reader reaches for is the alphabetical one. It survived
+because `IMO` is bit 4 either way and because every use of the three until
+now was a single `BIC` of all three at once, where swapping two changes
+nothing.
+
+The first image that SET one of them routed nothing: bit 5 is `AMO`. Every
+other check was green — the comparator expired, the GIC made PPI 26 pending,
+the priorities were right, the CPU interface was open — and no window ever
+ended. **A check written as `(HCR & ZX_HCR_FMO) != 0` could not have caught
+it**, because that is the same symbol on both sides of the comparison. The
+image now checks HCR by BIT POSITION, which is the only form of the check a
+swapped definition cannot satisfy, and the positions are asserted at compile
+time. The full account, including the three questions that localised it, is
+in `docs/armv8r-el2-reference.md`.
+
+### The isolation claim, between two partitions that are both alive
+
+One partition can be shown to be confined; it cannot be shown to be confined
+FROM ANYTHING. `zx_two_partitions_cross.elf` closes that: partition B is
+handed an address inside partition A's window and told to write to it, and
+its guest **grants itself that granule in its own EL1 MPU first**, so stage 1
+permits the access and B genuinely believes it owns the memory.
+
+Stage 2 refuses. A's region is not in B's enabled set, and PMSAv8-R gives
+EL0/EL1 no background map — an access that hits no enabled region faults
+regardless of `HSCTLR.BR`. That is "the stricter of the two stages wins" with
+the two stages genuinely disagreeing, between two live partitions, and the
+syndrome names it: `EC 0x24`, a data abort routed to EL2, with `HDFAR` naming
+the address B aimed at.
+
+**The second half of the result matters as much as the first.** B is stopped
+and **partition A runs to the end of the frame with its schedule untouched**
+— every window, every tick, every boundary. Being attacked cost it nothing.
+A run in which A's clock had slowed because B misbehaved would satisfy every
+memory check in this suite and would not be temporal partitioning.
+
+And B's windows are still **spent** rather than handed to A. That path — a
+frame stepping over a dead partition's slot — is exercised nowhere else, and
+it is the one place the "an idle partition burns its window" rule is
+observable rather than merely stated.
+
+⚠ **It also exposed a measurement defect.** Burning a stopped partition's
+window happens inside the boundary handler, so it was being counted as switch
+cost: a switch of a few thousand cycles reported as three million, with the
+difference showing up as jitter. A boundary that had to wait out a window is
+a switch PLUS a wait, and a figure averaging the two describes neither. Such
+boundaries are now counted and not timed, and the run prints both counts —
+which are equal in any run where both partitions live to the end.
+
+### What is deliberately not here
+
+* **Interrupt LATENCY is not a hypervisor-controlled quantity.** Guest
+  interrupts go straight to EL1, which is why they cost what they always did
+  — and why bounding them needs the List Registers this core has and this
+  phase does not use. That stays where the roadmap put it.
+* **An idle partition burns its window.** Trapping `WFI` to hand the
+  remainder to the next partition would raise throughput and would make one
+  partition's start time depend on its neighbour's behaviour, which is the
+  coupling temporal partitioning is bought to remove. Declined, on purpose.
+* **A faulted partition is stopped, not restarted.** Supervised restart is a
+  later phase, and a hypervisor that quietly re-entered a partition which had
+  just violated its boundary would be doing the easy half of it.
+* **A partition faulting at the exact instant of a frame boundary is not a
+  build**, and the gap is deliberate. It is a race a few cycles wide and
+  cannot be provoked reproducibly; a test that caught it once would be an
+  anecdote rather than a regression. What can be said is structural: the two
+  events arrive at DIFFERENT VECTORS — a fault at the Hyp trap entry, a
+  boundary at the FIQ vector — and a core takes one exception at a time.
+  Whichever arrives first is taken and the other is still pending: a fault
+  taken first returns to the hypervisor with the boundary's FIQ still
+  asserted at the GIC, and a boundary taken first re-enters the faulting
+  partition, which faults again on the same instruction. Neither order loses
+  an event, because neither event is edge-triggered and neither is
+  acknowledged until it is handled.
+* **The FPU is DENIED to a time-partitioned system rather than saved.** D23
+  recorded that opening `HCPTR.TCP10/TCP11` was exactly right with one
+  partition and a shared register bank with two, since nothing saves `FPEXC`,
+  `FPSCR` or the D-registers across a switch. The failure mode is a wrong
+  ANSWER and not a fault, so ZoneX closes the traps instead: a guest touching
+  floating point takes an exception at EL2 with a syndrome naming the cause.
+  Saving the bank is a real later-phase option and needs the register file's
+  width read from `MVFR0` rather than assumed; sharing it silently is not an
+  option at all.

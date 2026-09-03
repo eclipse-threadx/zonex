@@ -108,7 +108,7 @@ All are reached with `MRC`/`MCR p15, 4, <Rt>, …`. `opc1 = 4` is the Hyp bank.
 | Register | `CRn, CRm, opc2` | Notes |
 |---|---|---|
 | `HVBAR` | `c12, c0, 0` | EL2 vector base, 32-byte aligned. The ThreadX Cortex-R52 port's `entry.S` already installs it. |
-| `HCR` | `c1, c1, 0` | `VM[0]` stage-2 enable · `AMO[3]` · `IMO[4]` · `FMO[5]` · `TGE[27]` · `HCD[29]` — keep `HCD` clear to keep `HVC`. The ThreadX Cortex-R52 port clears all six; ZoneX sets `VM`. |
+| `HCR` | `c1, c1, 0` | `VM[0]` stage-2 enable · **`FMO[3]` · `IMO[4]` · `AMO[5]`** · `TGE[27]` · `HCD[29]` — keep `HCD` clear to keep `HVC`. ZoneX sets `VM` and `FMO`. ⚠ The three routing bits are **not** in alphabetical order and this file said they were; see the warning below, which cost a run. |
 | `HSCTLR` | `c1, c0, 0` | `M[0]` EL2 MPU enable · `BR[17]` background region · `TE` Thumb exceptions · `I` · `C`. |
 | `HSR` | `c5, c2, 0` | `EC[31:26]`, `IL[25]`, `ISS[24:0]`. |
 | `HDFAR` | `c6, c0, 0` | Data fault address. |
@@ -361,6 +361,122 @@ mapping at all. All are UNDEFINED until `ICC_HSRE.SRE` is set — see below.
 `ICC_IAR1` returning **1023** means nothing was pending. It must **not** be
 given an end-of-interrupt: the running priority was never raised, so dropping it
 corrupts the GIC's priority stack rather than merely being redundant.
+
+### ⚠ HCR's routing bits are FMO, IMO, AMO going UP from bit 3
+
+| Bit | Name | What it overrides |
+|---|---|---|
+| 3 | `FMO` | `CPSR.F` for physical FIQ at EL0/EL1, and routes it to EL2 |
+| 4 | `IMO` | `CPSR.I` for physical IRQ at EL0/EL1, and routes it to EL2 |
+| 5 | `AMO` | `CPSR.A` for asynchronous aborts at EL0/EL1 |
+
+TRM Table 3-70, and the architecture agrees. **The mnemonic order a reader
+reaches for is the alphabetical one — AMO, FMO, IMO — and it is wrong.** This
+port had `ZX_HCR_FMO` and `ZX_HCR_AMO` defined the other way round from its
+first commit.
+
+It survived because `IMO` is bit 4 under either reading, and because every use
+of the three until time partitioning arrived was a single `BIC` of all three at
+once — where swapping two of them changes nothing whatever. The reset path had
+been clearing exactly the right bits for the wrong reasons.
+
+**What it cost when the first image SET one of them.** Routing FIQ to EL2 set
+bit 5, which is AMO. Physical FIQ was never routed anywhere, so the guest's own
+`PSTATE.F` masked the hypervisor's tick as an ordinary EL1 FIQ and no
+partition's window ever ended. Every other check in the run was green: the
+comparator expired, the GIC made PPI 26 pending, the priorities were right, and
+the CPU interface was open. The image printed a flawless set-up and then went
+quiet for ever.
+
+**And a check written against the symbol could not have caught it**, because
+`(HCR & ZX_HCR_FMO) != 0` is the same symbol on both sides of the comparison
+and passes against either definition. The two-partition image therefore checks
+HCR **by bit position** — `0x8` for FMO, `0x10` for IMO, `0x20` for AMO — which
+is the only form of the check a swapped definition cannot satisfy. The
+positions are also asserted at compile time in `zx_context.c`.
+
+The diagnosis took three questions asked separately, and it is worth recording
+the order because a window that never ends looks identical in all three cases:
+
+| Question | Answered by | Result |
+|---|---|---|
+| did the comparator expire? | `CNTHP_CTL.ISTATUS` | yes |
+| did the GIC make it pending? | `GICR_ISPENDR0` bit 26 | yes |
+| did the core take it? | unmask `PSTATE.F` at EL2 | yes, **at EL2** |
+
+The third one is what localised it: the FIQ was delivered and taken the moment
+EL2 stopped masking it, so the CPU interface and the GIC were both correct and
+only the routing from EL1 was missing.
+
+### The hypervisor timer, CNTHP — the register a frame is built on
+
+| Register | Encoding | Note |
+|---|---|---|
+| `CNTHP_TVAL` | `p15, 4, c14, c2, 0` | 32-bit down-count, relative |
+| `CNTHP_CTL` | `p15, 4, c14, c2, 1` | `ENABLE` = 0, `IMASK` = 1, `ISTATUS` = 2 |
+| `CNTHP_CVAL` | `MRRC`/`MCRR p15, 6, …, c14` | **64-bit, ABSOLUTE, and the one to use** |
+| `CNTHCTL` | `p15, 4, c14, c1, 0` | `PL1PCTEN`/`PL1PCEN`, left CLEAR — D23 |
+
+TRM Tables 3-11 and 3-15. It compares against the **physical** counter, which
+is the one thing in the system no partition can move — `CNTHCTL.PL1PCTEN` stays
+clear so a guest cannot even read it.
+
+**`CNTHP_CVAL` and not `CNTHP_TVAL`, and this is the whole determinism claim.**
+`TVAL` is a down-count loaded relative to now, so re-arming it inside the
+handler adds the handler's own latency to every window — a frame declared as
+10 ms becomes 10 ms plus the switch, cumulatively, for the life of the run. The
+schedule still looks fixed and the windows stay in the right proportion. `CVAL`
+is an absolute comparison, so the switch's own cost comes out of the window it
+happens in.
+
+The opposite choice is right one level down and for the opposite reason: a
+guest re-arming its OWN virtual timer inside its own handler wants `CNTV_TVAL`,
+because that is one register write with no counter read and no 64-bit
+arithmetic. Two timers, two registers, and the reasoning inverts between them.
+
+**Write the comparator BEFORE the enable, at both levels.** Enabling first
+leaves the comparator holding the PREVIOUS deadline — already in the past — for
+the few cycles it takes to write the new one, so the level asserts and the
+interrupt is taken again immediately. On a level-triggered PPI that is a storm
+rather than a glitch.
+
+### ⚠ Setting `HCR.FMO` moves the guest's `ICC_PMR` write to the VIRTUAL interface
+
+**Measured consequence: a partition that was receiving its timer perfectly well
+stops receiving anything at all, with no fault and no message.**
+
+TRM 9.3.5 lists which CPU-interface registers an EL1 access is redirected for:
+
+| When | Registers redirected to `ICV_*` |
+|---|---|
+| `HCR.FMO == 1` | `ICC_AP0R0`, `ICC_BPR0`, `ICC_EOIR0`, `ICC_HPPIR0`, `ICC_IAR0`, `ICC_IGRPEN0` |
+| `HCR.IMO == 1` | `ICC_AP1R0`, `ICC_BPR1`, `ICC_EOIR1`, `ICC_HPPIR1`, `ICC_IAR1`, `ICC_IGRPEN1` |
+| **either** | `ICC_RPR`, `ICC_CTLR`, `ICC_DIR`, **`ICC_PMR`** |
+
+`ICC_PMR` is in the third row, so it moves the instant FMO is set even though
+`IMO` stays clear and the guest's Group 1 path is otherwise untouched. Every
+guest writes `ICC_PMR = 0xFF` at start-up to unmask its interrupts; from then
+on that write lands in `ICV_PMR` and changes nothing about physical delivery.
+The physical priority mask **resets to zero, which masks everything**.
+
+So the hypervisor owns the physical mask and opens it. Priority ORDER still
+does all the work it did before — the hypervisor's tick is numerically lower
+and preempts a partition's timer — and what changes is only who sets the
+threshold below which nothing is delivered at all.
+
+**And the same redirection is what makes the FIQ design airtight rather than
+merely cheap.** `ICC_IGRPEN0` is redirected too, so once FMO is set a partition
+cannot reach the physical Group 0 enable to switch off the interrupt that ends
+its own window: it writes `ICV_IGRPEN0` and nothing happens. Before FMO was
+set that register was genuinely shared with EL1, and D24 could only argue that
+a partition had no Group 0 interrupt worth enabling.
+
+| Register | Encoding | Used by |
+|---|---|---|
+| `ICC_IGRPEN0` | `p15, 0, c12, c12, 6` | EL2, to enable Group 0 signalling |
+| `ICC_IAR0` | `p15, 0, c12, c8, 0` | EL2, to acknowledge an FIQ |
+| `ICC_EOIR0` | `p15, 0, c12, c8, 1` | EL2, to complete one |
+| `GICR_ISPENDR0` | SGI frame, offset `0x0200` | reading whether a PPI is pending |
 
 ### The generic-timer registers, AArch32
 
@@ -891,30 +1007,111 @@ can support; it is repeatability, not the cost of anything.
 
 Not a decision — a **list of registers**, kept here because that is what it is,
 and because every entry on it was found by needing it rather than by reading a
-manual. Nothing switches partitions yet; this is what will have to.
+manual. **Every row is now handled**, and the column that used to say what was
+missing says how instead.
 
-`—` in the last column means nothing in ZoneX touches it today, which with one
-partition is exactly correct and with two is a defect.
+**Almost all of it is reachable from C at EL2**, and that turned out to be the
+most useful fact on this page. AArch32 Hyp mode banks only `SP`, `LR` and
+`SPSR`, so at the instant the hypervisor takes control a guest's banked
+registers, its EL1 system registers and its whole EL1 MPU are STILL IN THE
+MACHINE and can be read and written with ordinary `MRS`/`MSR` (banked) and
+`MRC`/`MCR` forms. Only fifteen words cannot wait: `r0`–`r12`, which Hyp mode
+SHARES with EL1 and which the first C instruction destroys, plus `ELR_hyp` and
+`SPSR_hyp`. Those are captured in the vector; everything else is C.
 
-| State | Encoding (AArch32) | Whose | Handled? |
+**The banked-register forms, verified by assembling them** under both
+`arm-none-eabi-gcc` and ATfE clang: `MRS Rd, SP_usr` / `LR_usr` / `R8_usr` …
+`R12_usr`, and the same for `_svc`, `_irq`, `_abt`, `_und`, `_fiq`, plus
+`SPSR_svc`/`_irq`/`_abt`/`_und`/`_fiq` and `R8_fiq`…`R12_fiq`. `MSR` in the
+other direction. **User and System share `SP` and `LR`**, so `SP_usr` covers
+both, and there is no `SPSR_usr` because User mode cannot take an exception
+into itself.
+
+| State | Encoding (AArch32) | Whose | How |
 |---|---|---|---|
-| **EL1 banked registers** — `SP`, `LR` per mode, `SPSR` per mode | mode-banked | guest | — |
-| `VBAR` | `p15, 0, c12, c0, 0` | guest | — · the guest writes it in its own board support, and a switch that did not restore it would send the next partition's faults to the previous one's vector table |
-| `SCTLR`, `CONTEXTIDR`, `TPIDRURW`/`TPIDRURO`/`TPIDRPRW` | `p15, 0, c1, c0, 0` / `c13, c0, 1` / `c13, c0, {2,3,4}` | guest | — |
-| **The whole EL1 MPU region set** — `PRBAR`/`PRLAR` per region, selected through `PRSELR` | `p15, 0, c6, c3, {0,1}` with `p15, 0, c6, c2, 1` | guest | — · **20 regions × 2 registers on the S32Z280.** This is likely to dominate the switch cost and it is the number the next step has to measure. |
-| **FPU** — `FPEXC`, `FPSCR`, `D0`–`D15` | `VMRS`/`VMSR` | guest | — · `HCPTR.TCP10/TCP11` are cleared for a guest (D23), so a guest *may* use the FPU and nothing saves it |
-| `CNTV_CTL`, `CNTV_TVAL`/`CNTV_CVAL` | `p15, 0, c14, c3, {1,0}` / `MRRC p15, 3, …, c14` | guest | **stop only.** `zx_el2_guest_timer_stop` disarms the timer when a partition yields, which makes an armed comparator harmless for one partition and does not make it correct for two: a switch that saved neither would hand the next partition the previous one's deadline. |
-| `CNTVOFF` | `MRRC`/`MCRR p15, 4, …, c14` | **hypervisor, per partition** | **yes**, for one partition. Becomes an array indexed by partition, along with the suspend/resume instants recorded beside it. |
-| **CPU interface** — `ICC_PMR`, `ICC_BPR1`, `ICC_IGRPEN1` | see the table above | guest | — · a partition brings these up itself in `board_init`, so a switch that did not restore them would leave the next partition running with the previous one's priority mask |
-| **Which PPIs are enabled** — `GICR_ISENABLER0` | memory-mapped, SGI frame | **hypervisor** | **yes** — every one is disabled at bring-up and only the granted INTID enabled. A switch changes which INTID that is, and it is one register write. |
+| `r0`–`r12`, `ELR_hyp`, `SPSR_hyp` | shared with EL1 / Hyp-banked | guest | **assembly, in the vector.** These are the only fifteen words that cannot wait: Hyp mode shares `r0`–`r12` with EL1. `SPSR` carries the guest's own masks and `PSTATE.T` back with it, so a T32 guest resumes in T32 without the switch knowing which. |
+| **EL1 banked registers** — `SP`, `LR` per mode, `SPSR` per mode, `R8_fiq`–`R12_fiq` | `MRS`/`MSR` (banked) | guest | **C.** FIQ mode's `r8`–`r12` are saved too, although a partition here can take no FIQ: "the guest cannot be using these" is a claim about a configuration bit, and a switch correct only while one bit stays set is a trap for whoever changes it. |
+| `VBAR`, `SCTLR`, `CPACR`, `CONTEXTIDR`, `TPIDRURW`/`TPIDRURO`/`TPIDRPRW`, `MAIR0/1`, `AMAIR0/1` | `p15, 0, c12, c0, 0` / `c1, c0, 0` / `c1, c0, 2` / `c13, c0, {1,2,3,4}` / `c10, c2, {0,1}` / `c10, c3, {0,1}` | guest | **C.** `SCTLR` is restored LAST of these, because it carries `M` — the bit that makes every region below start being consulted. |
+| **The whole EL1 MPU region set** — `PRBAR`/`PRLAR` per region, selected through `PRSELR` | `p15, 0, c6, c3, {0,1}` with `p15, 0, c6, c2, 1` | guest | **C, and it DOMINATES — measured.** 20 regions on the S32Z280, 32 on the model. One barrier pair for the whole block, never one per region; the `ISB` after each `PRSELR` write is the one that cannot be hoisted, because the next instruction reads `PRBAR` *through* it. |
+| **FPU** — `FPEXC`, `FPSCR`, `D0`–`D15` | `VMRS`/`VMSR` | guest | **DENIED, not saved.** `HCPTR.TCP10/TCP11` are set for a time-partitioned system, so a guest touching floating point takes an exception at EL2 with a syndrome naming the cause. With one partition an open FPU was exactly right; with two it is a shared register bank whose failure mode is a wrong ANSWER rather than a fault. See D23 and D25. |
+| `CNTV_CTL`, `CNTV_CVAL` | `p15, 0, c14, c3, 1` / `MRRC p15, 3, …, c14` | guest | **saved, then DISARMED.** Both in that order: the comparator is a deadline in the partition's own time and must come back with it, and an armed expired comparator holds the PPI asserted at the GIC — on the same INTID the next partition is about to be given. Restore the comparator BEFORE the control, or the incoming guest takes a tick it never scheduled as its first act. |
+| `CNTVOFF`, and the suspend/resume instants beside it | `MRRC`/`MCRR p15, 4, …, c14` | **hypervisor, per partition** | **yes, in the context block.** One register, several partitions, so the running partition's value is in the register and the others' are in their blocks. |
+| **CPU interface** — `ICC_PMR`, `ICC_CTLR`, `ICC_IGRPEN0` | see the redirection table above | **hypervisor, once** | **not switched at all, and this is what `FMO` changed.** An EL1 access to any of them is redirected to the virtual interface once `FMO` is set, so the physical copies are EL2's and are set once at boot. They came OFF this list. |
+| **CPU interface** — `ICC_BPR1`, `ICC_IGRPEN1` | see the table above | guest | **not switched.** Group 1 is not redirected while `IMO` is clear, and both partitions program them identically at start-up. A manifest whose partitions wanted different values would put these back on the list. |
+| **Which PPIs are enabled** — `GICR_ISENABLER0` | memory-mapped, SGI frame | **hypervisor** | **yes, and it does not change.** Both partitions use INTID 27 and never run at once, so what a switch changes is the COMPARATOR behind it rather than the enable. Two INTIDs would make this guest state and grow the switch for no gain. |
 | The stage-2 region set | `HPRENR` | hypervisor | **yes** — one write, measured; see D4 |
+| The next window boundary | `MCRR p15, 6, …, c14` (`CNTHP_CVAL`) | hypervisor | **yes**, absolute, computed from the frame's epoch — see D25 |
 
 The two ends of that table are worth contrasting, because they are the whole
 shape of the problem. The hypervisor's own per-partition state is *small and
-cheap* — one `HPRENR` write, one `CNTVOFF` write, one `GICR_ISENABLER0` write.
-The **guest's** state is large, and the EL1 MPU dominates it. A partition switch
-is therefore not expensive because the hypervisor does much; it is expensive
+cheap* — one `HPRENR` write, one `CNTVOFF` write, one comparator. The
+**guest's** state is large, and the EL1 MPU dominates it. A partition switch is
+therefore not expensive because the hypervisor does much; it is expensive
 because a guest has a lot of registers.
+
+**Measured 2 September 2026, over thirty-nine boundaries of a twenty-frame run
+on each target.** The FVP is a functional model and its numbers are not timing;
+they are here because printing them on every run keeps the measurement path
+exercised on a machine with no board attached. **Quote the silicon column.**
+
+| | Armv8-R AEM FVP | **S32Z280-594EVB** |
+|---|---|---|
+| EL1 MPU regions a switch carries | 32 | **20** |
+| whole switch, min / mean / max | 1,401 / 1,405 / 1,411 | **5,630 / 5,684 / 5,944** |
+| spread | 10 | **314** |
+| save, everything | 537 | **1,702** |
+| — of which the EL1 MPU | 458 | **1,460** |
+| restore, everything | 537 | **2,087** |
+| — of which the EL1 MPU | 458 | **1,729** |
+| stage-2 region set, one `HPRENR` write | 9 | **117** |
+| the time freeze, `CNTVOFF` | 75 | **404** |
+| arming the next boundary, `CNTHP_CVAL` | 24 | **90** |
+| counter-read overhead, subtracted from every row | 8 | **122** |
+
+**The EL1 MPU is 85% of each direction on BOTH targets**, and that proportion
+holding across a 32-region model and a 20-region part is the more useful half
+of the result.
+
+**Report the MAXIMUM, not the mean.** A schedule has to be built to survive the
+worst switch it will ever take, so a mean quoted alone hides exactly the
+excursion a reviewer is asking about. The spread is the interesting shape: a
+switch whose cost depended on what a guest had been doing would show it here.
+
+⚠ **It did, until the guest console came out of the measured span.** The spread
+on silicon was **9,562** cycles — min 5,928 against max 15,490 — because
+releasing the console closes a partial line, and on this board that is
+characters through a polled UART. Only the switches that happened to leave a
+partition mid-sentence paid it. A partition switch in a product has no console
+in it, so the tag is now taken and given back outside the two counter readings;
+left inside, the published figure described what a guest had been printing.
+
+⚠ **The `HPRENR` row disagrees with D4's and the disagreement is unexplained.**
+D4 measured the same function by the same method and got **235** cycles on the
+S32Z280 and **13** on the model, against **117** and **9** here — about half on
+both targets, which is too consistent to be noise. Both are recorded. D4's
+decision is unaffected either way, because it rests on a region write's cost
+GROWING with the incoming partition's region count while a mask's does not, and
+both readings agree the mask is much cheaper. Settling it belongs with the
+hardening work and should start by running both measurements in one image.
+
+### ⚠ The floating-point traps block the debugger's register read, on silicon
+
+With `HCPTR.TCP10/TCP11` SET, the S32Z280's debug probe cannot read the core's
+register file: gdb reports *"Could not read registers; remote failure reply
+'01'"* and the harness around the image exits non-zero **on a run whose own
+console said ALL CHECKS PASSED**. The debugger reads the VFP registers as part
+of the register file, and a trapped coprocessor is one it cannot reach.
+
+Measured by comparison on the board, which is the only way to attribute it: an
+image that stops BEFORE the traps are set produces no such error, and the same
+image stopping AFTER produces two.
+
+The answer is not to stop denying the FPU — the traps exist because nothing
+saves the register bank across a partition switch (D25). What they protect is
+the interval in which PARTITIONS run, so they are lifted once the last window
+has closed and before the hypervisor parks. A harness that reports a passing
+run as a failure is the one outcome a regression must never have, in either
+direction.
 
 ---
 
