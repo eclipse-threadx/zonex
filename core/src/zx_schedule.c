@@ -21,14 +21,493 @@
 /*                                                                        */
 /*  DESCRIPTION                                                           */
 /*                                                                        */
-/*    The time-partition schedule: the fixed cyclic window table and the  */
-/*    hypervisor-timer tick that advances it.                             */
+/*    The time-partition schedule: the fixed cyclic window table, and     */
+/*    where on the physical counter each window boundary falls.           */
 /*                                                                        */
-/*    This translation unit is deliberately empty of implementation.      */
-/*    The change that founded this repository builds the repository, not  */
-/*    the hypervisor; the unit exists so that the change which writes the */
-/*    code opens a tree that already configures, compiles and links.      */
+/*    Arithmetic only.  Nothing here reads a counter, writes a comparator */
+/*    or switches a region set; see zx_schedule.h for why the split is    */
+/*    there and what it buys.                                             */
+/*                                                                        */
+/*  THE WORST-CASE-EXECUTION-TIME ARGUMENT, WHERE THE CODE IS             */
+/*                                                                        */
+/*    zx_schedule_advance and zx_schedule_deadline run inside the         */
+/*    partition switch, so their cost is part of the number this step     */
+/*    exists to measure.  Both are straight-line: a fixed number of        */
+/*    64-bit adds, one 64-bit multiply, and two comparisons whose         */
+/*    operands are the schedule's own fields.                             */
+/*                                                                        */
+/*    NOTHING IN EITHER OF THEM DEPENDS ON ANYTHING A GUEST DID.  There   */
+/*    is no loop, no search, no allocation, and no data-dependent branch: */
+/*    the only branches are the window index wrapping and the frame limit */
+/*    being reached, and both are decided by the schedule's own counters. */
+/*    That is what makes "how long does a partition switch take" a        */
+/*    question with one answer rather than a distribution.                */
+/*                                                                        */
+/*    The one multiply is deliberate and is the reason the boundary is    */
+/*    computed rather than accumulated.  Adding a window's worth of       */
+/*    counts to a running total each time would be one instruction        */
+/*    cheaper and would make the frame's length the sum of everything     */
+/*    that had happened to it, which is exactly the drift an absolute     */
+/*    deadline exists to prevent.                                         */
 /*                                                                        */
 /**************************************************************************/
 
 #include "zx_schedule.h"
+#include "zx_console.h"
+
+
+/**************************************************************************/
+/*                                                                        */
+/*  FUNCTION                                               RELEASE        */
+/*                                                                        */
+/*    zx_schedule_build                                    PORTABLE C     */
+/*                                                                        */
+/*  DESCRIPTION                                                           */
+/*                                                                        */
+/*    Turns a manifest into a round-robin major frame.                    */
+/*                                                                        */
+/*    ONE WINDOW PER PARTITION, IN MANIFEST ORDER, and the order is worth */
+/*    stating because it is the only ordering rule Phase 0 has: a         */
+/*    schedule whose slots came out in a different order from the         */
+/*    manifest would be correct and unreadable, and every report in this  */
+/*    suite names partitions by their manifest index.                     */
+/*                                                                        */
+/*    THE FRAME IS CHECKED AGAINST ITS PARTS.  A manifest carries the     */
+/*    major frame explicitly rather than computing it, exactly so that it */
+/*    can be WRONG -- a computed field could never disagree with anything */
+/*    and would check nothing.  A frame that does not equal the sum of    */
+/*    its windows means somebody changed a window and not the total, and  */
+/*    the consequence is a partition whose slot silently moves.           */
+/*                                                                        */
+/**************************************************************************/
+
+UINT zx_schedule_build(const ZX_MANIFEST *manifest_ptr,
+                       uint64_t counts_per_tick,
+                       ULONG frame_limit,
+                       ZX_SCHEDULE *schedule_ptr)
+{
+    UINT  index;
+    ULONG total = 0UL;
+
+    if ((manifest_ptr == (const ZX_MANIFEST *)0)
+        || (schedule_ptr == (ZX_SCHEDULE *)0))
+    {
+        return ZX_MANIFEST_NULL_POINTER;
+    }
+
+    if (manifest_ptr->zx_manifest_partitions == (const ZX_PARTITION *)0)
+    {
+        return ZX_MANIFEST_NULL_POINTER;
+    }
+
+    /* Cleared in full before anything is assigned, for the reason the
+       region planner is: a schedule is read by a switch path that indexes
+       it, and a half-written one whose unused slots hold whatever was on
+       the stack would enter an arbitrary partition.  */
+
+    for (index = 0U; index < ZX_MAX_PARTITIONS; index++)
+    {
+        schedule_ptr->zx_schedule_windows[index].zx_window_partition =
+            ZX_MANIFEST_NO_INDEX;
+        schedule_ptr->zx_schedule_windows[index].zx_window_ticks = 0UL;
+    }
+
+    schedule_ptr->zx_schedule_window_count    = 0U;
+    schedule_ptr->zx_schedule_frame_ticks     = 0UL;
+    schedule_ptr->zx_schedule_counts_per_tick = 0U;
+    schedule_ptr->zx_schedule_epoch           = 0U;
+    schedule_ptr->zx_schedule_ticks_spent     = 0U;
+    schedule_ptr->zx_schedule_current         = 0U;
+    schedule_ptr->zx_schedule_frames          = 0UL;
+    schedule_ptr->zx_schedule_frame_limit     = 0UL;
+    schedule_ptr->zx_schedule_missed          = 0UL;
+    schedule_ptr->zx_schedule_running         = 0U;
+
+    if (manifest_ptr->zx_manifest_partition_count == 0U)
+    {
+        return ZX_MANIFEST_NO_PARTITIONS;
+    }
+
+    if (manifest_ptr->zx_manifest_partition_count > ZX_MAX_PARTITIONS)
+    {
+        return ZX_MANIFEST_TOO_MANY_PARTITIONS;
+    }
+
+    /* A tick that costs no counter counts would put every boundary at the
+       epoch, so the hypervisor timer would fire continuously and the run
+       would present as a hang INSIDE the hypervisor -- no output, no fault,
+       and nothing to point at.  Refused here, where it can be named.  */
+
+    if (counts_per_tick == 0U)
+    {
+        return ZX_MANIFEST_ZERO_WINDOW;
+    }
+
+    for (index = 0U; index < manifest_ptr->zx_manifest_partition_count;
+         index++)
+    {
+        ULONG ticks =
+            manifest_ptr->zx_manifest_partitions[index]
+                .zx_partition_window_ticks;
+
+        /* A window of zero ticks is a partition that is declared and never
+           runs.  That is either a mistake or a partition that should not be
+           in the manifest, and both are worth refusing rather than
+           producing a frame with an invisible member.  */
+
+        if (ticks == 0UL)
+        {
+            return ZX_MANIFEST_ZERO_WINDOW;
+        }
+
+        schedule_ptr->zx_schedule_windows[index].zx_window_partition = index;
+        schedule_ptr->zx_schedule_windows[index].zx_window_ticks     = ticks;
+
+        total += ticks;
+    }
+
+    if (total != manifest_ptr->zx_manifest_major_frame_ticks)
+    {
+        return ZX_MANIFEST_FRAME_MISMATCH;
+    }
+
+    schedule_ptr->zx_schedule_window_count =
+        manifest_ptr->zx_manifest_partition_count;
+    schedule_ptr->zx_schedule_frame_ticks     = total;
+    schedule_ptr->zx_schedule_counts_per_tick = counts_per_tick;
+    schedule_ptr->zx_schedule_frame_limit     = frame_limit;
+
+    return ZX_MANIFEST_SUCCESS;
+}
+
+
+/**************************************************************************/
+/*                                                                        */
+/*  FUNCTION                                               RELEASE        */
+/*                                                                        */
+/*    zx_schedule_start                                    PORTABLE C     */
+/*                                                                        */
+/*  DESCRIPTION                                                           */
+/*                                                                        */
+/*    Fixes the epoch every later boundary is measured from.              */
+/*                                                                        */
+/*    Called ONCE, with a counter reading the caller has just taken, and  */
+/*    immediately before the first partition is entered.  Taking it       */
+/*    earlier would charge the first window for whatever the hypervisor   */
+/*    did in between -- which on silicon is a great deal of polled UART   */
+/*    -- and the first window would then be the only short one in the     */
+/*    run, which is exactly the kind of asymmetry a determinism claim     */
+/*    cannot afford to have and not explain.                              */
+/*                                                                        */
+/**************************************************************************/
+
+void zx_schedule_start(ZX_SCHEDULE *schedule_ptr, uint64_t now)
+{
+    if (schedule_ptr == (ZX_SCHEDULE *)0)
+    {
+        return;
+    }
+
+    if (schedule_ptr->zx_schedule_window_count == 0U)
+    {
+        return;
+    }
+
+    schedule_ptr->zx_schedule_epoch       = now;
+    schedule_ptr->zx_schedule_ticks_spent = 0U;
+    schedule_ptr->zx_schedule_current     = 0U;
+    schedule_ptr->zx_schedule_frames      = 0UL;
+    schedule_ptr->zx_schedule_missed      = 0UL;
+    schedule_ptr->zx_schedule_running     = 1U;
+}
+
+
+/**************************************************************************/
+/*                                                                        */
+/*  FUNCTION                                               RELEASE        */
+/*                                                                        */
+/*    zx_schedule_deadline                                 PORTABLE C     */
+/*                                                                        */
+/*  DESCRIPTION                                                           */
+/*                                                                        */
+/*    The absolute physical count at which the current window ends.       */
+/*                                                                        */
+/*    epoch + (ticks already spent + this window's ticks) x counts.       */
+/*                                                                        */
+/*    THE MULTIPLICATION IS THE POINT.  Every boundary in the run is one  */
+/*    exact multiple of the tick away from one epoch, so the errors do    */
+/*    not compose: a switch that took ten thousand cycles moves nothing,  */
+/*    because the next boundary was already decided before it started.    */
+/*    The alternative -- add a window's counts to "now" inside the        */
+/*    handler -- is one instruction cheaper and makes the frame's length  */
+/*    the sum of every latency it has ever suffered.                      */
+/*                                                                        */
+/*    Zero when the schedule is not running, which is a deadline in the   */
+/*    past and therefore the conservative answer: a caller that armed a   */
+/*    timer with it would be interrupted at once rather than never.       */
+/*                                                                        */
+/**************************************************************************/
+
+uint64_t zx_schedule_deadline(const ZX_SCHEDULE *schedule_ptr)
+{
+    uint64_t ticks;
+
+    if (schedule_ptr == (const ZX_SCHEDULE *)0)
+    {
+        return 0U;
+    }
+
+    if (schedule_ptr->zx_schedule_running == 0U)
+    {
+        return 0U;
+    }
+
+    ticks = schedule_ptr->zx_schedule_ticks_spent
+            + (uint64_t)schedule_ptr->zx_schedule_windows
+                  [schedule_ptr->zx_schedule_current].zx_window_ticks;
+
+    return schedule_ptr->zx_schedule_epoch
+           + (ticks * schedule_ptr->zx_schedule_counts_per_tick);
+}
+
+
+/**************************************************************************/
+/*                                                                        */
+/*  FUNCTION                                               RELEASE        */
+/*                                                                        */
+/*    zx_schedule_current_partition                        PORTABLE C     */
+/*                                                                        */
+/*  DESCRIPTION                                                           */
+/*                                                                        */
+/*    Which partition owns the core, as a manifest index.                 */
+/*                                                                        */
+/*    ZX_MANIFEST_NO_INDEX rather than zero when there is no answer.      */
+/*    Zero is a valid partition, so a caller that received it for "the    */
+/*    schedule is not running" would enter partition zero -- which is a   */
+/*    real partition, in the middle of nothing, with its window already   */
+/*    spent.  The distinction is the same one the manifest fault record   */
+/*    makes and for the same reason.                                      */
+/*                                                                        */
+/**************************************************************************/
+
+UINT zx_schedule_current_partition(const ZX_SCHEDULE *schedule_ptr)
+{
+    if (schedule_ptr == (const ZX_SCHEDULE *)0)
+    {
+        return ZX_MANIFEST_NO_INDEX;
+    }
+
+    if (schedule_ptr->zx_schedule_running == 0U)
+    {
+        return ZX_MANIFEST_NO_INDEX;
+    }
+
+    return schedule_ptr->zx_schedule_windows
+               [schedule_ptr->zx_schedule_current].zx_window_partition;
+}
+
+
+/**************************************************************************/
+/*                                                                        */
+/*  FUNCTION                                               RELEASE        */
+/*                                                                        */
+/*    zx_schedule_advance                                  PORTABLE C     */
+/*                                                                        */
+/*  DESCRIPTION                                                           */
+/*                                                                        */
+/*    Move to the next window.  Called from the boundary handler only.    */
+/*                                                                        */
+/*    THE TICKS ARE SPENT BEFORE THE INDEX MOVES, and the order is not    */
+/*    cosmetic: the deadline for the NEXT window is                       */
+/*    epoch + (spent + next window's ticks) x counts, so a spend that     */
+/*    happened after the move would charge the outgoing window's time to  */
+/*    the incoming one and every boundary after it would be early by one  */
+/*    window.  The frame would still be the right length, every window    */
+/*    would be the wrong one, and a two-partition demonstration with      */
+/*    equal windows would look perfect.                                   */
+/*                                                                        */
+/*    THE FRAME LIMIT IS CHECKED AFTER THE WRAP, so a limit of one frame  */
+/*    means every window of frame zero runs and nothing of frame one      */
+/*    does.  A bounded run is what lets a regression assert on a total,   */
+/*    and "the harness timed out" is not a result.                        */
+/*                                                                        */
+/**************************************************************************/
+
+UINT zx_schedule_advance(ZX_SCHEDULE *schedule_ptr)
+{
+    if (schedule_ptr == (ZX_SCHEDULE *)0)
+    {
+        return ZX_MANIFEST_NO_INDEX;
+    }
+
+    if (schedule_ptr->zx_schedule_running == 0U)
+    {
+        return ZX_MANIFEST_NO_INDEX;
+    }
+
+    schedule_ptr->zx_schedule_ticks_spent +=
+        (uint64_t)schedule_ptr->zx_schedule_windows
+            [schedule_ptr->zx_schedule_current].zx_window_ticks;
+
+    schedule_ptr->zx_schedule_current++;
+
+    if (schedule_ptr->zx_schedule_current
+            >= schedule_ptr->zx_schedule_window_count)
+    {
+        schedule_ptr->zx_schedule_current = 0U;
+        schedule_ptr->zx_schedule_frames++;
+
+        if ((schedule_ptr->zx_schedule_frame_limit != 0UL)
+            && (schedule_ptr->zx_schedule_frames
+                    >= schedule_ptr->zx_schedule_frame_limit))
+        {
+            schedule_ptr->zx_schedule_running = 0U;
+
+            return ZX_MANIFEST_NO_INDEX;
+        }
+    }
+
+    return schedule_ptr->zx_schedule_windows
+               [schedule_ptr->zx_schedule_current].zx_window_partition;
+}
+
+
+/**************************************************************************/
+/*                                                                        */
+/*  FUNCTION                                               RELEASE        */
+/*                                                                        */
+/*    zx_schedule_note_missed                              PORTABLE C     */
+/*                                                                        */
+/*  DESCRIPTION                                                           */
+/*                                                                        */
+/*    Records a boundary that had already gone by when it was computed.   */
+/*                                                                        */
+/*    WHAT A MISS MEANS.  The window was too short to contain its own     */
+/*    partition switch, so the comparator was armed with a count already  */
+/*    in the past and the interrupt is pending again the instant the      */
+/*    hypervisor allows it.  The schedule does not break: it keeps        */
+/*    turning, in the right order, with the right proportions, and every  */
+/*    frame takes longer than it was declared to.                         */
+/*                                                                        */
+/*    THAT IS WHY IT IS COUNTED.  A missed deadline is the only failure   */
+/*    this arithmetic can have that produces no wrong answer anywhere --  */
+/*    a run full of them looks exactly like a working demonstrator, only  */
+/*    slower, and nobody times a demonstrator.  A number a test asserts   */
+/*    is zero is what makes it visible.                                   */
+/*                                                                        */
+/*    The CALLER decides that a miss happened, because deciding needs a   */
+/*    counter reading and this file has no hardware.  That division also  */
+/*    keeps the reading honest: on the S32Z280 a CNTPCT read costs about  */
+/*    93 counts of real time, so a check that took its own extra reading  */
+/*    would be partly measuring itself.                                   */
+/*                                                                        */
+/**************************************************************************/
+
+void zx_schedule_note_missed(ZX_SCHEDULE *schedule_ptr)
+{
+    if (schedule_ptr == (ZX_SCHEDULE *)0)
+    {
+        return;
+    }
+
+    schedule_ptr->zx_schedule_missed++;
+}
+
+
+UINT zx_schedule_is_running(const ZX_SCHEDULE *schedule_ptr)
+{
+    if (schedule_ptr == (const ZX_SCHEDULE *)0)
+    {
+        return 0U;
+    }
+
+    return schedule_ptr->zx_schedule_running;
+}
+
+
+/**************************************************************************/
+/*                                                                        */
+/*  FUNCTION                                               RELEASE        */
+/*                                                                        */
+/*    zx_schedule_report                                   PORTABLE C     */
+/*                                                                        */
+/*  DESCRIPTION                                                           */
+/*                                                                        */
+/*    Prints the major frame once, at boot.                               */
+/*                                                                        */
+/*    Every temporal claim this suite makes is a claim about a RATIO --   */
+/*    "a partition given half the frame sees half the ticks" -- and a     */
+/*    reader cannot check a ratio against a schedule they cannot see.     */
+/*    So each window is printed in ticks AND in counter counts, because   */
+/*    the two targets' counters differ by a factor of twelve and a count  */
+/*    quoted without its board means nothing.                             */
+/*                                                                        */
+/*    The counts are printed as a 32-bit value.  A window long enough to  */
+/*    overflow that at either target's frequency would be nine minutes,   */
+/*    which is not a window, and the alternative is a 64-bit decimal       */
+/*    printer this console does not have and would not otherwise need.    */
+/*                                                                        */
+/**************************************************************************/
+
+void zx_schedule_report(const ZX_SCHEDULE *schedule_ptr,
+                        const ZX_MANIFEST *manifest_ptr)
+{
+    UINT index;
+
+    if ((schedule_ptr == (const ZX_SCHEDULE *)0)
+        || (manifest_ptr == (const ZX_MANIFEST *)0))
+    {
+        return;
+    }
+
+    zx_console_puts("  major frame: ");
+    zx_console_putdec(schedule_ptr->zx_schedule_frame_ticks);
+    zx_console_puts(" ticks, ");
+    zx_console_putdec(schedule_ptr->zx_schedule_window_count);
+    zx_console_puts(" windows, tick = ");
+    zx_console_putdec((uint32_t)schedule_ptr->zx_schedule_counts_per_tick);
+    zx_console_puts(" counter counts\n");
+
+    for (index = 0U; index < schedule_ptr->zx_schedule_window_count; index++)
+    {
+        UINT partition =
+            schedule_ptr->zx_schedule_windows[index].zx_window_partition;
+
+        zx_console_puts("    window ");
+        zx_console_putdec(index);
+        zx_console_puts(": ");
+
+        if ((partition < manifest_ptr->zx_manifest_partition_count)
+            && (manifest_ptr->zx_manifest_partitions[partition]
+                    .zx_partition_name != (const CHAR *)0))
+        {
+            zx_console_puts(manifest_ptr->zx_manifest_partitions[partition]
+                                .zx_partition_name);
+        }
+        else
+        {
+            zx_console_puts("(unnamed)");
+        }
+
+        zx_console_puts(", ");
+        zx_console_putdec(
+            schedule_ptr->zx_schedule_windows[index].zx_window_ticks);
+        zx_console_puts(" ticks = ");
+        zx_console_putdec((uint32_t)(
+            (uint64_t)schedule_ptr->zx_schedule_windows[index].zx_window_ticks
+            * schedule_ptr->zx_schedule_counts_per_tick));
+        zx_console_puts(" counts\n");
+    }
+
+    if (schedule_ptr->zx_schedule_frame_limit == 0UL)
+    {
+        zx_console_puts("    the frame WRAPS for ever; nothing stops it\n");
+    }
+    else
+    {
+        zx_console_puts("    stopping after ");
+        zx_console_putdec(schedule_ptr->zx_schedule_frame_limit);
+        zx_console_puts(" frames, so a test can assert on a total rather\n"
+                        "      than on a run the harness had to kill\n");
+    }
+}

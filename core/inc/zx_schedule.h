@@ -22,8 +22,8 @@
 /*  DESCRIPTION                                                           */
 /*                                                                        */
 /*    Time partitioning: the fixed, cyclic window schedule that decides   */
-/*    which partition owns the core, and the hypervisor-timer tick that   */
-/*    ends each window.                                                   */
+/*    which partition owns the core, and where the boundary that ends     */
+/*    each window falls on the physical counter.                          */
 /*                                                                        */
 /*    Guests read time through the VIRTUAL timer, with a per-partition    */
 /*    CNTVOFF, so that a descheduled partition's clock is frozen rather   */
@@ -32,10 +32,57 @@
 /*    timer is simpler and undermines the determinism claim, which is the */
 /*    point of the demonstrator.                                          */
 /*                                                                        */
-/*  STATUS                                                                */
+/*  WHERE THE SPLIT IS                                                    */
 /*                                                                        */
-/*    Declared empty.  The second partition brings with it the first      */
-/*    schedule worth the name; one partition needs no scheduler.          */
+/*    This header DECIDES; it does not touch the machine.  Everything     */
+/*    here is arithmetic over a manifest and a counter reading: which     */
+/*    window is current, which one is next, and what absolute count the   */
+/*    current one ends at.  Nothing here reads a timer, writes a          */
+/*    comparator or switches a region set.  The caller -- which does have */
+/*    hardware -- reads the counter, programmes CNTHP_CVAL from the       */
+/*    deadline this file computes, and performs the switch.               */
+/*                                                                        */
+/*    That is the same split zx_mm.h and zx_partition.h make, for the     */
+/*    same reason, and it matters more here than in either of them: the   */
+/*    property this component exists to guarantee is that a frame does    */
+/*    not DRIFT, and drift is a property of arithmetic over many          */
+/*    iterations.  A workstation can run ten thousand frames of it in     */
+/*    a millisecond; a board cannot.                                      */
+/*                                                                        */
+/*  THE ONE PROPERTY EVERYTHING HERE EXISTS FOR                           */
+/*                                                                        */
+/*    EVERY BOUNDARY IS AN ABSOLUTE COUNT MEASURED FROM ONE EPOCH, never  */
+/*    a countdown re-armed at each tick.                                  */
+/*                                                                        */
+/*    Re-arming a relative interval inside the handler adds the           */
+/*    handler's own latency to every window, so a frame that is supposed  */
+/*    to be 10 ms becomes 10 ms plus however long the switch took --      */
+/*    every time, cumulatively.  The schedule still looks fixed, the      */
+/*    windows are still in the right proportion, and the frame slowly     */
+/*    stops being the length it was declared to be.  It is the single     */
+/*    most common way a "deterministic" frame stops being one, and it is  */
+/*    invisible in any run short enough to read.                          */
+/*                                                                        */
+/*    So the boundary is epoch + (ticks so far) x (counts per tick), and  */
+/*    the switch's own cost comes out of the window it happens in rather  */
+/*    than being added to the frame.  A window too short to hold its own  */
+/*    switch is then a MISSED DEADLINE, which is a reportable condition   */
+/*    rather than a schedule that silently slows down.                    */
+/*                                                                        */
+/*  PHASE 0 IS STATIC, AND THE OMISSIONS ARE DELIBERATE                   */
+/*                                                                        */
+/*    One window per partition, in manifest order, round robin, with      */
+/*    lengths fixed at build time.  No priorities, no admission control,  */
+/*    no yielding into another partition's window, no idle detection.     */
+/*                                                                        */
+/*    An idle partition BURNS its window, and that is not a limitation    */
+/*    to be fixed later -- it is what a static frame means.  Trapping     */
+/*    WFI (HCR.TWI) so that a blocked guest hands its remaining time to   */
+/*    the next partition would raise throughput and would make a          */
+/*    partition's start time depend on its neighbour's behaviour, which   */
+/*    is precisely the coupling temporal partitioning is bought to        */
+/*    remove.  It is a later-phase option and it is declined here on      */
+/*    purpose.                                                            */
 /*                                                                        */
 /**************************************************************************/
 
@@ -43,10 +90,193 @@
 #define ZX_SCHEDULE_H
 
 #include "zx_api.h"
+#include "zx_manifest.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/**************************************************************************/
+/*                              One window                                */
+/**************************************************************************/
+
+/* A slot in the major frame: which partition owns it and for how long.
+ *
+ * A SEPARATE ARRAY FROM THE PARTITION LIST, even though Phase 0 gives every
+ * partition exactly one window and could therefore index the manifest
+ * directly.  The two are different things and they stop being the same
+ * length the first time a partition needs two slots in a frame -- a
+ * high-rate partition interleaved with a slow one is the ordinary shape of
+ * a real major frame, and it is a change to the BUILDER below rather than
+ * to anything that consumes a schedule.  Collapsing them now would put that
+ * change in the switch path instead.  */
+
+typedef struct zx_schedule_window_struct
+{
+    UINT    zx_window_partition;    /* index into the manifest             */
+    ULONG   zx_window_ticks;        /* how long the slot lasts             */
+} ZX_SCHEDULE_WINDOW;
+
+/**************************************************************************/
+/*                             The schedule                               */
+/**************************************************************************/
+
+/* The whole time-partitioning state, in one object.
+ *
+ * ONE STRUCTURE AND NO STATIC STATE, so that the host suite can run a
+ * schedule for as many frames as it likes without a fixture, and so that
+ * two schedules could exist at once if a later phase ever needs to validate
+ * one while another runs.
+ *
+ * The counter fields are 64-bit because the physical counter is.  At the
+ * S32Z280's 8 MHz a 32-bit count wraps in nine minutes, and a demonstrator
+ * whose determinism claim expires after nine minutes is not one anybody
+ * should quote.  */
+
+typedef struct zx_schedule_struct
+{
+    ZX_SCHEDULE_WINDOW  zx_schedule_windows[ZX_MAX_PARTITIONS];
+    UINT                zx_schedule_window_count;
+
+    /* The major frame, as declared and as it will be spent.  */
+    ULONG               zx_schedule_frame_ticks;
+
+    /* How many counter counts one scheduling tick is.  A BOARD fact -- the
+       counter runs at 100 MHz on the model and 8 MHz on the S32Z280 -- so
+       it is passed in rather than assumed, and the schedule is expressed in
+       ticks so that one manifest describes both targets.  */
+    uint64_t            zx_schedule_counts_per_tick;
+
+    /* WHERE THE FRAME STARTED, on the physical counter, once and for all.
+       Every boundary in the whole run is computed from this one reading, so
+       there is nothing for a per-tick error to accumulate into.  */
+    uint64_t            zx_schedule_epoch;
+
+    /* Ticks consumed since the epoch, across all frames.  The other half of
+       the absolute-deadline arithmetic, and the reason it is a tick count
+       rather than a count of counter counts: ticks are exact integers and
+       counts are the product of one multiplication, so the rounding
+       happens once per boundary instead of accumulating.  */
+    uint64_t            zx_schedule_ticks_spent;
+
+    UINT                zx_schedule_current;    /* which window is running */
+    ULONG               zx_schedule_frames;     /* completed major frames  */
+
+    /* Stop after this many frames, or run for ever when zero.
+       A bounded run is what a ctest can assert on: "it was still going
+       when the harness timed out" is not a result.  See open question 3 of
+       the step this component was written for -- wrap, but be able to
+       stop.  */
+    ULONG               zx_schedule_frame_limit;
+
+    /* MISSED DEADLINES: boundaries that had already passed by the time they
+       were computed, which means a window was too short to contain its own
+       partition switch.
+     *
+       Counted rather than ignored and counted rather than fatal.  A missed
+       deadline is the one failure mode this arithmetic can have that does
+       not show up as a wrong answer: the schedule keeps running, the
+       partitions keep taking turns, and the frame is simply longer than it
+       was declared to be.  A number a test can assert is zero is the only
+       way that becomes visible.  */
+    ULONG               zx_schedule_missed;
+
+    /* Zero once the frame limit has been reached, so that "the schedule is
+       finished" is a state a caller reads rather than a condition it
+       recomputes.  */
+    UINT                zx_schedule_running;
+} ZX_SCHEDULE;
+
+/**************************************************************************/
+/*                              The builder                               */
+/**************************************************************************/
+
+/* Turn a manifest into a round-robin major frame.
+ *
+ * Pure: no hardware, no static state, no allocation, same inputs always the
+ * same answer.  Returns ZX_MANIFEST_SUCCESS or one of the ZX_MANIFEST_*
+ * codes -- one vocabulary rather than two, so a boot message means the same
+ * thing wherever it came from.
+ *
+ * counts_per_tick is what one scheduling tick costs on THIS board's
+ * counter.  Zero is refused rather than accepted as "instant": a schedule
+ * whose every boundary is the epoch would fire its timer continuously and
+ * present as a hang inside the hypervisor, which is the least diagnosable
+ * outcome available here.
+ *
+ * frame_limit of zero means run for ever, which is what a demonstration
+ * wants and what a regression must not have.  */
+
+ZX_NODISCARD UINT zx_schedule_build(const ZX_MANIFEST *manifest_ptr,
+                                    uint64_t counts_per_tick,
+                                    ULONG frame_limit,
+                                    ZX_SCHEDULE *schedule_ptr);
+
+/**************************************************************************/
+/*                          Running the frame                             */
+/**************************************************************************/
+
+/* Start the frame at a counter reading the caller has just taken.  Every
+   boundary for the rest of the run is measured from it.  */
+
+void zx_schedule_start(ZX_SCHEDULE *schedule_ptr, uint64_t now);
+
+/* THE ABSOLUTE COUNT AT WHICH THE CURRENT WINDOW ENDS.
+ *
+ * This is the value that goes into CNTHP_CVAL, and it is a comparison
+ * against the physical counter rather than a countdown, which is what makes
+ * the frame immune to the handler's own latency.  One multiply and one add,
+ * no loop, no branch on guest state.  */
+
+ZX_NODISCARD uint64_t zx_schedule_deadline(const ZX_SCHEDULE *schedule_ptr);
+
+/* Which partition owns the core right now, as an index into the manifest.
+   ZX_MANIFEST_NO_INDEX when the schedule is not running or was never
+   built -- an answer a caller must check, because the alternative is
+   entering partition zero by accident.  */
+
+ZX_NODISCARD UINT zx_schedule_current_partition(
+    const ZX_SCHEDULE *schedule_ptr);
+
+/* Move to the next window.  Called from the boundary handler and from
+   nowhere else.
+ *
+ * BRANCH-POOR AND LOOP-FREE ON PURPOSE.  This runs inside the partition
+ * switch, so its cost is part of the number a safety customer asks for:
+ * three adds, one comparison to wrap the window index, and one more to
+ * decide whether the frame limit has been reached.  Nothing here depends on
+ * anything a guest did.
+ *
+ * Returns the partition index now current, or ZX_MANIFEST_NO_INDEX when the
+ * schedule has just finished -- which is the signal to leave EL1 alone and
+ * return to the hypervisor rather than entering anything.  */
+
+ZX_NODISCARD UINT zx_schedule_advance(ZX_SCHEDULE *schedule_ptr);
+
+/* Record that the boundary just computed had already gone by.  Separate
+   from advance because it is the CALLER that knows what the counter reads:
+   this file does not read hardware, and a deadline check that took its own
+   counter reading would be measuring the cost of measuring.  See the note
+   in docs/armv8r-el2-reference.md on what a CNTPCT read costs.  */
+
+void zx_schedule_note_missed(ZX_SCHEDULE *schedule_ptr);
+
+ZX_NODISCARD UINT zx_schedule_is_running(const ZX_SCHEDULE *schedule_ptr);
+
+/**************************************************************************/
+/*                              Reporting                                 */
+/**************************************************************************/
+
+/* Print the frame once, at boot: which partition owns which slot, how long
+   each is in ticks and in counter counts, and what the whole frame costs.
+ *
+ * Worth its space for the same reason zx_mm_report is.  Every later claim
+ * in the run -- "the guest saw half as many ticks as it would standalone"
+ * -- is a claim about a ratio, and a reader cannot check a ratio against a
+ * schedule they cannot see.  */
+
+void zx_schedule_report(const ZX_SCHEDULE *schedule_ptr,
+                        const ZX_MANIFEST *manifest_ptr);
 
 #ifdef __cplusplus
 }

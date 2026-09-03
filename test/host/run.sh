@@ -104,14 +104,27 @@ case "${command}" in
         #
         # So the floor covers the files where a real number is defensible:
         # the manifest validator, the region-layout planner, the partition
-        # loader and the guest console.  All four are pure functions with no
-        # hardware in them, all four are reachable in full from a
-        # workstation, and none has an excuse for an unreached line.  100%
-        # is not aspirational -- it is what they measure, on lines and on
-        # branches both.  A rule added without a case that fails it drops
-        # this and fails the build, which is the entire point: a validator
-        # rule nothing has ever seen reject anything is not a rule, it is a
-        # comment.
+        # loader, the guest console and the time-partition schedule.  All
+        # five are pure functions with no hardware in them, all five are
+        # reachable in full from a workstation, and none has an excuse for an
+        # unreached line.  100% is not aspirational -- it is what they
+        # measure, on lines and on branches both.  A rule added without a
+        # case that fails it drops this and fails the build, which is the
+        # entire point: a validator rule nothing has ever seen reject
+        # anything is not a rule, it is a comment.
+        #
+        # THE SCHEDULE JOINED THIS LIST DELIBERATELY, and the decision was
+        # worth making rather than defaulting either way.  What it computes
+        # is where each window boundary falls, and its one interesting
+        # failure -- DRIFT -- is invisible in any run short enough to read:
+        # a frame that accumulated the handler's own latency would keep
+        # every partition in order and in proportion and slowly stop being
+        # the length it was declared to be.  Catching that needs ten
+        # thousand frames, which is a millisecond here and two minutes on
+        # the S32Z280.  It is also the file whose arithmetic is 64-bit
+        # against a counter that has been running since reset, and an epoch
+        # near the 32-bit boundary is a fixture on a workstation and nine
+        # minutes of waiting on a bench.
         #
         # The guest console is on this list for a reason worth stating: its
         # whole output is TEXT that somebody reads at three in the morning
@@ -135,6 +148,7 @@ case "${command}" in
               --filter "${ROOT}/core/src/zx_manifest_verify.c" \
               --filter "${ROOT}/core/src/zx_mm_setup.c" \
               --filter "${ROOT}/core/src/zx_partition_manager.c" \
+              --filter "${ROOT}/core/src/zx_schedule.c" \
               --txt - \
               --fail-under-line 100 \
               --fail-under-branch 100
