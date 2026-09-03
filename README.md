@@ -22,32 +22,100 @@ It runs at EL2 on Armv8-R, gives each partition a statically declared slice of
 memory and of time, and treats a partition stepping outside either as a fault to
 be reported rather than a condition to be recovered from.
 
-## Status: Phase 0, under construction
+## Status: Phase 0, under construction — a demonstrator that now time-partitions
 
-**There is no complete hypervisor in this repository yet — but stage 2 is
-alive.** ZoneX now boots at EL2 on both targets, programs stage-2 MPU regions,
-drops to EL1, and takes, decodes and reports a stage-2 access violation by
-name. There is no ThreadX guest, no partition manifest and no scheduler yet;
-each of those assumes what the current image exists to establish.
+**This is not production software and is not close to it.** It is a
+demonstrator, built to establish that a small set of mechanisms work on real
+Armv8-R silicon and to measure what they cost. Read the numbers below as a
+first measurement on one bench, not as characterisation.
 
-`examples/` holds the stage-2 probe: one EL2 program, one trivial EL1 payload
-and one deliberate fault. Run it with `scripts/test_fvp.sh` on the Armv8-R AEM
-FVP, or `examples/s32z280_evb/tools/run_zx_probe.sh` on the board.
+**What it does today.** Two ThreadX kernels run at EL1, each confined to its
+own stage-2 window, time-sharing one logical core under a static major frame
+taken from a manifest — on the Armv8-R AEM FVP and on the S32Z280-594EVB.
+Partition A holds seven ticks of every ten and partition B three, and each
+partition's clock advances by its own windows and by nothing else.
 
-The suite includes builds that must **fail**, registered as such: one whose
-deliberate violation is aimed at an address the payload *is* granted, and one
-told it needs more MPU regions than exist. A check that has never been seen to
-fail is not evidence that it can.
+Three results, and these are mechanisms rather than measurements — they do not
+move when the numbers below do:
 
-Along the way it settled four things about this architecture that the
-Cortex-R52 TRM describes ambiguously or contradicts itself about, on both a
-model and real silicon. The two most consequential:
+* **A partition cannot reach its neighbour's memory**, even after granting
+  itself that memory in its own EL1 MPU. Stage 2 refuses, the offender is
+  stopped, and the other partition runs to the end of the frame with its
+  schedule untouched. Being attacked costs the neighbour nothing.
+* **A window ends whether the partition agrees or not.** The hypervisor's
+  timer sits in GIC Group 0, so it arrives as an FIQ at EL2, and with
+  `HCR.FMO` set `PSTATE.F` is ignored at EL0 and EL1. One build proves it by
+  trying: a partition that masks IRQ and FIQ and spins for ever is preempted
+  exactly on schedule, and all its masking costs it is its own kernel's tick.
+* **Each partition's clock is its own**, and advances in its own windows and
+  in nobody else's.
+
+Measured on the board over twenty frames and thirty-nine window boundaries,
+with no missed deadline:
+
+| | counts on the core | its own ticks |
+|---|---|---|
+| partition A | 11,164,192 | 139 |
+| partition B | 4,818,043 | 51 |
+
+A × 3 = 33,492,576 against B × 7 = 33,726,301 — within 0.7% of exact. A
+partition able to see wall clock would be out by a factor of three, not by a
+percentage. This one is a ratio of two readings of the system counter, whose
+frequency was established three independent ways, so it does not depend on the
+core clock, the caches or the optimisation level.
+
+**And one measurement, which will change.** A partition switch costs
+**5,672 / 5,715 / 5,862 cycles** min / mean / max on the S32Z280, and the
+guest's own EL1 MPU is 85% of it — on both a 32-region model and a 20-region
+part. A switch is not expensive because the hypervisor does much; its
+per-partition state is three register writes. It is expensive because a guest
+has a lot of registers.
+
+Expect that figure to move, and to move for reasons already known. The EL2
+caches are off and the image is built `-Og`, which makes it an over-estimate.
+But **ZoneX configures no clock tree yet**, so the core runs on this part's
+power-up RC oscillator — 48 MHz, measured against the counter, and the
+reference manual names it the default clock for the whole system at power-up.
+At that clock the memory a switch touches is cheap in *core cycles*; raise the
+core clock without raising the memory's and the same code costs more, not
+fewer. **Configuring the clock tree is a later phase, and the number is
+expected to change when it lands.** It is published now because a measurement
+with its conditions stated is worth more than no measurement, and because the
+next one will have something to be compared against.
+
+The image prints those conditions, the measured clock and a nanosecond
+conversion above its own figures on every run, along with the two things
+excluded from them: the guest console, because closing a partial line is a
+polled-UART write and a product switch has no console in it, and boundaries
+that had to wait out a stopped partition's window, because a switch plus a
+wait is neither.
+
+`examples/` holds four experiments, each a separate image: the stage-2 probe,
+one ThreadX guest confined by stage 2, one preempted by a timer of its own,
+and two under a frame. Run them with `scripts/test_fvp.sh` on the model, or
+`examples/s32z280_evb/tools/run_zx_probe.sh` on the board.
+
+**The suite includes builds that must fail, registered as such**, because a
+check that has never been seen to fail is not evidence that it can: a
+violation aimed at an address the payload *is* granted, an image told it needs
+more MPU regions than exist, a manifest whose two windows overlap, and a
+hypervisor whose own tick cannot be delivered.
+
+Along the way it settled several things about this architecture that the
+Cortex-R52 TRM describes ambiguously, contradicts itself about, or states
+somewhere nobody looks — on both a model and real silicon. The three most
+consequential:
 
 * **`HPRENR` really is wider than 16 bits**, and a bit above 15 really does
   disable its region — proven functionally, not by reading the register back.
 * **`HPFAR` does not mean the same thing on the two targets.** The TRM
   describes it two ways in one section, and the FVP and the S32Z280 each
   implement a different one. ZoneX uses `HDFAR`.
+* **Setting `HCR.FMO` moves a guest's `ICC_PMR` write to the virtual CPU
+  interface.** Every guest unmasks its own interrupts at start-up; from that
+  moment the write changes nothing about physical delivery, while the physical
+  priority mask — which resets to zero — is left closed. A partition that was
+  receiving its timer stops receiving anything, with no fault and no message.
 
 `docs/armv8r-el2-reference.md` carries all of it, with the measured values.
 
