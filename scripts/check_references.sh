@@ -35,6 +35,27 @@
 #      Development-environment instructions are not project documentation, and
 #      a committed one starts being treated as though it were.
 #
+#   4. A ROADMAP OR PLAN IDENTIFIER.  Planning documents live outside every
+#      repository, so a comment citing one by its identifier points a reader
+#      at something they cannot obtain and never will.  The FACT such a
+#      comment carries is almost always worth keeping and is almost always
+#      citable another way: the measurements those documents record were
+#      taken during a named piece of work on a named board, so "measured on
+#      the S32Z280 during the Cortex-R52 Modules port work" carries
+#      everything the identifier did and survives the reader.
+#
+#      Worth its line because two went in while the partition switch was
+#      being written, in CODE COMMENTS rather than in documents, which is
+#      where nobody thinks to look for them.
+#
+#      THE PATTERN BELOW SPELLS THE SHAPES IT REJECTS, because a denylist has
+#      to.  That is the same bargain scripts/check_terminology.sh makes and
+#      states: it is the single place those spellings appear, so that the
+#      list cannot drift away from what is actually enforced.  A shape in a
+#      denylist is not a citation -- it points at nothing and carries no
+#      content -- but it is the one place in this repository where the shapes
+#      appear at all, and that is deliberate rather than accidental.
+#
 # Deliberately narrow.  It catches the shapes that have actually gone wrong
 # rather than trying to be a general secret scanner, because a check that
 # cries wolf gets bypassed and then catches nothing at all.
@@ -55,23 +76,43 @@ readonly FORBIDDEN_FILES='^(AGENTS|CLAUDE)\.md$|/(AGENTS|CLAUDE)\.md$'
 # "~/" only when it opens a path, so that prose using a tilde is not caught.
 # "step <n>" case-insensitively, because "Step 5" reads as naturally as
 # "step 5" and both are the same mistake.
+# The plan identifiers are matched with word boundaries and a digit, so that
+# ordinary prose is not caught, and case-SENSITIVELY so that lower-case text
+# cannot trip them.  That is why they are a separate pattern below rather
+# than folded into the case-insensitive one above.
 readonly PATTERN='(^|[^A-Za-z0-9_.-])(/home/[A-Za-z0-9._-]+|~/[A-Za-z0-9._-])|\bstep[ -][0-9]+\b'
 
 status=0
 
 # This script is excluded by name: it has to spell the patterns to look for
 # them.  Tracked files only -- a build tree is not this repository's content.
+# The plan identifiers are checked case-SENSITIVELY and separately, because
+# folding them into the pattern above would make "ar2" in ordinary prose an
+# error.  The document names are capitalised and the code never is.
+readonly PLAN_PATTERN='\b(AR[0-9]+|A[0-9]+-step[0-9]+)\b'
+
 findings="$(git ls-files -z \
     | grep -zZv '^scripts/check_references\.sh$' \
     | xargs -0 grep -nEiI "${PATTERN}" 2>/dev/null \
     | grep -v "${MARKER}" || true)"
 
+plan_findings="$(git ls-files -z \
+    | grep -zZv '^scripts/check_references\.sh$' \
+    | xargs -0 grep -nEI "${PLAN_PATTERN}" 2>/dev/null \
+    | grep -v "${MARKER}" || true)"
+
+if [ -n "${plan_findings}" ]; then
+    findings="${findings}${findings:+$'\n'}${plan_findings}"
+fi
+
 if [ -n "${findings}" ]; then
     echo "ZoneX reference check FAILED." >&2
     echo "" >&2
-    echo "These lines name a local path, or a numbered step of a document" >&2
-    echo "that is not in this repository. Keep the fact and drop the" >&2
-    echo "citation: a reader cannot follow either one." >&2
+    echo "These lines name a local path, a numbered step, or a roadmap" >&2
+    echo "identifier from a document that is not in this repository. Keep" >&2
+    echo "the fact and drop the citation: a reader cannot follow any of" >&2
+    echo "them, and the measurements those documents record ARE citable --" >&2
+    echo "by the work and the board they were taken on." >&2
     echo "" >&2
     echo "${findings}" >&2
     status=1

@@ -63,10 +63,9 @@
 @   one fixed depth however many boundaries a run takes.  A switch whose
 @   stack grew per boundary would survive a demonstration and not a
 @   deployment.  The one path that does push -- the capture from the trap
-@   vector -- balances it explicitly, for the reason AR2 invariant 17 was
-@   written: an unbalanced handler leaked bytes of a 1 KB stack per fault
-@   during the Cortex-R52 Modules port work and presented as nothing at all
-@   until the run got long.
+@   vector -- balances it explicitly.  An unbalanced handler leaked bytes of
+@   a 1 KB stack per fault during the Cortex-R52 Modules port work and
+@   presented as nothing at all until the run got long.
 @
 @ NOTE ON SYNTAX
 @

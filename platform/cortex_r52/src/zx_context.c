@@ -536,13 +536,13 @@ void zx_context_restore_mpu(const ZX_GUEST_CONTEXT *context_ptr)
 /*    that stops being harmless when somebody adds one.                    */
 /*                                                                        */
 /*    ONE BARRIER PAIR, AT THE END, NOT ONE PER REGION.  The barriers      */
-/*    dominate: AR2 measured 434-470 cycles for a region written directly  */
-/*    at EL1 with its own barriers, and most of that was the closing       */
-/*    DSB/ISB rather than the write.  Forty region writes with forty       */
-/*    barrier pairs would be forty times a cost that only has to be paid   */
-/*    once, because nothing between the first write and the ERET depends   */
-/*    on the new permissions.  The ISB before the ERET is what makes them  */
-/*    take effect, and there is exactly one.                              */
+/*    dominate: the Cortex-R52 Modules port work measured 434-470 cycles   */
+/*    for a region written directly at EL1 with its own barriers, and most */
+/*    of that was the closing DSB/ISB rather than the write.  Forty region */
+/*    writes with forty barrier pairs would be forty times a cost that     */
+/*    only has to be paid once, because nothing between the first write    */
+/*    and the ERET depends on the new permissions.  The ISB before the     */
+/*    ERET is what makes them take effect, and there is exactly one.       */
 /*                                                                        */
 /*    The PRSELR write inside the loop is different and does need its ISB: */
 /*    the very next instruction reads PRBAR THROUGH it, so the selection   */
