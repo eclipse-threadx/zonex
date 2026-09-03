@@ -233,6 +233,18 @@ void zx_guest_hand_over(const ZX_GUEST_LAUNCH *launch_ptr,
     zx_guest_mailbox_write(launch_ptr, ZX_GD_SPIN_B, 0U);
     zx_guest_mailbox_write(launch_ptr, ZX_GD_WAKES, 0U);
 
+    /* And what a guest that keeps running after its verdict reports: its
+       own liveness counter, and the two clocks it is the only party able to
+       read.  Zeroed for the same reason as everything above, and it matters
+       most here: "this partition's clock did not move" and "this partition
+       never wrote its clock" are different findings, and a stale value from
+       a previous excursion would make the first look like the second.  */
+
+    zx_guest_mailbox_write(launch_ptr, ZX_GD_LIVE, 0U);
+    zx_guest_mailbox_write(launch_ptr, ZX_GD_VCT_START, 0U);
+    zx_guest_mailbox_write(launch_ptr, ZX_GD_VCT_NOW, 0U);
+    zx_guest_mailbox_write(launch_ptr, ZX_GD_TICKS_NOW, 0U);
+
     __asm__ volatile("dsb" ::: "memory");
 }
 

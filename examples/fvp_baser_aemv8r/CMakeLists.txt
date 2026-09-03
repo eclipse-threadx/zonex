@@ -157,7 +157,7 @@ target_compile_definitions(zx_probe_badattr.elf PRIVATE ZX_PROBE_BAD_ATTR)
 ###############################################################################
 #
 # THE GUEST IS BUILT BY A SEPARATE CMAKE INVOCATION, as an ExternalProject.
-# Not an add_subdirectory, and the reasons are in guest_a/CMakeLists.txt --
+# Not an add_subdirectory, and the reasons are in guest/CMakeLists.txt --
 # briefly: the guest is ThreadX and stays C99 with ThreadX's own settings
 # while ZoneX is C17 with -Wpedantic, the guest is configured with THREADX's
 # toolchain file so that it is built the way ThreadX's own CI builds it, and a
@@ -171,8 +171,81 @@ target_compile_definitions(zx_probe_badattr.elf PRIVATE ZX_PROBE_BAD_ATTR)
 if(ZX_THREADX_SOURCE_DIR)
     include(ExternalProject)
 
+    # THE PARTITION WINDOWS, AND THE ONE PLACE THEY ARE WRITTEN DOWN.
+    #
+    # These four numbers are the contract between the hypervisor's linker
+    # scripts, its manifest, and the address each guest is LINKED for.  They
+    # were three separate copies of the same constants until a second
+    # partition made the cost of that obvious; now the guest builds are
+    # configured from here and the hypervisor's scripts assert against what
+    # they produce.
+    #
+    # Partition A's window is deliberately UNCHANGED from the one-partition
+    # image's -- same base, same size -- so that the guest running in it is
+    # byte for byte the guest those images already run.  A second partition
+    # was supposed to cost one more window and one more blob, and keeping A
+    # fixed is what makes that literally true.
+    #
+    # PARTITION B'S BASE IS NOT ROUND, and the reason is the ungranted
+    # granule between the two windows.  Sixty-four bytes that belong to
+    # nobody sit immediately after A and immediately before B, so a region
+    # limit that is one granule too generous at EITHER end is caught by an
+    # access that should fault.  An ungranted address far from every grant
+    # proves only that unmapped memory faults; adjacency is what makes it a
+    # boundary test.
+    set(ZX_PART_A_BASE 0x02000000)
+    set(ZX_PART_A_SIZE 0x00040000)
+    set(ZX_PART_B_BASE 0x02040040)
+    set(ZX_PART_B_SIZE 0x00040000)
+
+    # ONE GUEST PROJECT, CONFIGURED ONCE PER PARTITION.  The sub-project
+    # takes its window and its name as arguments and generates its own linker
+    # script from a template; see guest/CMakeLists.txt for why that is a
+    # parameter rather than a second copy of the file.
+    function(zx_add_guest_project guest_name window_base window_size)
+        ExternalProject_Add(zx_${guest_name}
+            SOURCE_DIR      ${ZX_FVP_DIR}/guest
+            BINARY_DIR      ${CMAKE_CURRENT_BINARY_DIR}/${guest_name}
+            CMAKE_GENERATOR ${CMAKE_GENERATOR}
+            CMAKE_ARGS
+                -DCMAKE_TOOLCHAIN_FILE=${ZX_GUEST_TOOLCHAIN}
+                -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
+                -DZX_THREADX_SOURCE_DIR=${ZX_THREADX_SOURCE_DIR}
+                -DZX_GUEST_COMMON_DIR=${ZX_COMMON_DIR}
+                -DZX_GUEST_NAME=${guest_name}
+                -DZX_GUEST_WINDOW_BASE=${window_base}
+                -DZX_GUEST_WINDOW_SIZE=${window_size}
+                # ZoneX's own warning module, so that ZoneX's guest support
+                # faces ZoneX's warning set inside a ThreadX build.  The
+                # sub-project applies it to ZoneX's three files and to nothing
+                # else; see guest/CMakeLists.txt for why that distinction is
+                # load-bearing.
+                -DZX_CMAKE_DIR=${CMAKE_SOURCE_DIR}/cmake
+                # And whether those warnings are fatal, carried across the
+                # project boundary by hand.  CMAKE_COMPILE_WARNING_AS_ERROR
+                # does NOT propagate into an ExternalProject: the sub-build is
+                # a separate CMake invocation and inherits nothing that is not
+                # listed here.  That is why the strict lanes were compiling the
+                # guest support with warnings merely printed -- when they
+                # compiled it at all.
+                -DZX_GUEST_WARNINGS_AS_ERRORS=${CMAKE_COMPILE_WARNING_AS_ERROR}
+            BUILD_BYPRODUCTS ${CMAKE_CURRENT_BINARY_DIR}/${guest_name}/${guest_name}.bin
+            # BUILD_ALWAYS, because the sub-build has its own dependency graph
+            # and this one cannot see into it.  Without it, editing the guest's
+            # application would leave a stale blob embedded in an image that
+            # relinked happily -- the same class of failure as a linker pattern
+            # that matches nothing, and just as quiet.
+            BUILD_ALWAYS    TRUE
+            INSTALL_COMMAND ""
+            USES_TERMINAL_CONFIGURE FALSE
+            USES_TERMINAL_BUILD     FALSE
+        )
+    endfunction()
+
     set(ZX_GUEST_A_BUILD ${CMAKE_CURRENT_BINARY_DIR}/guest_a)
     set(ZX_GUEST_A_BLOB  ${ZX_GUEST_A_BUILD}/guest_a.bin)
+    set(ZX_GUEST_B_BUILD ${CMAKE_CURRENT_BINARY_DIR}/guest_b)
+    set(ZX_GUEST_B_BLOB  ${ZX_GUEST_B_BUILD}/guest_b.bin)
 
     # ThreadX's own toolchain file, not ZoneX's.  They select the same
     # compiler and the same -mcpu, deliberately, but ZoneX's sets ZX_ARCH and
@@ -193,38 +266,8 @@ if(ZX_THREADX_SOURCE_DIR)
             ${ZX_THREADX_SOURCE_DIR}/cmake/cortex_r52.cmake)
     endif()
 
-    ExternalProject_Add(zx_guest_a
-        SOURCE_DIR      ${ZX_FVP_DIR}/guest_a
-        BINARY_DIR      ${ZX_GUEST_A_BUILD}
-        CMAKE_GENERATOR ${CMAKE_GENERATOR}
-        CMAKE_ARGS
-            -DCMAKE_TOOLCHAIN_FILE=${ZX_GUEST_TOOLCHAIN}
-            -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
-            -DZX_THREADX_SOURCE_DIR=${ZX_THREADX_SOURCE_DIR}
-            -DZX_GUEST_COMMON_DIR=${ZX_COMMON_DIR}
-            # ZoneX's own warning module, so that ZoneX's guest support faces
-            # ZoneX's warning set inside a ThreadX build.  The sub-project
-            # applies it to ZoneX's three files and to nothing else; see
-            # guest_a/CMakeLists.txt for why that distinction is load-bearing.
-            -DZX_CMAKE_DIR=${CMAKE_SOURCE_DIR}/cmake
-            # And whether those warnings are fatal, carried across the project
-            # boundary by hand.  CMAKE_COMPILE_WARNING_AS_ERROR does NOT
-            # propagate into an ExternalProject: the sub-build is a separate
-            # CMake invocation and inherits nothing that is not listed here.
-            # That is why the strict lanes were compiling the guest support
-            # with warnings merely printed -- when they compiled it at all.
-            -DZX_GUEST_WARNINGS_AS_ERRORS=${CMAKE_COMPILE_WARNING_AS_ERROR}
-        BUILD_BYPRODUCTS ${ZX_GUEST_A_BLOB}
-        # BUILD_ALWAYS, because the sub-build has its own dependency graph and
-        # this one cannot see into it.  Without it, editing the guest's
-        # application would leave a stale blob embedded in an image that
-        # relinked happily -- which is the same class of failure as a linker
-        # pattern that matches nothing, and just as quiet.
-        BUILD_ALWAYS    TRUE
-        INSTALL_COMMAND ""
-        USES_TERMINAL_CONFIGURE FALSE
-        USES_TERMINAL_BUILD     FALSE
-    )
+    zx_add_guest_project(guest_a ${ZX_PART_A_BASE} ${ZX_PART_A_SIZE})
+    zx_add_guest_project(guest_b ${ZX_PART_B_BASE} ${ZX_PART_B_SIZE})
 
     # One function, because the three probe variants are the same image with
     # one definition changed.  Building them from a shared function is what
@@ -387,6 +430,114 @@ if(ZX_THREADX_SOURCE_DIR)
     zx_add_preemptive(zx_preemptive_no_freeze.elf)
     target_compile_definitions(zx_preemptive_no_freeze.elf PRIVATE
                                ZX_PREEMPT_NO_FREEZE)
+    ###########################################################################
+    # TWO PARTITIONS: the image this whole repository has been building to
+    ###########################################################################
+    #
+    # It embeds BOTH guests, and that is the one structural difference from
+    # every image above.  A guest is linked for its window, so two windows are
+    # two different sets of bytes; there is no arrangement in which one blob
+    # serves both, and the loader's header check is what would catch an
+    # attempt.
+    #
+    # It shares the loader with the single-partition images -- zx_guest_launch.c
+    # -- and it shares the GUEST SOURCE with them byte for byte.  Whether a
+    # partition has a clock, prints, keeps running after its verdict or masks
+    # its own interrupts is a word in the mailbox and not a build, so the image
+    # that demonstrates isolation and the image that demonstrates time
+    # partitioning load the same kernel.
+    function(zx_add_two_partitions target_name)
+        add_executable(${target_name} EXCLUDE_FROM_ALL
+            ${ZX_COMMON_DIR}/zx_two_partitions.c
+            ${ZX_COMMON_DIR}/zx_guest_launch.c
+            ${ZX_COMMON_DIR}/zx_report.c
+            ${ZX_COMMON_DIR}/zx_guest_image.S
+            ${ZX_FVP_DIR}/zx_board.c
+        )
+
+        add_dependencies(${target_name} zx_guest_a zx_guest_b)
+
+        target_include_directories(${target_name} PRIVATE
+            ${ZX_FVP_DIR}
+            ${ZX_COMMON_DIR}
+        )
+
+        # TWO blob directories on the assembler's include path, and the second
+        # guest's .incbin switched on.  ZX_GUEST_B_BLOB is a preprocessor
+        # define rather than a second .S file because .incbin names a file
+        # that does not exist in a single-partition build -- an unconditional
+        # reference would fail the assembly of every other image here.
+        set_source_files_properties(${ZX_COMMON_DIR}/zx_guest_image.S
+            PROPERTIES
+                COMPILE_OPTIONS
+                    "-Wa,-I${ZX_GUEST_A_BUILD};-Wa,-I${ZX_GUEST_B_BUILD};-DZX_GUEST_B_BLOB"
+                OBJECT_DEPENDS  "${ZX_GUEST_A_BLOB};${ZX_GUEST_B_BLOB}"
+                TARGET_DIRECTORY ${target_name}
+        )
+
+        target_link_libraries(${target_name} PRIVATE
+            eclipse-threadx::zonex
+            zonex::warnings
+        )
+
+        target_link_options(${target_name} PRIVATE
+            -T${ZX_FVP_DIR}/zx_two_partitions.lds
+            -nostartfiles
+            -Wl,-Map=${target_name}.map
+            ${ZX_LINK_QUIET_RWX}
+        )
+
+        set_target_properties(${target_name} PROPERTIES
+            LINK_DEPENDS ${ZX_FVP_DIR}/zx_two_partitions.lds
+        )
+    endfunction()
+
+    # The image the suite runs.
+    zx_add_two_partitions(zx_two_partitions.elf)
+
+    # THE HOSTILE BUILD, and it must PASS.  Partition B masks IRQ and FIQ at
+    # EL1 and spins for ever, making no kernel call and asking the hypervisor
+    # for nothing.  It has to be preempted anyway, because with HCR.FMO set
+    # PSTATE.F is ignored at EL0 and EL1 -- so this is the build that turns
+    # the central design claim into a test result rather than a paragraph.
+    #
+    # A frame driven by an interrupt taken at EL1 would HANG here.
+    zx_add_two_partitions(zx_two_partitions_hog.elf)
+    target_compile_definitions(zx_two_partitions_hog.elf PRIVATE ZX_TWO_HOG)
+
+    # THE TWO NEGATIVE VERIFICATIONS, and they break different halves.
+    #
+    # Without the hypervisor's own PPI enabled, the comparator still expires
+    # and the GIC is simply never told to deliver it: no window can end,
+    # partition A runs until the harness stops it, and partition B never runs
+    # at all.  That is what makes the positive run's preemption checks
+    # evidence -- a check whose pass condition is "the window ended" has to be
+    # capable of failing.
+    zx_add_two_partitions(zx_two_partitions_no_tick.elf)
+    target_compile_definitions(zx_two_partitions_no_tick.elf PRIVATE
+                               ZX_TWO_NO_TICK)
+
+    # THE CROSS-PARTITION BUILD, and it must PASS.  Partition B is told to
+    # write inside partition A's window; its guest grants itself that granule
+    # in its OWN EL1 MPU first, so stage 1 permits the access and B genuinely
+    # believes it owns the memory.  Stage 2 refuses, B is stopped, and A runs
+    # to the end of the frame with its schedule untouched.
+    #
+    # It is in the passing group because both halves of it are the claim: the
+    # violation is DETECTED, and being attacked costs the neighbour nothing.
+    # A run where it started failing would mean one partition had found a way
+    # to reach -- or to delay -- the other.
+    zx_add_two_partitions(zx_two_partitions_cross.elf)
+    target_compile_definitions(zx_two_partitions_cross.elf PRIVATE ZX_TWO_CROSS)
+
+    # And two overlapping windows, which the validator must refuse BY NAME
+    # before a single region is programmed.  Two enabled regions on one
+    # address is CONSTRAINED UNPREDICTABLE and aborts on the S32Z280, so
+    # discovering it at run time is not an option this architecture offers.
+    zx_add_two_partitions(zx_two_partitions_overlap.elf)
+    target_compile_definitions(zx_two_partitions_overlap.elf PRIVATE
+                               ZX_TWO_OVERLAP)
+
 else()
     message(STATUS
         "ZoneX: ZX_THREADX_SOURCE_DIR is empty, so the ThreadX guest images "
@@ -486,6 +637,51 @@ if(ZX_FVP_BASER_AEMV8R)
                                  --fvp ${ZX_FVP_BASER_AEMV8R}
                                  --expect fail)
             endforeach()
+
+            # THE TWO-PARTITION IMAGES.  Two that must pass and two that must
+            # fail, and the pair that must fail is what makes the pair that
+            # must pass evidence rather than observation.
+            #
+            # The HOG build is in the passing group deliberately: its whole
+            # point is that a partition doing the most uncooperative thing an
+            # EL1 program can do changes NOTHING about the schedule.  A run
+            # where it started failing would mean a partition had found a way
+            # to defer the end of its own window.
+            #
+            # The timeout is longer than the other images': this one runs six
+            # major frames of simulated time with two kernels ticking through
+            # them, and a functional model is not fast.  A timeout that had to
+            # be guessed is one that eventually fires on somebody's slower
+            # machine and is read as a hang.
+            foreach(zx_positive "" _hog _cross)
+                add_test(NAME zx-fvp-two-partitions${zx_positive}
+                         COMMAND ${Python3_EXECUTABLE} ${ZX_FVP_RUNNER}
+                                 --elf $<TARGET_FILE:zx_two_partitions${zx_positive}.elf>
+                                 --fvp ${ZX_FVP_BASER_AEMV8R}
+                                 --timeout 600)
+            endforeach()
+
+            foreach(zx_negative no_tick overlap)
+                add_test(NAME zx-fvp-two-partitions-${zx_negative}
+                         COMMAND ${Python3_EXECUTABLE} ${ZX_FVP_RUNNER}
+                                 --elf $<TARGET_FILE:zx_two_partitions_${zx_negative}.elf>
+                                 --fvp ${ZX_FVP_BASER_AEMV8R}
+                                 --timeout 600
+                                 --expect fail)
+            endforeach()
+
+            add_custom_target(zx-run-two-partitions
+                COMMAND ${ZX_FVP_BASER_AEMV8R}
+                        -C cluster0.NUM_CORES=1
+                        -C bp.vis.disable_visualisation=1
+                        -C bp.terminal_0.start_telnet=0
+                        -C bp.pl011_uart0.out_file=-
+                        -C bp.pl011_uart0.unbuffered_output=1
+                        -a $<TARGET_FILE:zx_two_partitions.elf>
+                DEPENDS zx_two_partitions.elf
+                USES_TERMINAL
+                COMMENT "Running the ZoneX two-partition image on FVP_BaseR_AEMv8R..."
+            )
 
             add_custom_target(zx-run-preemptive
                 COMMAND ${ZX_FVP_BASER_AEMV8R}

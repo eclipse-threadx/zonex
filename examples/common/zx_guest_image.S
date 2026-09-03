@@ -45,6 +45,20 @@
 @   contain, and the loader checks the image's own magic number before it
 @   ERETs anywhere.
 
+@ ONE BLOB, OR TWO, AND WHY IT IS A DEFINE RATHER THAN A SECOND FILE
+@
+@   An image with two partitions embeds two guests: each one is LINKED for
+@   its own window, so they are different bytes and neither can stand in for
+@   the other.  The obvious arrangement -- a second .S file next to this one
+@   -- would carry a second copy of everything above, and the two copies
+@   would agree until one of them was fixed.
+@
+@   The second blob is therefore conditional, and it has to be: .incbin names
+@   a file, and "guest_b.bin" does not exist in a build that has only one
+@   partition.  An unconditional reference would fail the assembly of every
+@   single-partition image with "file not found" -- which is a good failure
+@   for a real mistake and a poor one for a file that is legitimately absent.
+
 #include "zx_guest_abi.h"
 
     .section .zx_guest_a_blob, "a", %progbits
@@ -58,3 +72,19 @@ __zx_guest_a_image_start:
     .balign 4
     .global __zx_guest_a_image_end
 __zx_guest_a_image_end:
+
+#ifdef ZX_GUEST_B_BLOB
+
+    .section .zx_guest_b_blob, "a", %progbits
+    .balign 64
+
+    .global __zx_guest_b_image_start
+__zx_guest_b_image_start:
+
+    .incbin "guest_b.bin"
+
+    .balign 4
+    .global __zx_guest_b_image_end
+__zx_guest_b_image_end:
+
+#endif

@@ -245,6 +245,7 @@ if have("__zx_partition_a_start"):
     REPORT_MAGIC = 0x5A58F00D
 
     box = sym("__zx_partition_a_start")
+    guest_sealed = False
 
     def mb(offset):
         return rd(box + offset)
@@ -281,6 +282,7 @@ if have("__zx_partition_a_start"):
         failures += 1
     else:
         print("    the report is sealed and attributable")
+        guest_sealed = True
 
     for bit, name in ((GP_BSP_MAIN,  "reached bsp_main"),
                       (GP_KERNEL,    "tx_application_define ran"),
@@ -298,6 +300,16 @@ if have("__zx_partition_a_start"):
         print("        result and the image's own verdict says FAILED for it.")
 
 # --- what the trap handler captured ------------------------------------------
+#
+# Defined here as well, because the guest block above is conditional on the
+# image having a partition window at all: the stage-2 probe images do not, and
+# a NameError inside a gdb Python block reports as an error in the sourced
+# file with no clue as to which name.
+try:
+    guest_sealed
+except NameError:
+    guest_sealed = False
+
 print("")
 captures = val("zx_el2_fault_storage")          # first field
 print("  captures into EL2    = %d  (yields included, so not a fault count)"
@@ -311,9 +323,35 @@ spsr   = rd(sym("zx_el2_fault_storage") + 28)
 vector = rd(sym("zx_el2_fault_storage") + 4)
 ec     = (hsr >> 26) & 0x3F
 
-if captures == 0:
-    print("  *** FAIL: nothing was ever captured at EL2.  The payload either")
-    print("            never ran or was never stopped.")
+# ZERO CAPTURES MEANS TWO OPPOSITE THINGS, AND THE GUEST'S OWN REPORT IS WHAT
+# SEPARATES THEM.
+#
+# The fault record is filled by the HYP TRAP vector -- a yield, a fault, or
+# anything else routed to EL2 from EL1.  For every image that runs a payload
+# and takes it back, a count of zero means the payload never ran, and that is
+# the failure this check was written for.
+#
+# A TIME-PARTITIONED RUN IS THE OPPOSITE CASE.  Its partitions never yield and
+# never fault: every window ends at an FIQ boundary, which is a different
+# vector and does not touch the fault record at all.  Zero captures there is
+# not "nothing ran", it is "nothing ever left its window except at a boundary"
+# -- which is the strongest possible outcome and exactly what the run is for.
+#
+# So the check asks the guest.  A sealed, attributable report with progress
+# bits in it is proof the payload ran, obtained from the partition's own
+# memory and independent of anything the hypervisor recorded.  With that in
+# hand, zero captures is a RESULT; without it, zero captures is the original
+# failure and is still reported as one.
+if captures == 0 and guest_sealed:
+    print("  and that is the RESULT, not a failure: no partition ever left")
+    print("  its window except at a boundary.  A yield or a fault would have")
+    print("  filled this record; an FIQ boundary is a different vector and")
+    print("  does not touch it.  The guest's own sealed report above is what")
+    print("  makes this distinguishable from a payload that never ran.")
+elif captures == 0:
+    print("  *** FAIL: nothing was ever captured at EL2, and no guest sealed")
+    print("            a report either.  The payload never ran, or it never")
+    print("            reached its first publish.")
     failures += 1
 else:
     print("  last capture:")

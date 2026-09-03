@@ -13,7 +13,12 @@
 # SPDX-License-Identifier: MIT and CC0-1.0
 ###############################################################################
 #
-# The ThreadX guest for ZoneX partition A on the NXP S32Z280-594EVB.
+# The ThreadX guest for ONE ZoneX partition on the NXP S32Z280-594EVB.
+#
+# WHICH partition is an argument, not a copy of this file: the window base,
+# the window size and the image name arrive as CMake variables and this
+# project is configured once per partition.  The model's copy carries the
+# reasoning for that; what is board-specific is below.
 #
 # THIS IS A PROJECT OF ITS OWN, configured and built by a SEPARATE CMake
 # invocation from a superbuild step in the parent example.  It is not an
@@ -34,17 +39,19 @@
 #     images in one link resolve into each other silently.  Separate projects
 #     make that impossible rather than merely unlikely.
 #
-# What crosses back is one file: guest_a.bin, the raw image, which the
-# hypervisor pulls in with .incbin.  guest_a.elf and guest_a.map stay here,
+# What crosses back is one file: <name>.bin, the raw image, which the
+# hypervisor pulls in with .incbin.  The ELF and its map file stay here,
 # beside it, because a fault report names a guest PC and the only way to turn
-# that back into a function is the map file.
+# that back into a function is the map file -- and with two partitions there
+# are two map files, one per window, which is exactly what a report naming an
+# address in one of them needs.
 
 cmake_minimum_required(VERSION 3.28...4.2)
 
-project(zx_guest_a_s32z280
+project(zx_guest_s32z280
     VERSION     0.1.0
     LANGUAGES   C ASM
-    DESCRIPTION "A ThreadX guest for ZoneX partition A on the S32Z280"
+    DESCRIPTION "A ThreadX guest for one ZoneX partition on the S32Z280"
 )
 
 if(NOT ZX_THREADX_SOURCE_DIR)
@@ -60,6 +67,40 @@ endif()
 if(NOT ZX_GUEST_COMMON_DIR)
     message(FATAL_ERROR "ZX_GUEST_COMMON_DIR was not passed to the guest build.")
 endif()
+
+# WHICH PARTITION THIS GUEST IS FOR.  Every one of these is checked rather
+# than defaulted: a guest silently linked for somebody else's window is the
+# failure the image header exists to catch at boot, and catching it at
+# CONFIGURE time costs nothing and names the cause.
+#
+# ZX_GUEST_NAME becomes the ELF, the map file and the raw blob, and the
+# hypervisor's .incbin names that blob literally -- so a guest built under
+# the wrong name is a link that fails rather than an image that runs the
+# wrong kernel.
+if(NOT ZX_GUEST_NAME)
+    message(FATAL_ERROR
+        "ZX_GUEST_NAME was not passed to the guest build, so this guest has "
+        "no identity: the hypervisor embeds its blob by name.")
+endif()
+
+if(NOT ZX_GUEST_WINDOW_BASE OR NOT ZX_GUEST_WINDOW_SIZE)
+    message(FATAL_ERROR
+        "ZX_GUEST_WINDOW_BASE and ZX_GUEST_WINDOW_SIZE were not both passed "
+        "to the guest build.\n"
+        "A guest is LINKED for one window and every absolute address in it is "
+        "baked in; there is no defensible default, because a guest linked for "
+        "the wrong address starts and then faults at its first literal pool "
+        "load, at an address that looks entirely reasonable in the report.")
+endif()
+
+# The linker script, with this partition's window substituted in.  Generated
+# into this project's own binary directory, so the two partitions' scripts
+# cannot be confused with each other or with the template.
+configure_file(
+    ${CMAKE_CURRENT_LIST_DIR}/link_partition.lds.in
+    ${CMAKE_CURRENT_BINARY_DIR}/link_partition.lds
+    @ONLY
+)
 
 # ZONEX'S OWN WARNING SET, READ FROM ZONEX'S OWN MODULE.
 #
@@ -289,7 +330,7 @@ function(zx_add_guest target_name)
     target_link_libraries(${target_name} PRIVATE threadx)
 
     target_link_options(${target_name} PRIVATE
-        -T${GUEST_DIR}/link_partition_a.lds
+        -T${CMAKE_CURRENT_BINARY_DIR}/link_partition.lds
         -nostartfiles
         -Wl,-Map=${target_name}.map
         ${GUEST_LINK_QUIET_RWX}
@@ -299,12 +340,12 @@ function(zx_add_guest target_name)
     # would not trigger a relink and a stale guest would be loaded against new
     # region boundaries.
     set_target_properties(${target_name} PROPERTIES
-        LINK_DEPENDS ${GUEST_DIR}/link_partition_a.lds
+        LINK_DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/link_partition.lds
     )
 
     # The raw image, which is what the hypervisor embeds.  objcopy -O binary
     # spans any gap between loaded sections, which is exactly why the window
-    # is one contiguous area -- see the header of link_partition_a.lds.
+    # is one contiguous area -- see the header of link_partition.lds.in.
     #
     # The blob drops the .elf suffix, so the ELF and its map file sit beside
     # a blob named for the guest rather than for the ELF.  That is not tidying:
@@ -327,14 +368,17 @@ function(zx_add_guest target_name)
     )
 endfunction()
 
-# ONE GUEST IMAGE, and that is a decision rather than an economy.
+# ONE GUEST IMAGE PER PARTITION, and that is a decision rather than an
+# economy.
 #
-# The hypervisor demonstrates three different outcomes with this guest -- a
-# stage-2 violation, a stage-1 fault, and an access that is genuinely
-# permitted -- and it selects between them by writing an ADDRESS into the
-# guest's mailbox, not by building a different guest.  A binary per case is a
-# set of binaries that can drift apart, and the one demonstrating isolation
-# would then stop being the one demonstrating that the kernel runs.  Here
-# they are the same bytes, and the run that proves the kernel works is
-# literally the run that proves it is confined.
-zx_add_guest(guest_a.elf)
+# ONE per PARTITION, because a guest is linked for its window and two
+# partitions are two windows.  ONE per partition, because everything else a
+# guest might vary -- whether it has a clock, whether it prints, what it
+# probes, whether it hands the machine back or hogs it -- is a WORD IN THE
+# MAILBOX and not a build.  A binary per behaviour is a set of binaries that
+# can drift apart, and the one demonstrating isolation would then stop being
+# the one demonstrating that the kernel runs.  Here every partition runs the
+# same source, compiled the same way, differing only in the address it was
+# linked for -- so the run that proves the kernel works is literally the run
+# that proves it is confined, in both partitions.
+zx_add_guest(${ZX_GUEST_NAME}.elf)

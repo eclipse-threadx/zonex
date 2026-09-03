@@ -13,27 +13,37 @@
  * SPDX-License-Identifier: MIT and CC0-1.0
  **************************************************************************/
 
-/* Link map for the ZoneX one-partition image on the S32Z280-594EVB.
+/* Link map for the ZoneX TWO-PARTITION image on the Armv8-R AEM FVP.
  *
- * WHY THIS IS A SECOND SCRIPT AND NOT AN EXTENSION OF zx_link.lds
+ * WHY THIS IS A THIRD SCRIPT AND NOT AN EXTENSION OF THE OTHER TWO
  *
- * The two images describe genuinely different memory.  The stage-2 probe has
- * two small partition windows and a relocatable blob copied into both; this
- * one has a single 64 KB window holding a whole ThreadX, and it embeds a
- * guest image that the probe image does not have and must not require.
+ * The three images describe genuinely different memory.  The stage-2 probe
+ * has two small windows and a relocatable blob copied into both; the
+ * one-partition image has a single 256 KB window and embeds one guest; this
+ * one has TWO 256 KB windows and embeds two, because a guest is linked for
+ * its window and two windows are two different sets of bytes.
  *
- * Sharing one script would mean the probe carrying a KEEP for a section it
+ * Sharing one script would mean an image carrying a KEEP for a section it
  * never supplies -- which produces an EMPTY section rather than an error,
  * silently, at whatever address the location counter held.  That is the exact
  * failure the loader's magic-number check exists to catch, and the right
  * place to avoid it is here.
  *
- * THE WINDOW ADDRESS IS A CONTRACT, NOT A CHOICE.  0x317C0000 and 0x10000
- * are written into the guest's own linker script as well, because the guest
- * is LINKED for this window -- every absolute address inside it is baked in.
- * Changing either number means changing both, and the guest declares what it
- * was built for in its own image header so that a mismatch is REFUSED at
- * boot rather than discovered as a fault at a plausible-looking address.
+ * THE WINDOW ADDRESSES ARE A CONTRACT, NOT A CHOICE.  Each is passed to its
+ * guest's build from examples/fvp_baser_aemv8r/CMakeLists.txt, which is the
+ * one place they are written down, and each guest declares what it was built
+ * for in its own image header so that a mismatch is REFUSED at boot rather
+ * than discovered as a fault at a plausible-looking address.  The numbers
+ * below have to agree with that file, and the ASSERTs at the foot of this
+ * script are what say so.
+ *
+ * THE UNGRANTED GRANULE BETWEEN THE TWO WINDOWS IS LOAD-BEARING.  Sixty-four
+ * bytes belonging to nobody sit immediately after partition A and
+ * immediately before partition B.  A region limit one granule too generous
+ * at either end reaches into it, and an access there must fault -- which is
+ * why partition B's base is not a round number.  An ungranted address far
+ * from every grant proves only that unmapped memory faults; adjacency is
+ * what makes it a boundary test.
  *
  * A NOTE ON ALIGN, because the two spellings are not equivalent
  *
@@ -55,77 +65,56 @@ ENTRY(_start)
 
 __zx_hyp_stack_size = 0x1000;
 
-/* THE PARTITION WINDOW.  Both numbers are duplicated in
-   guest/link_partition.lds.in and the pair is checked at boot against the
-   guest's own image header.  */
+/* THE PARTITION WINDOWS.  Each pair is passed to its guest's build from this
+   board's CMakeLists.txt, and checked at boot against the guest's own image
+   header.  */
 
-__zx_partition_a_base = 0x317C0000;
-__zx_partition_a_size = 0x00010000;
+__zx_partition_a_base = 0x02000000;
+__zx_partition_a_size = 0x00040000;
+__zx_partition_b_base = 0x02040040;
+__zx_partition_b_size = 0x00040000;
 
 MEMORY
 {
-    /* THREE regions here where the model needs two, because this board has
-       two memories rather than one flat DRAM.
-       
-         CODE    7 MB at 0x79900000, which is also where the core resets.
-                 The hypervisor's text and the embedded guest image live
-                 here.
-         HYP     the first 256 KB of the 512 KB data SRAM at 0x31780000:
-                 the hypervisor's own data, bss and stack.
-         PART_A  a 64 KB partition window higher in the same data SRAM,
-                 plus one granule of ungranted memory after it.
-    
-       The partition window is in DATA and not in CODE, and that is forced
-       rather than chosen: a partition needs its code and its data in ONE
-       CONTIGUOUS window -- one stage-2 region, and a blob that objcopy does
-       not pad out to the 1.2 GB between the two memories.  The Cortex-R52
-       Modules port work put its module area in data SRAM for the same
-       reason.
+    /* Two regions rather than one location counter, so that the window's
+       address is declared rather than arrived at.  A script that reached
+       0x02000000 by assignment would place the window correctly today and
+       silently move it the first time the hypervisor's own image grew past
+       32 MB -- which is a change nobody would connect to a guest that
+       stopped working.  */
 
-       Declared as separate regions rather than reached by assignment so that
-       the window's address is stated.  A script that arrived at 0x317C0000
-       by advancing a location counter would place it correctly today and
-       move it silently the first time the hypervisor's own data grew.  */
-
-    CODE   (rx)  : ORIGIN = 0x79900000, LENGTH = 0x00700000    /* 7 MB    */
-    HYP    (rwx) : ORIGIN = 0x31780000, LENGTH = 0x00040000    /* 256 KB  */
-    PART_A (rwx) : ORIGIN = 0x317C0000, LENGTH = 0x00010040    /* + hole  */
+    HYP    (rwx) : ORIGIN = 0x00000000, LENGTH = 0x02000000    /* 32 MB    */
+    PART_A (rwx) : ORIGIN = 0x02000000, LENGTH = 0x00040040    /* + a hole */
+    PART_B (rwx) : ORIGIN = 0x02040040, LENGTH = 0x00040040    /* + a hole */
 }
 
 SECTIONS
 {
     . = ALIGN(64);
 
-    /* .boot MUST come first: MC_ME_PRTN0_CORE0_ADDR is 0x79900000 on this
-       board, so whatever lands at the start of CODE is what the core
-       executes out of reset, and that has to be _start -- as a T32
-       instruction, since the core resets in Thumb state.  The EL2 vector
-       table needs alignment but not a fixed address, because HVBAR is
-       programmed at run time, so it follows rather than leads.  */
-
     .boot :
     {
         KEEP(*(.text.boot))
-    } > CODE
+    } > HYP
 
     .vectors_el2 :
     {
         KEEP(*(.vectors_el2))
-    } > CODE
+    } > HYP
 
     .text :
     {
         *(.text*)
         *(.glue_7)
         *(.glue_7t)
-    } > CODE
+    } > HYP
 
     .rodata :
     {
         . = ALIGN(4);
         *(.rodata*)
         . = ALIGN(4);
-    } > CODE
+    } > HYP
 
     /* ------------------------------------------------------------------
        THE GUEST IMAGE, in the hypervisor's own memory.
@@ -143,7 +132,15 @@ SECTIONS
         KEEP(*(.zx_guest_a_blob))
         . = ALIGN(4);
         __zx_guest_a_blob_end = .;
-    } > CODE
+    } > HYP
+
+    .zx_guest_b_blob : ALIGN(64)
+    {
+        __zx_guest_b_blob_start = .;
+        KEEP(*(.zx_guest_b_blob))
+        . = ALIGN(4);
+        __zx_guest_b_blob_end = .;
+    } > HYP
 
     .data : ALIGN(64)
     {
@@ -206,6 +203,31 @@ SECTIONS
     } > PART_A
 
     /* ------------------------------------------------------------------
+       PARTITION B'S WINDOW, and its own ungranted granule.
+
+       B's base is A's hole's END, so the sixty-four bytes between them
+       belong to neither partition and are adjacent to both.  That single
+       granule is what catches a limit one granule too generous at EITHER
+       end -- the defect class that otherwise reads as a working system,
+       because two region sets a whole kilobyte apart would pass a test
+       that only checked the neighbour's data.
+       ------------------------------------------------------------------ */
+
+    .zx_partition_b (NOLOAD) : ALIGN(64)
+    {
+        __zx_partition_b_start = .;
+        . = . + __zx_partition_b_size;
+        __zx_partition_b_end = .;
+    } > PART_B
+
+    .zx_partition_b_hole (NOLOAD) : ALIGN(64)
+    {
+        __zx_partition_b_hole_start = .;
+        . = . + 64;
+        __zx_partition_b_hole_end = .;
+    } > PART_B
+
+    /* ------------------------------------------------------------------
        Assert the geometry the region programming and the loader depend on,
        so that a layout mistake fails the LINK rather than the run.  A
        region whose base is under-aligned does not fault: its low bits land
@@ -222,8 +244,36 @@ SECTIONS
     ASSERT(__zx_partition_a_hole_start == __zx_partition_a_end,
            "the ungranted granule is NOT adjacent to partition A's window")
 
+    ASSERT((__zx_partition_b_start & 63) == 0,
+           "partition B's window base is not 64-byte aligned")
+    ASSERT(((__zx_partition_b_end - __zx_partition_b_start) & 63) == 0,
+           "partition B's window is not a whole number of granules")
+    ASSERT(__zx_partition_b_start == __zx_partition_b_base,
+           "partition B's window is not at the address its guest was linked for")
+    ASSERT(__zx_partition_b_hole_start == __zx_partition_b_end,
+           "the ungranted granule is NOT adjacent to partition B's window")
+
+    /* AND THE GRANULE BETWEEN THEM BELONGS TO NOBODY.  A's hole ends
+       exactly where B's window begins, so there is one ungranted granule
+       and it is adjacent to both windows.  Written as an assert rather than
+       trusted to the MEMORY lengths, because the two are computed from
+       different numbers and a change to either would break this silently.  */
+
+    ASSERT(__zx_partition_a_hole_end == __zx_partition_b_start,
+           "the ungranted granule is not adjacent to both partition windows")
+
+    /* And the two windows do not overlap, which PMSAv8-R makes worse than a
+       logical error: two enabled regions matching one address is CONSTRAINED
+       UNPREDICTABLE, and it aborts on the S32Z280.  The manifest validator
+       refuses it too; this catches it a whole build earlier.  */
+
+    ASSERT(__zx_partition_a_end <= __zx_partition_b_start,
+           "the two partition windows overlap")
+
     ASSERT((__zx_guest_a_blob_start & 63) == 0,
-           "the guest image is not 64-byte aligned")
+           "guest A's image is not 64-byte aligned")
+    ASSERT((__zx_guest_b_blob_start & 63) == 0,
+           "guest B's image is not 64-byte aligned")
 
     /* THE BLOB IS NOT EMPTY, and this is the check that catches an .incbin
        whose file was missing or a linker input pattern that matched
@@ -243,24 +293,22 @@ SECTIONS
        section into whatever followed it.  */
 
     ASSERT((__zx_guest_a_blob_end - __zx_guest_a_blob_start) >= 0x90,
-           "the embedded guest image is empty or too small to carry its header")
+           "guest A's embedded image is empty or too small to carry its header")
+    ASSERT((__zx_guest_b_blob_end - __zx_guest_b_blob_start) >= 0x90,
+           "guest B's embedded image is empty or too small to carry its header")
 
     ASSERT((__zx_guest_a_blob_end - __zx_guest_a_blob_start)
                <= __zx_partition_a_size,
-           "the embedded guest image does not fit partition A's window")
+           "guest A's embedded image does not fit partition A's window")
+    ASSERT((__zx_guest_b_blob_end - __zx_guest_b_blob_start)
+               <= __zx_partition_b_size,
+           "guest B's embedded image does not fit partition B's window")
 
-    /* And the hypervisor's own data must not have reached the window.  The
-       separate MEMORY regions make this impossible rather than merely
-       unlikely, so this asserts the thing the reader would otherwise have to
-       work out from the region lengths.  */
+    /* And the hypervisor's own image must not have reached the window.  The
+       two MEMORY regions make this impossible rather than merely unlikely,
+       so this asserts the thing the reader would otherwise have to work out
+       from the region lengths.  */
 
     ASSERT(_end <= __zx_partition_a_base,
-           "the hypervisor's own data has grown into partition A's window")
-
-    /* And the window stays out of the half-speed memory.  Nothing would fail
-       if it did not; every timing number a later step produced would simply
-       be wrong by a factor nobody would think to look for.  */
-
-    ASSERT((__zx_partition_a_base + __zx_partition_a_size) <= 0x31800000,
-           "the partition window reaches into DRAM2, which runs at half core speed")
+           "the hypervisor's own image has grown into partition A's window")
 }

@@ -13,7 +13,11 @@
  * SPDX-License-Identifier: MIT and CC0-1.0
  **************************************************************************/
 
-/* Link map for a ThreadX guest inside ZoneX partition A, S32Z280-594EVB.
+/* Link map for a ThreadX guest inside a ZoneX partition, S32Z280-594EVB.
+ *
+ * A TEMPLATE, configured once per partition: the window base and size are
+ * substituted by CMake.  The model's script carries the reasoning for that
+ * and for everything else the two have in common.
  *
  * WHY THE WINDOW IS IN DATA SRAM AND NOT IN CODE SRAM
  *
@@ -55,10 +59,16 @@ ENTRY(_start)
    64 KB, where the model's guest gets 256 KB.  Data SRAM here is 512 KB in
    total and the hypervisor's own data, bss and stack come out of the same
    memory, so the headroom that costs nothing on a 128 MB model is a real
-   budget on this board.  The image below links to roughly a third of it.  */
+   budget on this board.  The image below links to roughly a third of it.
 
-__zx_guest_window_base = 0x317C0000;
-__zx_guest_window_size = 0x00010000;
+   BOTH ARE SUBSTITUTED BY CMAKE, from the values the hypervisor's own
+   linker script declares, so the two cannot disagree by being edited apart.
+   Two 64 KB windows and their ungranted granules fit this memory with room
+   left; a third would not, and the ASSERT at the foot of the hypervisor's
+   script is what says so rather than a comment here.  */
+
+__zx_guest_window_base = @ZX_GUEST_WINDOW_BASE@;
+__zx_guest_window_size = @ZX_GUEST_WINDOW_SIZE@;
 
 /* Per-mode stacks.  Smaller than the model's for the same reason the window
    is: this is a budget rather than a whole DRAM.  */
@@ -73,7 +83,7 @@ __sys_stack_size__ = 0x0300;
 
 MEMORY
 {
-    WINDOW (rwx) : ORIGIN = 0x317C0000, LENGTH = 0x00010000
+    WINDOW (rwx) : ORIGIN = @ZX_GUEST_WINDOW_BASE@, LENGTH = @ZX_GUEST_WINDOW_SIZE@
 }
 
 SECTIONS

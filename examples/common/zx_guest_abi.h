@@ -178,6 +178,44 @@
 
 #define ZX_GO_TICK                  0x00000002U
 
+/* ZX_GO_FOREVER asks the guest NOT to hand the machine back when it has
+ * finished its programme, and it is what makes a MAJOR FRAME demonstrable.
+ *
+ * A guest that yields is a guest that has finished.  With one partition that
+ * was exactly the right ending -- the hypervisor took the core back, read
+ * the sealed report and printed it.  With a frame it is the wrong one: a
+ * schedule can only be shown to preempt partitions that are still trying to
+ * run, and a partition that stopped after its first window would spend every
+ * later window being politely idled through.
+ *
+ * So with this bit set the guest keeps working after its verdict: it stays
+ * runnable, keeps taking its own ticks, and keeps republishing its tick count
+ * and its own virtual counter into the mailbox.  The hypervisor then reads,
+ * at the end of the run, what each partition's clock did -- which is the
+ * evidence for the claim the whole step exists to make.
+ *
+ * The verdict is published BEFORE the endless phase begins, so a run that is
+ * stopped at any point afterwards still carries a sealed report.  */
+
+#define ZX_GO_FOREVER               0x00000004U
+
+/* ZX_GO_HOG asks the guest to be as uncooperative as an EL1 program can be:
+ * after its verdict it masks IRQ and FIQ at EL1 and spins for ever, making
+ * no kernel call and giving nothing back.
+ *
+ * IT IS THE DEMONSTRATION AND NOT A HAZARD, and the distinction is the whole
+ * design.  With HCR.FMO set, PSTATE.F is IGNORED at EL0 and EL1 -- so the
+ * interrupt that ends this partition's window is delivered to EL2 whatever
+ * the guest has masked, and there is nothing a partition can do about it.
+ * Masking its own IRQ costs it only its own kernel's tick.
+ *
+ * A run of this build must therefore look exactly like a run without it,
+ * except that the hogging partition stops ticking.  If the frame were driven
+ * by an interrupt taken at EL1 instead, this build would hang -- which is
+ * why it exists as a build rather than as a paragraph.  */
+
+#define ZX_GO_HOG                   0x00000008U
+
 /* THE READBACK CONVENTION, and why it is a structure rather than one word.
  *
  * A single progress word is enough to say "the guest got somewhere".  It is
@@ -283,7 +321,39 @@
 #define ZX_GD_SPIN_B                0x50U   /* spinner B's loop count       */
 #define ZX_GD_WAKES                 0x54U   /* times the sleeper woke       */
 
-/* 0x5C to 0x7C are spare, and are zeroed by the handover like everything
+/* WHAT A GUEST REPORTS WHILE IT IS STILL RUNNING, which is the other half
+ * of the temporal claim.
+ *
+ * The sealed snapshot says what a partition ACHIEVED.  These four say what
+ * its clock did, and they are refreshed continuously by the endless phase
+ * ZX_GO_FOREVER asks for -- so the hypervisor can read them at the end of a
+ * run and compare each partition's own elapsed time against the windows it
+ * was actually given.
+ *
+ * THE COMPARISON IS THE POINT AND IT ONLY WORKS FROM BOTH SIDES.  ZoneX
+ * knows how much of the physical counter each partition spent on the core;
+ * only the guest can say what its OWN counter did over the same span.  A
+ * partition whose virtual time matched WALL CLOCK rather than its own
+ * windows would be a partition that could see its neighbour's time, and it
+ * is precisely the failure that leaves a system running perfectly while
+ * lying about time.
+ *
+ * OUTSIDE THE SEAL, like the rest of this granule, because they are written
+ * by a loop that must not stop to checksum anything.  Nothing rests on them
+ * that the sealed words do not also carry: ZX_GD_TICKS is tx_time_get() and
+ * IS sealed, and these are the running version of it plus the counter
+ * underneath.
+ *
+ * LOW HALVES ONLY.  At the S32Z280's 8 MHz a 32-bit virtual count wraps in
+ * nine minutes and a frame demonstration is seconds long, so the low half is
+ * both sufficient and honest about what it is -- see guest_virtual_count.  */
+
+#define ZX_GD_LIVE                  0x5CU   /* the endless loop's own count */
+#define ZX_GD_VCT_START             0x60U   /* CNTVCT when the guest began  */
+#define ZX_GD_VCT_NOW               0x64U   /* CNTVCT, refreshed            */
+#define ZX_GD_TICKS_NOW             0x68U   /* tx_time_get(), refreshed     */
+
+/* 0x6C to 0x7C are spare, and are zeroed by the handover like everything
    else.  A word nobody wrote reads as whatever the image was built with,
    which for a loaded, zero-filled section is zero -- but only until somebody
    changes the section, so the handover writes them rather than relying on

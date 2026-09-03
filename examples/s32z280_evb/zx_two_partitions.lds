@@ -55,12 +55,26 @@ ENTRY(_start)
 
 __zx_hyp_stack_size = 0x1000;
 
-/* THE PARTITION WINDOW.  Both numbers are duplicated in
-   guest/link_partition.lds.in and the pair is checked at boot against the
-   guest's own image header.  */
+/* THE PARTITION WINDOWS.  Each pair is passed to its guest's build from
+   this board's CMakeLists.txt, which is the one place they are written
+   down, and each guest declares what it was built for in its own image
+   header so that a mismatch is REFUSED at boot.
+
+   PARTITION B'S BASE IS NOT ROUND, and the reason is the ungranted granule
+   between the two windows.  Sixty-four bytes belonging to nobody sit
+   immediately after A and immediately before B, so a region limit one
+   granule too generous at EITHER end is caught by an access that should
+   fault.  An ungranted address far from every grant proves only that
+   unmapped memory faults; adjacency is what makes it a boundary test.
+
+   TWO 64 KB WINDOWS AND THEIR GRANULES FIT THIS MEMORY WITH ROOM LEFT, and
+   only just: data SRAM ends at 0x31800000, where DRAM2 begins at half core
+   speed.  The last ASSERT below is what says so rather than a comment.  */
 
 __zx_partition_a_base = 0x317C0000;
 __zx_partition_a_size = 0x00010000;
+__zx_partition_b_base = 0x317D0040;
+__zx_partition_b_size = 0x00010000;
 
 MEMORY
 {
@@ -74,6 +88,10 @@ MEMORY
                  the hypervisor's own data, bss and stack.
          PART_A  a 64 KB partition window higher in the same data SRAM,
                  plus one granule of ungranted memory after it.
+         PART_B  a second, immediately after A's granule and with a granule
+                 of its own.  The two windows are 64 KB apart and the sixty-
+                 four bytes between them belong to neither -- which is why
+                 B's base is not a round number.
     
        The partition window is in DATA and not in CODE, and that is forced
        rather than chosen: a partition needs its code and its data in ONE
@@ -90,6 +108,7 @@ MEMORY
     CODE   (rx)  : ORIGIN = 0x79900000, LENGTH = 0x00700000    /* 7 MB    */
     HYP    (rwx) : ORIGIN = 0x31780000, LENGTH = 0x00040000    /* 256 KB  */
     PART_A (rwx) : ORIGIN = 0x317C0000, LENGTH = 0x00010040    /* + hole  */
+    PART_B (rwx) : ORIGIN = 0x317D0040, LENGTH = 0x00010040    /* + hole  */
 }
 
 SECTIONS
@@ -143,6 +162,14 @@ SECTIONS
         KEEP(*(.zx_guest_a_blob))
         . = ALIGN(4);
         __zx_guest_a_blob_end = .;
+    } > CODE
+
+    .zx_guest_b_blob : ALIGN(64)
+    {
+        __zx_guest_b_blob_start = .;
+        KEEP(*(.zx_guest_b_blob))
+        . = ALIGN(4);
+        __zx_guest_b_blob_end = .;
     } > CODE
 
     .data : ALIGN(64)
@@ -205,6 +232,23 @@ SECTIONS
         __zx_partition_a_hole_end = .;
     } > PART_A
 
+    /* PARTITION B'S WINDOW, beginning where A's ungranted granule ends, so
+       that the one granule between them is adjacent to BOTH.  */
+
+    .zx_partition_b (NOLOAD) : ALIGN(64)
+    {
+        __zx_partition_b_start = .;
+        . = . + __zx_partition_b_size;
+        __zx_partition_b_end = .;
+    } > PART_B
+
+    .zx_partition_b_hole (NOLOAD) : ALIGN(64)
+    {
+        __zx_partition_b_hole_start = .;
+        . = . + 64;
+        __zx_partition_b_hole_end = .;
+    } > PART_B
+
     /* ------------------------------------------------------------------
        Assert the geometry the region programming and the loader depend on,
        so that a layout mistake fails the LINK rather than the run.  A
@@ -222,8 +266,23 @@ SECTIONS
     ASSERT(__zx_partition_a_hole_start == __zx_partition_a_end,
            "the ungranted granule is NOT adjacent to partition A's window")
 
+    ASSERT((__zx_partition_b_start & 63) == 0,
+           "partition B's window base is not 64-byte aligned")
+    ASSERT(((__zx_partition_b_end - __zx_partition_b_start) & 63) == 0,
+           "partition B's window is not a whole number of granules")
+    ASSERT(__zx_partition_b_start == __zx_partition_b_base,
+           "partition B's window is not at the address its guest was linked for")
+    ASSERT(__zx_partition_b_hole_start == __zx_partition_b_end,
+           "the ungranted granule is NOT adjacent to partition B's window")
+    ASSERT(__zx_partition_a_hole_end == __zx_partition_b_start,
+           "the ungranted granule is not adjacent to both partition windows")
+    ASSERT(__zx_partition_a_end <= __zx_partition_b_start,
+           "the two partition windows overlap")
+
     ASSERT((__zx_guest_a_blob_start & 63) == 0,
-           "the guest image is not 64-byte aligned")
+           "guest A's image is not 64-byte aligned")
+    ASSERT((__zx_guest_b_blob_start & 63) == 0,
+           "guest B's image is not 64-byte aligned")
 
     /* THE BLOB IS NOT EMPTY, and this is the check that catches an .incbin
        whose file was missing or a linker input pattern that matched
@@ -243,11 +302,16 @@ SECTIONS
        section into whatever followed it.  */
 
     ASSERT((__zx_guest_a_blob_end - __zx_guest_a_blob_start) >= 0x90,
-           "the embedded guest image is empty or too small to carry its header")
+           "guest A's embedded image is empty or too small to carry its header")
+    ASSERT((__zx_guest_b_blob_end - __zx_guest_b_blob_start) >= 0x90,
+           "guest B's embedded image is empty or too small to carry its header")
 
     ASSERT((__zx_guest_a_blob_end - __zx_guest_a_blob_start)
                <= __zx_partition_a_size,
-           "the embedded guest image does not fit partition A's window")
+           "guest A's embedded image does not fit partition A's window")
+    ASSERT((__zx_guest_b_blob_end - __zx_guest_b_blob_start)
+               <= __zx_partition_b_size,
+           "guest B's embedded image does not fit partition B's window")
 
     /* And the hypervisor's own data must not have reached the window.  The
        separate MEMORY regions make this impossible rather than merely
@@ -261,6 +325,6 @@ SECTIONS
        if it did not; every timing number a later step produced would simply
        be wrong by a factor nobody would think to look for.  */
 
-    ASSERT((__zx_partition_a_base + __zx_partition_a_size) <= 0x31800000,
-           "the partition window reaches into DRAM2, which runs at half core speed")
+    ASSERT((__zx_partition_b_base + __zx_partition_b_size + 64) <= 0x31800000,
+           "the partition windows reach into DRAM2, which runs at half core speed")
 }

@@ -108,13 +108,13 @@ target_compile_definitions(zx_probe_starved.elf PRIVATE ZX_PROBE_STARVE_REGIONS)
 # Built exactly as the model's is -- a separate CMake invocation with
 # ThreadX's own toolchain file, producing one raw binary the hypervisor
 # embeds with .incbin.  The reasoning is in
-# examples/fvp_baser_aemv8r/guest_a/CMakeLists.txt and is not repeated.
+# examples/fvp_baser_aemv8r/guest/CMakeLists.txt and is not repeated.
 #
 # WHAT DIFFERS ON THIS BOARD is the window: 64 KB in data SRAM rather than
 # 256 KB in flat DRAM, because the hypervisor's own data comes out of the
 # same 512 KB and because a partition's code and data must be CONTIGUOUS --
 # objcopy -O binary would otherwise pad the blob out to the 1.2 GB between
-# this part's two memories.  See guest_a/link_partition_a.lds.
+# this part's two memories.  See guest/link_partition.lds.in.
 #
 # AND ONE THING THE MODEL CANNOT SHOW: the guest's reset path here needs the
 # port's TX_R52_BOOT_AT_EL1 bracket, which the S32Z280 entry.S gained for
@@ -126,8 +126,33 @@ target_compile_definitions(zx_probe_starved.elf PRIVATE ZX_PROBE_STARVE_REGIONS)
 if(ZX_THREADX_SOURCE_DIR)
     include(ExternalProject)
 
+    # THE PARTITION WINDOWS, AND THE ONE PLACE THEY ARE WRITTEN DOWN.
+    #
+    # The contract between this board's linker scripts, the manifest, and the
+    # address each guest is LINKED for.  Partition A's window is deliberately
+    # UNCHANGED from the one-partition image's, so the guest running in it is
+    # byte for byte the guest those images already run.
+    #
+    # PARTITION B'S BASE IS NOT ROUND because the ungranted granule between
+    # the two windows is load-bearing: sixty-four bytes belonging to nobody
+    # sit immediately after A and immediately before B, so a region limit one
+    # granule too generous at either end is caught by an access that should
+    # fault.
+    #
+    # 64 KB EACH, WHERE THE MODEL GIVES 256 KB.  Data SRAM here is 512 KB in
+    # total and the hypervisor's own data comes out of the same memory; two
+    # windows and their granules end at 0x317E0080, comfortably short of the
+    # half-speed DRAM2 at 0x31800000.  A third would not fit, and the
+    # linker script says so with an ASSERT rather than a comment.
+    set(ZX_PART_A_BASE 0x317C0000)
+    set(ZX_PART_A_SIZE 0x00010000)
+    set(ZX_PART_B_BASE 0x317D0040)
+    set(ZX_PART_B_SIZE 0x00010000)
+
     set(ZX_GUEST_A_BUILD ${CMAKE_CURRENT_BINARY_DIR}/guest_a)
     set(ZX_GUEST_A_BLOB  ${ZX_GUEST_A_BUILD}/guest_a.bin)
+    set(ZX_GUEST_B_BUILD ${CMAKE_CURRENT_BINARY_DIR}/guest_b)
+    set(ZX_GUEST_B_BLOB  ${ZX_GUEST_B_BUILD}/guest_b.bin)
 
     if(CMAKE_C_COMPILER_ID STREQUAL "Clang")
         set(ZX_GUEST_TOOLCHAIN
@@ -137,33 +162,47 @@ if(ZX_THREADX_SOURCE_DIR)
             ${ZX_THREADX_SOURCE_DIR}/cmake/cortex_r52.cmake)
     endif()
 
-    ExternalProject_Add(zx_guest_a
-        SOURCE_DIR      ${ZX_S32Z_DIR}/guest_a
-        BINARY_DIR      ${ZX_GUEST_A_BUILD}
-        CMAKE_GENERATOR ${CMAKE_GENERATOR}
-        CMAKE_ARGS
-            -DCMAKE_TOOLCHAIN_FILE=${ZX_GUEST_TOOLCHAIN}
-            -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
-            -DZX_THREADX_SOURCE_DIR=${ZX_THREADX_SOURCE_DIR}
-            -DZX_GUEST_COMMON_DIR=${ZX_COMMON_DIR}
-            # ZoneX's own warning module, so that ZoneX's guest support faces
-            # ZoneX's warning set inside a ThreadX build.  The sub-project
-            # applies it to ZoneX's three files and to nothing else; see
-            # guest_a/CMakeLists.txt for why that distinction is load-bearing.
-            -DZX_CMAKE_DIR=${CMAKE_SOURCE_DIR}/cmake
-            # And whether those warnings are fatal, carried across the project
-            # boundary by hand.  CMAKE_COMPILE_WARNING_AS_ERROR does NOT
-            # propagate into an ExternalProject: the sub-build is a separate
-            # CMake invocation and inherits nothing that is not listed here.
-            # That is why the strict lanes were compiling the guest support
-            # with warnings merely printed -- when they compiled it at all.
-            -DZX_GUEST_WARNINGS_AS_ERRORS=${CMAKE_COMPILE_WARNING_AS_ERROR}
-        BUILD_BYPRODUCTS ${ZX_GUEST_A_BLOB}
-        BUILD_ALWAYS    TRUE
-        INSTALL_COMMAND ""
-        USES_TERMINAL_CONFIGURE FALSE
-        USES_TERMINAL_BUILD     FALSE
-    )
+    # ONE GUEST PROJECT, CONFIGURED ONCE PER PARTITION.  The sub-project
+    # takes its window and its name as arguments and generates its own linker
+    # script from a template; see guest/CMakeLists.txt for why that is a
+    # parameter rather than a second copy of a two-hundred-line file.
+    function(zx_add_guest_project guest_name window_base window_size)
+        ExternalProject_Add(zx_${guest_name}
+            SOURCE_DIR      ${ZX_S32Z_DIR}/guest
+            BINARY_DIR      ${CMAKE_CURRENT_BINARY_DIR}/${guest_name}
+            CMAKE_GENERATOR ${CMAKE_GENERATOR}
+            CMAKE_ARGS
+                -DCMAKE_TOOLCHAIN_FILE=${ZX_GUEST_TOOLCHAIN}
+                -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
+                -DZX_THREADX_SOURCE_DIR=${ZX_THREADX_SOURCE_DIR}
+                -DZX_GUEST_COMMON_DIR=${ZX_COMMON_DIR}
+                -DZX_GUEST_NAME=${guest_name}
+                -DZX_GUEST_WINDOW_BASE=${window_base}
+                -DZX_GUEST_WINDOW_SIZE=${window_size}
+                # ZoneX's own warning module, so that ZoneX's guest support
+                # faces ZoneX's warning set inside a ThreadX build.  The
+                # sub-project applies it to ZoneX's three files and to nothing
+                # else; see guest/CMakeLists.txt for why that distinction is
+                # load-bearing.
+                -DZX_CMAKE_DIR=${CMAKE_SOURCE_DIR}/cmake
+                # And whether those warnings are fatal, carried across the
+                # project boundary by hand.  CMAKE_COMPILE_WARNING_AS_ERROR
+                # does NOT propagate into an ExternalProject: the sub-build is
+                # a separate CMake invocation and inherits nothing that is not
+                # listed here.  That is why the strict lanes were compiling the
+                # guest support with warnings merely printed -- when they
+                # compiled it at all.
+                -DZX_GUEST_WARNINGS_AS_ERRORS=${CMAKE_COMPILE_WARNING_AS_ERROR}
+            BUILD_BYPRODUCTS ${CMAKE_CURRENT_BINARY_DIR}/${guest_name}/${guest_name}.bin
+            BUILD_ALWAYS    TRUE
+            INSTALL_COMMAND ""
+            USES_TERMINAL_CONFIGURE FALSE
+            USES_TERMINAL_BUILD     FALSE
+        )
+    endfunction()
+
+    zx_add_guest_project(guest_a ${ZX_PART_A_BASE} ${ZX_PART_A_SIZE})
+    zx_add_guest_project(guest_b ${ZX_PART_B_BASE} ${ZX_PART_B_SIZE})
 
     function(zx_add_s32z_one_partition target_name)
         add_executable(${target_name} EXCLUDE_FROM_ALL
@@ -292,6 +331,85 @@ if(ZX_THREADX_SOURCE_DIR)
     zx_add_s32z_preemptive(zx_preemptive_no_freeze.elf)
     target_compile_definitions(zx_preemptive_no_freeze.elf PRIVATE
                                ZX_PREEMPT_NO_FREEZE)
+    ###########################################################################
+    # TWO PARTITIONS, on silicon
+    ###########################################################################
+    #
+    # The image the whole repository has been building to, and the one whose
+    # numbers are worth quoting: the model is functional and its cycle counts
+    # are not timing at all.
+    #
+    # It embeds BOTH guests, which is the one structural difference from every
+    # image above.  A guest is linked for its window, so two windows are two
+    # different sets of bytes and there is no arrangement in which one blob
+    # serves both.
+    function(zx_add_s32z_two_partitions target_name)
+        add_executable(${target_name} EXCLUDE_FROM_ALL
+            ${ZX_COMMON_DIR}/zx_two_partitions.c
+            ${ZX_COMMON_DIR}/zx_guest_launch.c
+            ${ZX_COMMON_DIR}/zx_report.c
+            ${ZX_COMMON_DIR}/zx_guest_image.S
+            ${ZX_S32Z_DIR}/zx_board.c
+        )
+
+        add_dependencies(${target_name} zx_guest_a zx_guest_b)
+
+        target_include_directories(${target_name} PRIVATE
+            ${ZX_S32Z_DIR}
+            ${ZX_COMMON_DIR}
+        )
+
+        set_source_files_properties(${ZX_COMMON_DIR}/zx_guest_image.S
+            PROPERTIES
+                COMPILE_OPTIONS
+                    "-Wa,-I${ZX_GUEST_A_BUILD};-Wa,-I${ZX_GUEST_B_BUILD};-DZX_GUEST_B_BLOB"
+                OBJECT_DEPENDS  "${ZX_GUEST_A_BLOB};${ZX_GUEST_B_BLOB}"
+                TARGET_DIRECTORY ${target_name}
+        )
+
+        target_link_libraries(${target_name} PRIVATE
+            eclipse-threadx::zonex
+            zonex::warnings
+        )
+
+        target_link_options(${target_name} PRIVATE
+            -T${ZX_S32Z_DIR}/zx_two_partitions.lds
+            -nostartfiles
+            -Wl,-Map=${target_name}.map
+            ${ZX_LINK_QUIET_RWX}
+        )
+
+        set_target_properties(${target_name} PROPERTIES
+            LINK_DEPENDS ${ZX_S32Z_DIR}/zx_two_partitions.lds
+        )
+    endfunction()
+
+    zx_add_s32z_two_partitions(zx_two_partitions.elf)
+
+    # THE HOSTILE BUILD, and it must PASS.  Partition B masks IRQ and FIQ at
+    # EL1 and spins for ever.  It has to be preempted anyway, because with
+    # HCR.FMO set PSTATE.F is ignored at EL0 and EL1 -- and this is the board
+    # where that claim is worth anything, because this is the board with real
+    # interrupt latency.
+    zx_add_s32z_two_partitions(zx_two_partitions_hog.elf)
+    target_compile_definitions(zx_two_partitions_hog.elf PRIVATE ZX_TWO_HOG)
+
+    # The cross-partition build: B reaches into A's window, stage 2 refuses,
+    # B is stopped, and A runs to the end of the frame untouched.  It must
+    # PASS -- both halves of it are the isolation claim.
+    zx_add_s32z_two_partitions(zx_two_partitions_cross.elf)
+    target_compile_definitions(zx_two_partitions_cross.elf PRIVATE
+                               ZX_TWO_CROSS)
+
+    # And the two negative verifications, exactly as on the model.
+    zx_add_s32z_two_partitions(zx_two_partitions_no_tick.elf)
+    target_compile_definitions(zx_two_partitions_no_tick.elf PRIVATE
+                               ZX_TWO_NO_TICK)
+
+    zx_add_s32z_two_partitions(zx_two_partitions_overlap.elf)
+    target_compile_definitions(zx_two_partitions_overlap.elf PRIVATE
+                               ZX_TWO_OVERLAP)
+
 else()
     message(STATUS
         "ZoneX: ZX_THREADX_SOURCE_DIR is empty, so the ThreadX guest images "

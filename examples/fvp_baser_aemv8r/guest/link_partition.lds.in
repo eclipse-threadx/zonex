@@ -13,7 +13,24 @@
  * SPDX-License-Identifier: MIT and CC0-1.0
  **************************************************************************/
 
-/* Link map for a ThreadX guest inside ZoneX partition A, Armv8-R AEM FVP.
+/* Link map for a ThreadX guest inside a ZoneX partition, Armv8-R AEM FVP.
+ *
+ * A TEMPLATE, configured once per partition.
+ *
+ * The window base and size below are substituted by CMake, and that is the
+ * answer to a question this repository asked deliberately: adding a second
+ * partition was meant to be a data change plus one more .incbin, and it was
+ * not -- it was going to be a second copy of a two-hundred-line build file
+ * and a second copy of this script, differing in one number each.
+ *
+ * Two copies of an argument stay true until the day they do not, and the day
+ * they do not is a guest linked for a window it is not loaded into: it
+ * STARTS, because the entry branch is PC-relative, and faults at its first
+ * literal pool load at an address that looks entirely reasonable.  So the
+ * script is one file and the number is data.  The image still declares what
+ * it was built for in its own header, and the hypervisor still refuses a
+ * mismatch at boot -- the template removes a way to create one, not the
+ * check that catches it.
  *
  * WHAT MAKES THIS DIFFERENT FROM THE PORT'S OWN link.lds
  *
@@ -73,10 +90,14 @@ ENTRY(_start)
    256 KB is not a measurement, it is headroom: the guest below links to
    roughly a tenth of it, and a window sized to what the image happens to
    need today would fail the ASSERT the first time a demo grew a thread.
-   The stage-2 region costs the same whatever its size.  */
+   The stage-2 region costs the same whatever its size.
 
-__zx_guest_window_base = 0x02000000;
-__zx_guest_window_size = 0x00040000;
+   BOTH ARE SUBSTITUTED BY CMAKE, from the values the hypervisor's own
+   linker script declares, so the two cannot disagree by being edited apart.
+   Every partition on this board gets the same size and a different base. */
+
+__zx_guest_window_base = @ZX_GUEST_WINDOW_BASE@;
+__zx_guest_window_size = @ZX_GUEST_WINDOW_SIZE@;
 
 /* Per-mode stacks.  Every AArch32 mode needs one and the port's el1_entry
    sets all six; a mode whose stack symbol was missing would fail the link,
@@ -93,7 +114,7 @@ __sys_stack_size__ = 0x0400;
 
 MEMORY
 {
-    WINDOW (rwx) : ORIGIN = 0x02000000, LENGTH = 0x00040000
+    WINDOW (rwx) : ORIGIN = @ZX_GUEST_WINDOW_BASE@, LENGTH = @ZX_GUEST_WINDOW_SIZE@
 }
 
 SECTIONS

@@ -453,6 +453,86 @@ static ULONG preemptive_phase(void)
 
 
 /**************************************************************************/
+/*  endless_phase -- what a partition does when it has finished but the   */
+/*                   frame has not.                                       */
+/*                                                                        */
+/*  WHY A GUEST WOULD REFUSE TO HAND THE MACHINE BACK.                     */
+/*                                                                        */
+/*  A guest that yields is a guest that has finished, and with one         */
+/*  partition that was exactly the right ending.  Under a MAJOR FRAME it   */
+/*  is the wrong one: a schedule can only be shown to preempt partitions   */
+/*  that are still trying to run, and a partition that stopped after its   */
+/*  first window would spend every later window being idled through.       */
+/*  Nothing about the demonstration would be false; it would simply stop   */
+/*  demonstrating the thing.                                              */
+/*                                                                        */
+/*  So this loop keeps the partition runnable and keeps republishing two   */
+/*  numbers the hypervisor cannot obtain for itself: this partition's OWN  */
+/*  tick count, and its OWN virtual counter.  Those are what the temporal  */
+/*  claim is checked against from the inside -- ZoneX knows how much of    */
+/*  the physical counter each partition was given, and only the guest can  */
+/*  say what its own clock did over the same span.                        */
+/*                                                                        */
+/*  THE HOG VARIANT MASKS INTERRUPTS AND THAT IS THE POINT.  With          */
+/*  ZX_GO_HOG the loop first disables IRQ and FIQ at EL1 and then never    */
+/*  makes another kernel call.  A partition doing this is as               */
+/*  uncooperative as an EL1 program can be: it cannot be descheduled by    */
+/*  its own kernel, because its own kernel has stopped ticking, and it     */
+/*  asks the hypervisor for nothing.                                       */
+/*                                                                        */
+/*  It must be preempted anyway.  With HCR.FMO set, PSTATE.F is IGNORED    */
+/*  at EL0 and EL1, so the FIQ that ends this window reaches EL2 whatever  */
+/*  this thread has masked.  All the masking costs is this partition's own */
+/*  tick -- which is visible, because ZX_GD_TICKS_NOW stops moving while   */
+/*  ZX_GD_LIVE keeps going, and that pair is the evidence.                 */
+/*                                                                        */
+/*  NO SEAL AND NO CHECKSUM IN HERE, deliberately.  The verdict was        */
+/*  published before this was entered, so a run stopped at any point       */
+/*  below still carries a complete sealed report; resealing on every       */
+/*  iteration would spend the partition's window computing a checksum      */
+/*  nobody reads.  These words are outside the seal and zx_guest_abi.h     */
+/*  says so.                                                              */
+/**************************************************************************/
+
+static void endless_phase(ULONG options)
+{
+    ULONG live = 0UL;
+
+    guest_mailbox_write(ZX_GD_VCT_START, guest_virtual_count());
+
+    if ((options & (ULONG) ZX_GO_HOG) != 0UL)
+    {
+        console_puts("HOGGING: masking IRQ and FIQ at EL1 and spinning for\n"
+                     "ever.  My own kernel will stop ticking.  The window\n"
+                     "must end anyway, because PSTATE.F is ignored at EL1\n"
+                     "while the hypervisor routes FIQ to itself -- and I\n"
+                     "cannot reach the bit that would change that.\n");
+
+        /* Both masks.  IRQ is this kernel's own tick; F is the one that
+           does nothing, and it is set precisely so that the run
+           demonstrates it doing nothing.  */
+
+        __asm__ volatile("cpsid if" ::: "memory");
+    }
+    else
+    {
+        console_puts("finished, and staying runnable so that the frame has\n"
+                     "something to preempt.  My tick count and my own\n"
+                     "virtual counter keep going into the mailbox.\n");
+    }
+
+    for (;;)
+    {
+        live++;
+
+        guest_mailbox_write(ZX_GD_LIVE, live);
+        guest_mailbox_write(ZX_GD_VCT_NOW, guest_virtual_count());
+        guest_mailbox_write(ZX_GD_TICKS_NOW, tx_time_get());
+    }
+}
+
+
+/**************************************************************************/
 /*  consumer_entry                                                        */
 /*                                                                        */
 /*  Drains the queue, checks each message is the one the producer sent in  */
@@ -669,10 +749,23 @@ static void consumer_entry(ULONG thread_input)
         console_puts("GUEST RESULT: FAILED\n");
     }
 
-    /* Back to the hypervisor, on purpose.  A guest that simply returned from
-       its last thread would leave the kernel idling forever inside a
-       partition nothing would ever take back, and the run would time out
-       rather than report.  */
+    /* AND THEN ONE OF TWO ENDINGS, chosen by the hypervisor rather than by
+       the build.
+     *
+       Back to the hypervisor, on purpose, is the right ending for an image
+       that runs one partition: a guest that simply returned from its last
+       thread would leave the kernel idling inside a partition nothing would
+       ever take back, and the run would time out rather than report.
+     *
+       Under a major frame it is the wrong ending, because a schedule can
+       only be shown to preempt partitions that are still trying to run.
+       ZX_GO_FOREVER keeps this one runnable; see endless_phase.  */
+
+    if ((guest_mailbox_read(ZX_GD_OPTIONS)
+         & (unsigned long) ZX_GO_FOREVER) != 0UL)
+    {
+        endless_phase((ULONG) guest_mailbox_read(ZX_GD_OPTIONS));
+    }
 
     guest_yield();
 }

@@ -56,7 +56,7 @@ ENTRY(_start)
 __zx_hyp_stack_size = 0x1000;
 
 /* THE PARTITION WINDOW.  Both numbers are duplicated in
-   guest_a/link_partition_a.lds and the pair is checked at boot against the
+   guest/link_partition.lds.in and the pair is checked at boot against the
    guest's own image header.  */
 
 __zx_partition_a_base = 0x02000000;

@@ -142,8 +142,8 @@ extern char __zx_partition_a_hole_start[];
  * hypervisor tick will have to go once there is one: ZoneX's own timer must
  * be able to preempt a partition's, or a partition could delay the end of
  * its own window by taking a long interrupt.  That is not yet built -- it
- * needs HCR.IMO -- and the number is chosen now so that it does not have to
- * change then.  */
+ * needs HCR.FMO and the hypervisor's tick in Group 0 -- and the number is
+ * chosen now so that it does not have to change then.  */
 
 #define ZX_GUEST_TIMER_PRIORITY 0xA0U
 
@@ -589,7 +589,8 @@ ZX_NORETURN void zx_el2_main(void)
              "         whole interrupt capability is system-register state",
              (zx_partitions[0].zx_partition_region_count == 1U) ? 1U : 0U);
 
-    status = zx_mm_plan(&zx_manifest, board_regions, el2_regions, &zx_layout);
+    status = zx_mm_plan(&zx_manifest, board_regions, el2_regions,
+                        zx_hprenr_implemented_bits, &zx_layout);
     zx_note("zx_mm_plan", status);
     zx_check("the layout fits this part's region budget",
              (status == ZX_MANIFEST_SUCCESS) ? 1U : 0U);
@@ -1164,14 +1165,21 @@ ZX_NORETURN void zx_el2_main(void)
                     "\n"
                     " NOT PROVED, and the omission is deliberate rather than\n"
                     " pending: this is not TIME PARTITIONING.  ZoneX cannot\n"
-                    " yet END a partition's window, because HCR.IMO is CLEAR\n"
-                    " -- every physical interrupt taken while a partition\n"
-                    " runs goes to EL1, including the hypervisor's own timer.\n"
-                    " Setting IMO routes them all to EL2 instead, and every\n"
-                    " guest interrupt then has to be INJECTED through one of\n"
-                    " this core's four List Registers.  That is a change to\n"
-                    " the hypervisor and to no guest, which is why the shape\n"
-                    " here is worth having first.\n"
+                    " yet END a partition's window, because nothing here\n"
+                    " routes an interrupt to EL2 at all -- every physical\n"
+                    " interrupt taken while a partition runs goes to EL1,\n"
+                    " including the hypervisor's own timer.\n"
+                    "\n"
+                    " WHAT IT TAKES IS FIQ, NOT INJECTION, and the difference\n"
+                    " is a rewrite against two register writes.  Routing is\n"
+                    " by exception TYPE and not by INTID: HCR.FMO sends\n"
+                    " physical FIQ to EL2 while HCR.IMO, left clear, leaves\n"
+                    " IRQ with EL1.  So the hypervisor's tick goes in GROUP 0\n"
+                    " -- which the GIC delivers as an FIQ -- and every guest\n"
+                    " interrupt stays Group 1, stays an IRQ, and is still\n"
+                    " delivered straight to EL1 exactly as it is here, with\n"
+                    " no List Register anywhere.  See docs/decisions.md D24,\n"
+                    " whose first version concluded the opposite and says so.\n"
                     "\n"
                     " NOT PROVED: anything about timing on a functional\n"
                     " model, and anything about more than one partition or\n"
