@@ -84,8 +84,8 @@
 /*    nothing can deliver an FIQ to it.  What is missing is at EL2 --      */
 /*    FMO, PPI 26 in Group 0, and a real body on the FIQ vector -- and     */
 /*    none of it has been run.  Injection through the List Registers stays */
-/*    where the roadmap put it: a later phase, for bounding interrupt      */
-/*    latency, not a prerequisite for a partition tick.                    */
+/*    a later phase, for bounding interrupt latency, not a prerequisite    */
+/*    for a partition tick.                                                */
 /*                                                                        */
 /*  MISRA C:2012 deviations (justified)                                   */
 /*                                                                        */

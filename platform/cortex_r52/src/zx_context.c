@@ -35,14 +35,15 @@
 /*    SPSR_hyp have to be captured before the first C instruction runs,   */
 /*    and those fifteen words are zx_context.S's whole job.               */
 /*                                                                        */
-/*    That split is worth its explanation because the plan this work came */
-/*    from expected the opposite -- one large assembly routine doing all  */
-/*    of it.  The dominant cost here is the EL1 MPU: twenty regions on    */
-/*    the S32Z280, two registers each, selected through a third.  As a    */
-/*    loop it is eight lines that a reader can check against the region   */
-/*    count the part reported.  Unrolled in assembly it is a hundred and  */
-/*    twenty coprocessor moves in which a single transposed operand is    */
-/*    invisible and hands one partition another's memory permissions.     */
+/*    That split is worth its explanation because this work was           */
+/*    originally expected to be the opposite -- one large assembly        */
+/*    routine doing all of it.  The dominant cost here is the EL1 MPU:    */
+/*    twenty regions on the S32Z280, two registers each, selected through */
+/*    a third.  As a loop it is eight lines that a reader can check       */
+/*    against the region count the part reported.  Unrolled in assembly   */
+/*    it is a hundred and twenty coprocessor moves in which a single      */
+/*    transposed operand is invisible and hands one partition another's   */
+/*    memory permissions.                                                 */
 /*                                                                        */
 /*    Nothing is given up.  The loop's trip count is read from MPUIR once */
 /*    at boot and does not depend on anything a guest did, so the switch  */

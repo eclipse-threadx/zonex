@@ -62,7 +62,7 @@ Every other component of the suite uses a two-letter prefix — `tx_`, `fx_`,
 its own capability-macro prefix for exactly the reason prefixes exist: headers
 get included together, and a collision is discovered at the worst moment.
 
-The alternative was `tx_hv_*`, which is the spelling the focused task list uses
+The alternative was `tx_hv_*`, the spelling an earlier sketch of this work used
 (`tx_hv_mm_setup.c`, `tx_hv_partition_manager.c`, `tx_hv_trap_handler.S`). It
 was dropped because it reads as a ThreadX subsystem, and ZoneX is not one — it
 does not link ThreadX (D9) and it is released as its own component.
@@ -496,9 +496,10 @@ like the ThreadX one and does not mean the same thing.
 This entry originally said ZoneX "is the reference implementation of the
 suite-wide C17/CMake plan rather than an exception to it." That overstated it
 in both halves, and the claim was load-bearing in a later argument before
-anyone checked it — see D19. The plan makes no such claim: it says it is
-independent of the ZoneX roadmap, and asks only that ZoneX be started directly
-in C17 with the capability macros. And ZoneX *is* an exception on one point,
+anyone checked it — see D19. The suite-wide C17 and CMake work makes no such
+claim: it is independent of ZoneX's own sequencing, and asks only that ZoneX be
+started directly in C17 with the capability macros. And ZoneX *is* an
+exception on one point,
 recorded below.
 
 Every other component migrates to C17 from C99. ZoneX is the only one *born*
@@ -508,7 +509,7 @@ capability macro block, `cmake_minimum_required(VERSION 3.28...4.2)`, the
 HEADERS` are all in place from commit one. A later component copying the shape
 should copy ZoneX's.
 
-**Where ZoneX deviates.** The plan proposes `CMAKE_C_EXTENSIONS OFF` in the CI
+**Where ZoneX deviates.** That work proposes `CMAKE_C_EXTENSIONS OFF` in the CI
 strict preset with extensions **ON** in the default build, so that ports
 relying on compiler builtins can be fixed incrementally. ZoneX has it off in
 the *default* build. That is stricter, it is worth keeping — a repository with
@@ -746,9 +747,9 @@ were considered and both fail:
   ever respelled one of these would then fail loudly at the include rather
   than diverge quietly.
 * *"ZoneX is the reference implementation of the C17 migration, so it should
-  set the precedent."* The suite-wide plan says the opposite — it is
-  independent of the ZoneX roadmap and asks only that ZoneX start at C17 with
-  the capability macros. It also settles the migration risk outright: it
+  set the precedent."* The suite-wide C17 work says the opposite — it is
+  independent of ZoneX's own sequencing and asks only that ZoneX start at C17
+  with the capability macros. It also settles the migration risk outright: it
   changes no struct layout, no calling convention and no type name, and
   regression-tests that a C99 application still compiles against the new
   headers. Those names are load-bearing for that promise, and therefore
@@ -1083,9 +1084,9 @@ never enables `ICC_IGRPEN0`, so nothing can deliver an FIQ to it. What is missin
 is all at EL2 — `FMO`, PPI 26 in Group 0, and a real body on the FIQ vector — and
 none of it has been run.
 
-Injection through the List Registers stays where the roadmap put it: a later
-phase, for making interrupt latency a hypervisor-controlled and WCET-bounded
-quantity. It is not a prerequisite for a partition tick, and treating it as one
+Injection through the List Registers stays a later phase, for making interrupt
+latency a hypervisor-controlled and WCET-bounded quantity. It is not a
+prerequisite for a partition tick, and treating it as one
 would have made the next step look far larger than it is.
 
 ### What a partition ends up touching
@@ -1308,7 +1309,7 @@ EL1 and the first C instruction would destroy them. Everything else a
 partition owns is still in the machine while the hypervisor runs: its banked
 SPs and LRs, its EL1 system registers, its whole EL1 MPU. Those are C.
 
-The plan this work came from expected one large assembly routine. The split
+This work was originally expected to be one large assembly routine. The split
 is better, and the reason is the twenty-region loop: as C it is eight lines a
 reader can check against the region count the part reported, and unrolled in
 assembly it is a hundred and twenty coprocessor moves in which one transposed
@@ -1375,7 +1376,7 @@ which are equal in any run where both partitions live to the end.
 * **Interrupt LATENCY is not a hypervisor-controlled quantity.** Guest
   interrupts go straight to EL1, which is why they cost what they always did
   — and why bounding them needs the List Registers this core has and this
-  phase does not use. That stays where the roadmap put it.
+  phase does not use. That stays a later phase.
 * **An idle partition burns its window.** Trapping `WFI` to hand the
   remainder to the next partition would raise throughput and would make one
   partition's start time depend on its neighbour's behaviour, which is the

@@ -351,12 +351,12 @@ Three things follow.
   `ICH_VTR`, and **four List Registers, `ICH_LR0`–`ICH_LR3`**. Interrupt
   injection is therefore available on this part.
 
-  This is worth recording because it corrects an assumption. The focused
-  roadmap expected Phase 0 to have to paravirtualise interrupts because NXP's
-  EL2M does. EL2M's reason is that the GIC **Distributor** is a shared
-  resource, not that injection is unavailable. Phase 0 still keeps interrupt
-  handling simple — but that is now a scope decision taken knowingly rather
-  than a limitation inherited by assumption.
+  This is worth recording because it corrects an assumption. Phase 0 was
+  expected to have to emulate interrupt delivery, on the belief that the
+  injection hardware was not there. It is, and this is the measurement that
+  says so. Phase 0 still keeps interrupt handling simple — but that is now a
+  scope decision taken knowingly rather than a limitation inherited by
+  assumption. See `docs/decisions.md` D24.
 
 ### A partition's timer PPI is delivered to EL1 directly — measured on both targets
 

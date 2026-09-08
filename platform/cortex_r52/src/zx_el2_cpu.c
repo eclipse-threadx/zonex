@@ -190,7 +190,7 @@ uint32_t zx_read_ich_vtr(void)
        number of List Registers MINUS ONE -- the Cortex-R52 resets it to
        0x90180003, which is four registers, ICH_LR0 to ICH_LR3.  Recorded
        because interrupt injection being AVAILABLE on this part corrects an
-       assumption the roadmap carried; see docs/armv8r-el2-reference.md.  */
+       earlier assumption; see docs/armv8r-el2-reference.md.  */
     __asm__ volatile("mrc p15, 4, %0, c12, c11, 1" : "=r"(value));
 
     return value;
