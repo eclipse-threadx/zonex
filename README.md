@@ -43,14 +43,18 @@ computing with its own interrupts masked, storming the console, and violating
 its boundary on every iteration of its own loop.
 
 On the board A's window period is 800,000 counts of an 8 MHz counter. Over six
-hundred major frames it moves by **21** counts while its neighbour idles,
-**21** while that neighbour computes, **22** while it computes with IRQ and FIQ
-masked, and **304** while it commits a hundred and three thousand boundary
+hundred major frames it moves by **22** counts while its neighbour idles,
+**20** while that neighbour computes, **24** while it computes with IRQ and FIQ
+masked, and **185** while it commits a hundred and three thousand boundary
 violations.
+
+**An independent run six days earlier agreed to within the scatter** — 21, 21,
+22 and 304 counts, with the same 22-byte console hypercall — so these are a
+reproduced measurement rather than one run's luck.
 
 **One thing does reach a neighbour, and it is the hypervisor's own doing.** In
 the same run, the phase where the untrusted partition storms the console moves
-A's period by **17,830** counts.
+A's period by **17,951** counts.
 
 Nothing a partition does *through the schedule* reaches its neighbour — the
 figures above are tens of counts, against a violation count in six figures.
@@ -59,7 +63,7 @@ per character, answered at EL2 with `PSTATE.F` set, so the FIQ that ends a
 window waits for it. Nearly every one of those hypercalls writes the single
 byte the guest asked for. **The one that opens a line writes twenty-two** —
 the newline a deferred close still owed, the tag naming the partition, and the
-guest's own character — and that is 106,214 core cycles, 2.2 ms, about
+guest's own character — and that is 106,116 core cycles, 2.2 ms, about
 **17,640 counts**, with the boundary interrupt held off throughout.
 
 **That is a defect in ZoneX, not a limit of the partitioning**, and it is
@@ -109,10 +113,10 @@ frequency was established three independent ways, so it does not depend on the
 core clock, the caches or the optimisation level.
 
 **And one measurement, which will change.** A partition switch costs **about
-6,000 cycles** on the S32Z280 — 5,662 / 5,705 / 5,964 min / mean / max on the
-most recent run, with the mean spanning 5,705 to 6,078 across five readings
+6,000 cycles** on the S32Z280 — 5,662 / 5,703 / 5,982 min / mean / max on the
+most recent run, with the mean spanning 5,703 to 6,078 across six readings
 taken on this bench over a week. The guest's own EL1 MPU is **3,407 of those
-5,705** — 85% of the save and restore, and 60% of the whole switch. A switch is
+5,703** — 85% of the save and restore, and 60% of the whole switch. A switch is
 not expensive because the hypervisor does much; its per-partition state is
 three register writes. It is expensive because a guest has a lot of registers,
 and most of them are its memory protection unit.
