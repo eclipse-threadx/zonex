@@ -632,7 +632,33 @@ static void test_region_edges(void)
     EXPECT_STATUS(ZX_MANIFEST_SUCCESS);
 }
 
+/**************************************************************************/
+/*  The granule constant itself, which now lives in this header.           */
+/**************************************************************************/
+
+static void test_granule_constant(void)
+{
+    /* The 64-byte granule is not a tunable.  PMSAv8-R lays HPRBAR out as
+       BASE[31:6] with SH, AP and XN in the low bits, so a base that is not a
+       multiple of 64 does not fault -- it silently rewrites the region's
+       attributes.  If this constant is ever not 64, every mask in the port
+       is wrong and every alignment rule below is checking the wrong thing.  */
+    ZX_CHECK_EQ(ZX_MPU_GRANULE, 64U);
+    ZX_CHECK_EQ(ZX_MPU_GRANULE & (ZX_MPU_GRANULE - 1U), 0U);
+
+    /* And the named memory types are the indices the ports are held to.  A
+       value changed here without the matching HMAIR byte moving is caught at
+       build time by the assertions in the port; this catches a change made
+       with no thought at all.  */
+    ZX_CHECK_EQ(ZX_ATTR_NORMAL_WB, 0U);
+    ZX_CHECK_EQ(ZX_ATTR_DEVICE,    1U);
+    ZX_CHECK_EQ(ZX_ATTR_NORMAL_NC, 2U);
+    ZX_CHECK(ZX_ATTR_NORMAL_NC < ZX_ATTR_INDEX_COUNT);
+}
+
+
 ZX_TEST_MAIN("test_zx_manifest",
+    test_granule_constant();
     test_good_manifest();
     test_null_pointers();
     test_partition_structure();

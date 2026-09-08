@@ -64,6 +64,21 @@ extern "C" {
 /*                       Stage-2 region attributes                        */
 /**************************************************************************/
 
+/* PMSAv8-R programs a region as a base and an inclusive limit, both of which
+   must be aligned to the 64-byte granule.  An under-aligned base does not
+   fault: its low bits land on the SH, AP and XN fields of HPRBAR and silently
+   change the region's attributes.  An unmasked limit is worse -- (base + size
+   - 1) ends in 0x3F, which lands on HPRLAR's AttrIndx field and selects an
+   unwritten MAIR byte.  Both traps were paid for at EL1 during the
+   Cortex-R52 Modules port work, and are repeated here because they apply
+   unchanged at stage 2.
+
+   It sits with the manifest's other region vocabulary rather than in the
+   general API because it is a rule about what a manifest may DECLARE: every
+   base and every limit a manifest carries is checked against it, and someone
+   writing one needs it to hand.  */
+#define ZX_MPU_GRANULE              64U
+
 /* AP[2:1] as stage 2 encodes it.  These are NOT the EL1 AP encodings, and
    the difference is the one that matters for isolation: there is no encoding
    that grants a guest access while denying EL2.  A partition is isolated

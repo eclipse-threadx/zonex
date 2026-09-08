@@ -44,11 +44,12 @@
    is only validated when it sits on a real declaration; a version of the block
    that compiled but produced an attribute the compiler silently ignored would
    pass any test that only checked the macro was defined.  */
-ZX_NODISCARD static zx_addr_t zx_test_align_down_to_granule(zx_addr_t address);
+ZX_NODISCARD static zx_addr_t zx_test_align_down(zx_addr_t address,
+                                                 zx_addr_t alignment);
 
-static zx_addr_t zx_test_align_down_to_granule(zx_addr_t address)
+static zx_addr_t zx_test_align_down(zx_addr_t address, zx_addr_t alignment)
 {
-    return address & ~(zx_addr_t)(ZX_MPU_GRANULE - 1U);
+    return address & ~(alignment - 1U);
 }
 
 static void zx_test_unused_is_accepted(ZX_MAYBE_UNUSED int ignored)
@@ -57,23 +58,21 @@ static void zx_test_unused_is_accepted(ZX_MAYBE_UNUSED int ignored)
 
 ZX_TEST_MAIN("zx_api",
 {
-    /* The 64-byte granule is not a tunable.  PMSAv8-R lays HPRBAR out as
-       BASE[31:6] with SH, AP and XN in the low bits, so a base that is not a
-       multiple of 64 does not fault -- it silently rewrites the region's
-       attributes.  If this constant is ever not 64, every mask in the port is
-       wrong.  */
-    ZX_CHECK_EQ(ZX_MPU_GRANULE, 64U);
-    ZX_CHECK_EQ(ZX_MPU_GRANULE & (ZX_MPU_GRANULE - 1U), 0U);
+    /* Alignment arithmetic on zx_addr_t behaves as region programming will
+       need it to: an aligned address is left alone, and an unaligned one is
+       brought DOWN rather than up.  Down, because a region must not start
+       before the memory the manifest declared.
 
-    /* Alignment behaves as the region programming will need it to: an aligned
-       base is left alone, and an under-aligned one is brought down rather
-       than up.  Down, because a region must not start before the memory the
-       manifest declared.  */
-    ZX_CHECK_EQ(zx_test_align_down_to_granule((zx_addr_t)0x80000000U),
+       This exercises the type and the ZX_NODISCARD declaration above; the
+       GRANULE itself belongs to the manifest and is asserted by the manifest
+       suite.  zx_api.h is deliberately tested with no other ZoneX header
+       included, which is what makes it evidence that the header stands
+       alone.  */
+    ZX_CHECK_EQ(zx_test_align_down((zx_addr_t)0x80000000U, 64U),
                 (zx_addr_t)0x80000000U);
-    ZX_CHECK_EQ(zx_test_align_down_to_granule((zx_addr_t)0x8000003FU),
+    ZX_CHECK_EQ(zx_test_align_down((zx_addr_t)0x8000003FU, 64U),
                 (zx_addr_t)0x80000000U);
-    ZX_CHECK_EQ(zx_test_align_down_to_granule((zx_addr_t)0x80000040U),
+    ZX_CHECK_EQ(zx_test_align_down((zx_addr_t)0x80000040U, 64U),
                 (zx_addr_t)0x80000040U);
 
     /* zx_addr_t and zx_size_t must be able to express a limit computed as

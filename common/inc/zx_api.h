@@ -183,16 +183,6 @@ typedef uintptr_t zx_addr_t;
    what makes (base + size - 1) safe to compute as a limit.  */
 typedef uintptr_t zx_size_t;
 
-/* PMSAv8-R programs a region as a base and an inclusive limit, both of which
-   must be aligned to the 64-byte granule.  An under-aligned base does not
-   fault: its low bits land on the SH, AP and XN fields of HPRBAR and silently
-   change the region's attributes.  An unmasked limit is worse -- (base + size
-   - 1) ends in 0x3F, which lands on HPRLAR's AttrIndx field and selects an
-   unwritten MAIR byte.  Both traps were paid for at EL1 during the
-   Cortex-R52 Modules port work, and are repeated here because they apply
-   unchanged at stage 2.  */
-#define ZX_MPU_GRANULE      64U
-
 /* The C17 baseline is a project decision (docs/decisions.md D12), not an
    accident of whichever compiler happens to be installed.  Asserting it here
    means a build that quietly fell back to an older standard fails at the first
