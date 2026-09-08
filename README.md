@@ -40,17 +40,44 @@ isolation cases in one run — seven in each direction, each aimed at an address
 of its own — and measures the critical partition's window period continuously
 while the untrusted one is steered through five behaviours: idle, computing,
 computing with its own interrupts masked, storming the console, and violating
-its boundary on every iteration of its own loop. On the board A's period is
-800,000 counter counts and moves by **nine** counts while its neighbour idles,
-**fifteen** while it computes with interrupts masked, and **sixty-nine** while
-it commits a hundred and seventeen thousand boundary violations.
+its boundary on every iteration of its own loop.
 
-Nothing a partition does *through the schedule* reaches its neighbour. One
-thing does, and it is the hypervisor's own doing: a guest's console is one
-hypercall per character through a polled UART, and a window that ends with a
-partial line has that line closed by the boundary handler — which delays the
-next partition's entry by 24,000 counts. It is measured, bounded by one line
-of output, and the fix is to buffer the console off that path.
+On the board A's window period is 800,000 counts of an 8 MHz counter. Over six
+hundred major frames it moves by **21** counts while its neighbour idles,
+**21** while that neighbour computes, **22** while it computes with IRQ and FIQ
+masked, and **304** while it commits a hundred and three thousand boundary
+violations.
+
+**One thing does reach a neighbour, and it is the hypervisor's own doing.** In
+the same run, the phase where the untrusted partition storms the console moves
+A's period by **17,830** counts.
+
+Nothing a partition does *through the schedule* reaches its neighbour — the
+figures above are tens of counts, against a violation count in six figures.
+What reaches it is ZoneX's console driver. A guest's console is one hypercall
+per character, answered at EL2 with `PSTATE.F` set, so the FIQ that ends a
+window waits for it. Nearly every one of those hypercalls writes the single
+byte the guest asked for. **The one that opens a line writes twenty-two** —
+the newline a deferred close still owed, the tag naming the partition, and the
+guest's own character — and that is 106,214 core cycles, 2.2 ms, about
+**17,640 counts**, with the boundary interrupt held off throughout.
+
+**That is a defect in ZoneX, not a limit of the partitioning**, and it is
+bounded, derived and reproducible. The bound is one line tag: a period is a
+difference between two window entries, so a constant deferral cancels in it
+and only a *change* reaches the number — one long period and one short
+correction, 35,280 counts against a half-window bound of 40,000. Every other
+phase is held to one eighth of a window.
+
+It is also not rare, and that took finding out. Runs that once looked clean
+were runs where the phase relationship between a fixed schedule and a guest
+printing a fixed message happened to keep the boundary out of a tag; adding
+two cycle-counter reads per character, under one per cent of a character time,
+moved that phase and the excursion appeared on every run. **What removes it is
+a console the hypervisor can hand a byte to without waiting for the wire** —
+an interrupt-driven driver with a polled fallback the fault path can force,
+because the fault reporter prints at the moment ZoneX has already failed once.
+That is named and costed in `docs/wcet-inputs.md`, and it is not done.
 
 Three results, and these are mechanisms rather than measurements — they do not
 move when the numbers below do:
@@ -82,11 +109,13 @@ frequency was established three independent ways, so it does not depend on the
 core clock, the caches or the optimisation level.
 
 **And one measurement, which will change.** A partition switch costs **about
-6,000 cycles** on the S32Z280 — 6,030 / 6,078 / 6,370 min / mean / max on the
-most recent run — and the guest's own EL1 MPU is 85% of it, on both a
-32-region model and a 20-region part. A switch is not expensive because the
-hypervisor does much; its per-partition state is three register writes. It is
-expensive because a guest has a lot of registers.
+6,000 cycles** on the S32Z280 — 5,662 / 5,705 / 5,964 min / mean / max on the
+most recent run, with the mean spanning 5,705 to 6,078 across five readings
+taken on this bench over a week. The guest's own EL1 MPU is **3,407 of those
+5,705** — 85% of the save and restore, and 60% of the whole switch. A switch is
+not expensive because the hypervisor does much; its per-partition state is
+three register writes. It is expensive because a guest has a lot of registers,
+and most of them are its memory protection unit.
 
 **Read that as ±4%, not as four significant figures.** The same code
 re-measured a day later, on the same bench, reads 3% higher — and the two
@@ -154,16 +183,82 @@ Phase 0 is a partitioning demonstrator with a deliberately small scope:
 
 Targets are the Armv8-R AEM FVP and the NXP S32Z280-594EVB.
 
-### What Phase 0 will prove, and what it will not
+### The region budget, and where this port will not fit
 
-The demonstrator runs on a Cortex-R52 in **lockstep**. On that configuration it
-demonstrates **memory isolation and temporal determinism on one logical core**.
+ZoneX's isolation is region descriptors in the EL2 MPU, and they are the scarce
+resource. **Check this number against your part before you choose a board.**
 
-It does **not** demonstrate spatial partitioning across cores; that requires
-split-mode SMP and is deferred to a later phase. Interrupt virtualisation with
-a certified worst-case execution time, inter-partition communication, the full
-time-partition scheduler, TraceX integration, supervised partition restart and
-the safety package are likewise later phases, and are not in Phase 0.
+`HMPUIR[7:0]` gives the EL2 region count, and on a Cortex-R52 the
+architecturally permitted values are **0, 16, 20 or 24**. Measured:
+
+| | EL2 regions | ZoneX's own MMIO | the two-partition demonstrator |
+|---|---|---|---|
+| S32Z280-594EVB | 20 | 2 | 4 of 20 |
+| Armv8-R AEM FVP | 32 | 0 | 2 of 32 |
+
+Three consequences, and the first decides a board.
+
+* **A Cortex-R52 configured with no EL2 MPU cannot run ZoneX at all.** Zero is
+  a legal `HMPUIR` value, and there is no software fallback: on Armv8-R there
+  are no page tables at either stage of translation, <!-- zx-terminology-allow -->
+  so the region MPU is the only memory control there is. A part with 16 will
+  run ZoneX with less headroom than this bench.
+* **The hypervisor's own MMIO is not free, and its cost is a property of the
+  board rather than of ZoneX.** On the S32Z280 the console and the GIC both
+  fall in the background map's Normal write-through band, not the Device band,
+  and a memory-mapped device reached with cacheable attributes is not a working
+  peripheral. Each therefore costs a Device-attributed EL2 region. On the FVP
+  both sit in the Device band and cost nothing — so **the model cannot show you
+  this constraint**, and it reports 32 regions, which is not a legal Cortex-R52
+  value at either stage.
+* **A region must also be reachable by the switch.** A partition switch enables
+  and disables region sets with one write to `HPRENR`, whose implemented width
+  is a property of the part — `0x000fffff`, all 20 bits, on this board. A
+  region seated past that mask would be programmed with its own enable bit set
+  and left there, so the outgoing partition's window would stay live under the
+  incoming one with nothing to fault on. ZoneX checks the count and the mask
+  separately at boot and refuses to start if the layout does not fit both.
+
+The manifest allows four partitions of six regions each, static-asserted
+against 24. That ceiling is a build-time constant; the boot-time check against
+the real `HMPUIR` and `HPRENR` is what holds it to account on a given part.
+
+### What Phase 0 demonstrates, and what it does not
+
+Two ThreadX kernels run at EL1 on one logical Cortex-R52 core, each confined to
+its own stage-2 window, time-sharing the core under a static major frame taken
+from a manifest. Neither can read, write or execute the other's memory or the
+hypervisor's — not even after granting itself that memory in its own EL1 MPU. A
+violation is caught by the stage-2 MPU at EL2 and reported with the partition,
+the address and the guest PC, and the system halts. Each partition's virtual
+time advances only inside its own windows.
+
+**Nothing a partition does through the schedule reaches its neighbour.**
+Computing, masking its own interrupts and violating its boundary without pause
+each move the critical partition's period by tens of counts.
+
+**What reaches it is the hypervisor's own console driver.** A guest that prints
+moves that period by up to one line tag — 22 bytes at 115,200 8N1, 17,640
+counts of the board's 8 MHz counter — every run. That is a defect in ZoneX, not
+a limit of the partitioning, and it is bounded, derived and reproducible.
+
+And what it does not demonstrate.
+
+The demonstrator runs on a Cortex-R52 in **lockstep**, which presents as **one
+logical core**, so this is temporal and memory partitioning on a single core.
+It is **not** spatial partitioning across multiple cores; that needs split-mode
+SMP and is deferred.
+
+**Interrupt latency is not measured at all.** Guest interrupts go straight to
+EL1 and cost what they always did; bounding them needs the GIC List Registers
+this core has and this phase does not use. Interrupt virtualisation with a
+bounded worst-case latency, inter-partition communication, the full
+time-partition scheduler, supervised partition restart, TraceX integration and
+the safety-artifact package are later phases and are not in Phase 0.
+
+Every timing figure above comes from one part on one bench, with the EL2 caches
+off, built `-Og`, and with no clock tree configured. Read them as a first
+measurement with its conditions stated, not as characterisation.
 
 We state this plainly because the audience for this work is safety-savvy, and
 because an overclaimed demonstrator is worth less than an honest one.
