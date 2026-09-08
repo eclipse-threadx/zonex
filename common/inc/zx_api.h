@@ -100,10 +100,23 @@ extern "C" {
 /* Version identification.  ZoneX follows the suite-wide scheme described in
    CONTRIBUTING.md, "Release model and support".  Phase 0 is pre-release and
    carries a 0 major deliberately: the interfaces below are expected to change
-   until the demonstrator is complete.  */
+   until the demonstrator is complete.
+
+   ZX_BUILD_VERSION is the suite's YYYYQQ form: the year followed by the
+   QUARTER of publication, not the month.  202603 is the THIRD QUARTER of
+   2026, and the neighbouring components carry the same shape -- 202602 is
+   Q2.  Worth stating outright in the header a reader reaches first, because
+   the value reads as a month, a month would be accepted silently, and it
+   would be wrong by two quarters.  The host suite range-checks it.
+
+   ZX_HOTFIX_VERSION is a CHARACTER, and a space means no hotfix.  A letter
+   appears only when one is issued against a build that is already
+   published, and hotfixes are component-specific rather than suite-wide.  */
 #define ZX_MAJOR_VERSION    0
 #define ZX_MINOR_VERSION    1
 #define ZX_PATCH_VERSION    0
+#define ZX_BUILD_VERSION    202603
+#define ZX_HOTFIX_VERSION   ' '
 
 /**************************************************************************/
 /*                          Fundamental types                             */

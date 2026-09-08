@@ -88,4 +88,22 @@ ZX_TEST_MAIN("zx_api",
        deliberately 0.x, and something that bumped the major without meaning
        to should be visible here rather than only in a release note.  */
     ZX_CHECK_EQ(ZX_MAJOR_VERSION, 0);
+
+    /* The build number is YYYYQQ -- the year then the QUARTER.  A value
+       carrying a MONTH is the mistake this shape invites: 202609 for
+       September would satisfy every other property a version has, and be
+       wrong by two quarters.  So the quarter is range-checked rather than
+       the whole value pinned, which would need editing every release and
+       would then be edited without being read.
+
+       The lower bound is Q3 2025, when the project adopted the quarterly
+       model -- see CONTRIBUTING.md, "Release cadence".  */
+    ZX_CHECK(ZX_BUILD_VERSION >= 202503);
+    ZX_CHECK((ZX_BUILD_VERSION % 100) >= 1);
+    ZX_CHECK((ZX_BUILD_VERSION % 100) <= 4);
+
+    /* A space means no hotfix; anything else is a letter.  A digit here
+       would mean somebody had treated it as a number.  */
+    ZX_CHECK((ZX_HOTFIX_VERSION == ' ')
+             || ((ZX_HOTFIX_VERSION >= 'a') && (ZX_HOTFIX_VERSION <= 'z')));
 })
