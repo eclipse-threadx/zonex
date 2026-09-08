@@ -73,7 +73,7 @@ static void set_region(ZX_REGION *region_ptr, zx_addr_t base, zx_addr_t limit,
     region_ptr->zx_region_ap         = ZX_AP_EL2_RW_GUEST_RW;
     region_ptr->zx_region_xn         = xn;
     region_ptr->zx_region_sh         = ZX_SH_NON_SHAREABLE;
-    region_ptr->zx_region_attr_index = 0U;
+    region_ptr->zx_region_attr_index = (UCHAR)ZX_ATTR_NORMAL_WB;
 }
 
 /* The known-good partition, rebuilt before every case.  Region 0 is

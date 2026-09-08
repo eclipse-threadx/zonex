@@ -97,6 +97,26 @@ extern "C" {
    that reason.  */
 #define ZX_ATTR_INDEX_COUNT         8U
 
+/* The memory types a manifest may name, and THE INDEX EACH ONE OCCUPIES IS A
+   CONTRACT EVERY PORT MUST KEEP.  A port is free to choose the attribute
+   byte that expresses "Normal, write-back" on its hardware; it is not free
+   to put it at a different index, because a manifest names the index.
+
+   These live here rather than in a port for the same reason the AP, XN and
+   SH encodings do: the port programs what a manifest declares, so the
+   vocabulary belongs to the manifest.  The host-side validator has to build
+   and check the same descriptors with no port header in reach, and until
+   this moved it could not name a memory type at all -- test/host wrote a
+   bare 0 where it meant Normal write-back.
+
+   A port binds itself to this with _Static_assert over the register values
+   it programs; see platform/cortex_r52/src/zx_stage2_mpu.c.  Index 3 and
+   above are deliberately unnamed: they are inside ZX_ATTR_INDEX_COUNT, no
+   port programs them, and the validator refuses a region that names one.  */
+#define ZX_ATTR_NORMAL_WB           0x00U   /* Normal, write-back, RW-alloc */
+#define ZX_ATTR_DEVICE              0x01U   /* Device-nGnRnE               */
+#define ZX_ATTR_NORMAL_NC           0x02U   /* Normal, non-cacheable       */
+
 /**************************************************************************/
 /*                            Region descriptor                           */
 /**************************************************************************/

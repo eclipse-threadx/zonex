@@ -229,6 +229,41 @@ static uint32_t zx_read_hprlar(void)
 /*  are on.                                                                */
 /**************************************************************************/
 
+/* THIS PORT BINDING ITSELF TO THE MANIFEST'S CONTRACT.  zx_manifest.h fixes
+   which INDEX each memory type occupies, because a manifest names the index;
+   this port chooses the BYTE that expresses that type on Cortex-R52.  The
+   two have to agree, and nothing above checks that they do -- a byte moved
+   to the wrong index would give every region naming that type the wrong
+   memory attribute, silently, with the validator satisfied and the hardware
+   not objecting.  Each assertion extracts the byte the register value
+   actually carries at the contracted index and compares it.
+
+   Written as extraction from ZX_HMAIR0_VALUE rather than as a restatement of
+   it: a restatement would be a second copy of the same number, and the two
+   would drift together.  */
+/* Every type this port names sits in HMAIR0, so all three indices are below
+   4.  Checked FIRST because the extraction below depends on it: an index of
+   4 or more is an HMAIR1 byte, and this port programs HMAIR1 as zero.  */
+_Static_assert((ZX_ATTR_NORMAL_WB < 4U) && (ZX_ATTR_DEVICE < 4U)
+                   && (ZX_ATTR_NORMAL_NC < 4U),
+               "a named memory type moved into HMAIR1, which this port "
+               "programs as zero; the byte checks below read HMAIR0");
+
+/* The index is masked to 0-3 inside the shift so that the expression stays a
+   constant expression whatever the index is.  Without the mask an index of 4
+   shifts a uint32_t by 32, which is undefined, and the compiler reports THAT
+   instead of the assertion above -- a worse diagnostic for the same bug.  */
+#define ZX_MAIR0_BYTE_AT(idx)   (((ZX_HMAIR0_VALUE) >> (8U * ((idx) & 3U))) \
+                                 & 0xFFU)
+
+_Static_assert(ZX_MAIR0_BYTE_AT(ZX_ATTR_NORMAL_WB) == ZX_MAIR_BYTE_NORMAL_WB,
+               "HMAIR0 does not carry Normal write-back at ZX_ATTR_NORMAL_WB");
+_Static_assert(ZX_MAIR0_BYTE_AT(ZX_ATTR_DEVICE) == ZX_MAIR_BYTE_DEVICE,
+               "HMAIR0 does not carry Device-nGnRnE at ZX_ATTR_DEVICE");
+_Static_assert(ZX_MAIR0_BYTE_AT(ZX_ATTR_NORMAL_NC) == ZX_MAIR_BYTE_NORMAL_NC,
+               "HMAIR0 does not carry Normal non-cacheable at "
+               "ZX_ATTR_NORMAL_NC");
+
 void zx_mair_program(void)
 {
     uint32_t mair0 = ZX_HMAIR0_VALUE;

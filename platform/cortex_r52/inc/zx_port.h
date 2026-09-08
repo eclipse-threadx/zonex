@@ -215,9 +215,10 @@
    enough to pass a careless test.  Programming every index ZoneX names means
    a wrong index produces a WRONG ATTRIBUTE rather than a plausible one.  */
 
-#define ZX_ATTR_NORMAL_WB       ZX_C32(0x0)     /* Normal, write-back, RW-alloc */
-#define ZX_ATTR_DEVICE          ZX_C32(0x1)     /* Device-nGnRnE                */
-#define ZX_ATTR_NORMAL_NC       ZX_C32(0x2)     /* Normal, non-cacheable        */
+/* The INDICES are not defined here.  They are a manifest's vocabulary and
+   they live in core/inc/zx_manifest.h as ZX_ATTR_NORMAL_WB and friends; what
+   belongs to this port is the byte each index has to hold on this hardware,
+   below, and the assertions in zx_stage2_mpu.c that bind the two.  */
 
 #define ZX_MAIR_BYTE_NORMAL_WB  ZX_C32(0xFF)
 #define ZX_MAIR_BYTE_DEVICE     ZX_C32(0x00)
