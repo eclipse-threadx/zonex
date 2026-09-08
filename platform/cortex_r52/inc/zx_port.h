@@ -1403,6 +1403,25 @@ typedef struct ZX_FRAME_STRUCT
     UINT                zx_frame_stopped_index;
     uint32_t            zx_frame_stop_outcome;
 
+    /* HOW LATE THE BOUNDARY ITSELF WAS, which is a different question from
+       how long the switch took and is the one a printing neighbour can
+       answer badly.  The comparator holds an ABSOLUTE deadline, so a
+       boundary that arrives after it was deferred -- and the only thing at
+       EL2 that defers one is EL2 itself, running with FIQ masked.
+
+       Measured as the physical count at the top of the boundary handler
+       minus the deadline the ending window was armed with.  It therefore
+       includes the vector entry, which is a constant, and the deferral,
+       which is not.  Min as well as max, because the two together say
+       whether a run's lateness is a steady offset or something that moves:
+       a constant lateness costs a partition's PERIOD nothing at all, since
+       a period is a difference between two entries and a constant cancels
+       in it.  What a period sees is the CHANGE.  */
+
+    uint32_t            zx_frame_late_min;
+    uint32_t            zx_frame_late_max;
+    uint32_t            zx_frame_late_count;
+
     /* The per-major-frame hook, and the frame count it was last called at.
        See zx_frame_set_frame_hook: this is how a regression divides one run
        into phases, and it is called OUTSIDE the timed bracket so that it
@@ -1441,6 +1460,15 @@ ZX_NODISCARD uint32_t zx_frame_run(ZX_FRAME *frame_ptr);
    resume, or a null pointer when the frame is over.  Not called from C. */
 
 ZX_NODISCARD ZX_GUEST_CONTEXT *zx_el2_window_boundary(void);
+
+/* Read the boundary lateness recorded since the last call, and reset it.
+   Read-and-reset rather than read, so that a caller dividing a run into
+   phases gets each phase's own worst case instead of a high-water mark the
+   first phase set and every later one inherited.  Writes zero to all three
+   when no boundary has been timed.  */
+
+void zx_frame_lateness_take(ZX_FRAME *frame_ptr, uint32_t *min_ptr,
+                            uint32_t *max_ptr, uint32_t *count_ptr);
 
 /* Where the boundary handler leaves the reason a frame ended, because the
    vector it runs in has no caller to return one to.  */
@@ -1664,6 +1692,13 @@ void zx_board_init(void);
 
 ZX_NORETURN void zx_el2_hypervisor_fault(void);
 ZX_NORETURN void zx_el2_unexpected_vector(void);
+
+/* The guest console hypercall, answered in the trap vector.  Wraps the
+   portable tagging code with the one measurement the port is in a position
+   to take: how long this call held FIQ masked, which is how long a window
+   boundary can be deferred by a partition that prints.  See zx_console.h. */
+
+void zx_el2_guest_console_hypercall(char character);
 
 #ifdef __cplusplus
 }

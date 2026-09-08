@@ -128,7 +128,26 @@ static void zx_guest_console_close_owed_line(void)
 
 static void zx_guest_console_tag(void)
 {
-    /* THE DEBT IS PAID BEFORE THE TAG, by the party about to speak.  A
+    /* THIS IS THE EXPENSIVE HYPERCALL, and on a target with a polled
+       console it is the only expensive one.  Every other character a guest
+       prints is one byte; the one that opens a line is the owed newline,
+       the tag below and the character itself -- twenty-two bytes on the
+       wire of the S32Z280-594EVB, 2.2 ms at 115,200 8N1, all of it at EL2
+       with FIQ masked because a hypercall is an exception to EL2.  A window
+       boundary that falls inside it is deferred for the rest of it, and
+       that is the whole of what a neighbour who PRINTS costs the critical
+       partition: measured at 17,640 counts of that board's 8 MHz counter,
+       every run.  See zx_console_bound in the regression image for the
+       measurements and docs/decisions.md for what it costs the claim.
+
+       NOTHING HERE IS THE PLACE TO FIX IT.  The tag cannot be shortened
+       without changing the contract, and it cannot be split across
+       hypercalls without letting another partition's tag into the middle of
+       a line.  What removes it is a console the hypervisor can hand a byte
+       to without waiting for the wire, which is a driver and not a tagging
+       rule.
+
+       THE DEBT IS PAID BEFORE THE TAG, by the party about to speak.  A
        partition that handed the console back mid-sentence left a line open;
        whoever opens the next one closes it first, so no two partitions ever
        share a physical line and no tag is ever written into the middle of

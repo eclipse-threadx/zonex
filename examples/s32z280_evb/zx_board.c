@@ -103,6 +103,31 @@
 
 #define ZX_LINFLEXD_GUARD       100000U
 
+/* AND BOUNDED BY TIME AS WELL, which is the bound that means anything.
+   Every spin in this file runs at EL2 with FIQ masked, so what it costs is
+   what a partition's window boundary can be DEFERRED by -- and an iteration
+   count cannot be compared with a window, a deadline, or anything else a
+   schedule is built out of.  Ten character times is the same rule
+   docs/decisions.md D28 already uses for the jitter bound: ten times the
+   worst legitimate case, which for a transmitter is the one character it is
+   sending.
+
+   BOTH BOUNDS ARE KEPT, and that is deliberate rather than belt-and-braces.
+   The time bound is the one a WCET argument reads; the iteration bound is
+   what survives a counter that is not running, which would otherwise turn
+   the time bound into the infinite loop it was introduced to remove.  This
+   is the same pair, for the same reason, as zx_el2_dwell.  */
+
+#define ZX_LINFLEXD_BAUD        115200U
+#define ZX_LINFLEXD_CHAR_BITS   10U     /* 8N1: start + eight data + stop */
+#define ZX_LINFLEXD_SPIN_CHARS  10U
+
+#define ZX_LINFLEXD_SPIN_COUNTS                                             \
+    ((uint32_t)((((uint64_t)ZX_S32Z_SYSTEM_COUNTER_HZ                       \
+                  * (uint64_t)(ZX_LINFLEXD_CHAR_BITS                        \
+                               * ZX_LINFLEXD_SPIN_CHARS))                   \
+                 / (uint64_t)ZX_LINFLEXD_BAUD)))
+
 #define ZX_LINFLEXD_IBRR_115200 21U
 #define ZX_LINFLEXD_FBRR_115200 11U
 
@@ -112,6 +137,28 @@
    header and docs/decisions.md D2.  */
 
 #define ZX_S32Z_MMIO_REGIONS    2U
+
+/* THE TWO SPINS IN THE CHARACTER WRITE, AT THEIR WORST.  Both are below in
+   zx_board_console_putc and neither had ever been measured: the first waits
+   for the byte to go out and is a character time by construction, and the
+   second waits for a write-one-to-clear flag to de-assert and is bounded by
+   an ITERATION COUNT, which is not a bound anything can reason about in
+   time.  The whole write happens at EL2 with FIQ masked, so what these cost
+   is what a window boundary can be deferred by.
+
+   A counter and a comparison per iteration, and nothing else: the loops
+   they instrument are each an MMIO read of a peripheral on another clock
+   domain, so the increment is lost in the noise of the thing it counts.  */
+
+static uint32_t zx_console_spin_high;
+static uint32_t zx_console_guard_high;
+
+/* AND EVERY BYTE THIS DRIVER HAS PUT ON THE WIRE.  Counted here rather than
+   where the string is handed over, because those two numbers are not the
+   same: a newline is ONE character to a caller and TWO bytes on the wire,
+   and it is the wire that costs the time.  */
+
+static uint32_t zx_console_bytes;
 
 /**************************************************************************/
 /*  zx_linflexd_configure_once                                            */
@@ -201,11 +248,16 @@ void zx_board_console_init(void)
 void zx_board_console_putc(char character)
 {
     uint32_t guard;
+    uint32_t spins = 0U;
+    uint32_t used;
+    uint64_t deadline;
 
     if (character == '\n')
     {
         zx_board_console_putc('\r');
     }
+
+    zx_console_bytes++;
 
     /* Start the byte, wait for completion, clear the flag, then wait for the
        clear to actually take effect.
@@ -229,20 +281,82 @@ void zx_board_console_putc(char character)
     /* Polled on purpose: this console runs before any interrupt controller
        is configured, and it must work inside a fault handler.  */
 
-    while ((ZX_REG32(ZX_CONSOLE_BASE + ZX_LINFLEXD_UARTSR) & ZX_UARTSR_DTF)
-           == 0U)
+    /* THE DEADLINE IS TAKEN ONCE, before either spin, and both share it:
+       what the two of them cost together is what defers a boundary, so a
+       bound given to each separately would bound neither.  */
+
+    deadline = zx_read_cntpct() + (uint64_t)ZX_LINFLEXD_SPIN_COUNTS;
+
+    guard = ZX_LINFLEXD_GUARD;
+
+    while (((ZX_REG32(ZX_CONSOLE_BASE + ZX_LINFLEXD_UARTSR) & ZX_UARTSR_DTF)
+            == 0U)
+           && (guard > 0U) && (zx_read_cntpct() < deadline))
     {
         /* wait for this byte to go out */
+        guard--;
+        spins++;
     }
 
     ZX_REG32(ZX_CONSOLE_BASE + ZX_LINFLEXD_UARTSR) = ZX_UARTSR_DTF;
 
     guard = ZX_LINFLEXD_GUARD;
     while (((ZX_REG32(ZX_CONSOLE_BASE + ZX_LINFLEXD_UARTSR) & ZX_UARTSR_DTF)
-            != 0U) && (guard > 0U))
+            != 0U) && (guard > 0U) && (zx_read_cntpct() < deadline))
     {
         guard--;
     }
+
+    /* Both maxima updated AFTER the write rather than inside either loop,
+       so that the branch a new high costs is paid once per character and
+       not once per iteration.  */
+
+    if (spins > zx_console_spin_high)
+    {
+        zx_console_spin_high = spins;
+    }
+
+    used = ZX_LINFLEXD_GUARD - guard;
+
+    if (used > zx_console_guard_high)
+    {
+        zx_console_guard_high = used;
+    }
+}
+
+
+/**************************************************************************/
+/*  zx_board_console_spin_max, zx_board_console_guard_max                 */
+/*                                                                        */
+/*  What the two spins above reached, in ITERATIONS, since the last reset. */
+/*  Iterations rather than time because that is what the loops are written */
+/*  in; converting one to the other is the caller's job and needs a        */
+/*  measured cost per iteration, which is exactly the thing a bound        */
+/*  expressed in iterations does not give anybody.                        */
+/**************************************************************************/
+
+uint32_t zx_board_console_spin_max(void)
+{
+    return zx_console_spin_high;
+}
+
+
+uint32_t zx_board_console_bytes(void)
+{
+    return zx_console_bytes;
+}
+
+
+uint32_t zx_board_console_guard_max(void)
+{
+    return zx_console_guard_high;
+}
+
+
+void zx_board_console_spin_reset(void)
+{
+    zx_console_spin_high  = 0U;
+    zx_console_guard_high = 0U;
 }
 
 

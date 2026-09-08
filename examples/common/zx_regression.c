@@ -333,6 +333,41 @@ typedef struct ZX_PHASE_RECORD_STRUCT
 
     uint32_t    zx_phase_violations;
 
+    /* WHAT THE HYPERVISOR'S OWN CONSOLE COST DURING THE PHASE, which is
+       the one perturbation in this run that is ZoneX's doing rather than
+       the partitioning's.  Every one of these is a maximum over the phase
+       and is reset at its boundary, so that a phase's worst case is its
+       own and not the boot's.
+
+       THE FIRST TWO ARE THE MECHANISM.  A guest's console is one hypercall
+       per character, answered at EL2 with FIQ masked, so the longest
+       hypercall is the longest a window boundary can be DEFERRED -- and
+       the character count is what says whether that hypercall wrote the
+       one character the guest asked for or a line tag as well.
+
+       THE NEXT TWO ARE THE BOARD DRIVER'S TWO SPINS, in iterations: the
+       wait for the byte to go out, and the wait for the write-one-to-clear
+       flag to de-assert afterwards.  The second was the leading suspect
+       before any of this was measured, and an iteration count is not a
+       bound a WCET argument can use, so it is reported next to the thing
+       it was suspected of causing.
+
+       AND THE LAST TWO ARE THE CONSEQUENCE, measured directly: how late
+       the window boundary arrived against the absolute deadline it was
+       armed with.  Min as well as max, because a lateness that is constant
+       costs a PERIOD nothing -- a period is a difference between two
+       entries and a constant cancels in it.  What a period sees is the
+       spread between these two.  */
+
+    uint32_t    zx_phase_hvc_cycles;
+    uint32_t    zx_phase_hvc_chars;
+    uint32_t    zx_phase_hvc_calls;
+    uint32_t    zx_phase_spin_max;
+    uint32_t    zx_phase_guard_max;
+    uint32_t    zx_phase_late_min;
+    uint32_t    zx_phase_late_max;
+    uint32_t    zx_phase_late_count;
+
 } ZX_PHASE_RECORD;
 
 static ZX_PHASE_RECORD  zx_phase[ZX_PHASE_COUNT];
@@ -766,6 +801,25 @@ static void zx_close_phase(uint32_t index)
     zx_phase[index].zx_phase_violations =
         zx_context[ZX_PART_B].zx_ctx_violations - zx_phase_violations_at_start;
     zx_phase_violations_at_start = zx_context[ZX_PART_B].zx_ctx_violations;
+
+    /* AND WHAT THE CONSOLE COST, taken and reset together so that the next
+       phase starts from nothing.  Read here rather than at the end of the
+       run because the question these answer is which PHASE paid, and a
+       high-water mark over a whole run cannot say.  */
+
+    zx_phase[index].zx_phase_hvc_cycles = zx_console_hvc_cycles_max();
+    zx_phase[index].zx_phase_hvc_chars  = zx_console_hvc_characters_max();
+    zx_phase[index].zx_phase_hvc_calls  = zx_console_hvc_calls();
+    zx_console_hvc_measure_reset();
+
+    zx_phase[index].zx_phase_spin_max  = zx_board_console_spin_max();
+    zx_phase[index].zx_phase_guard_max = zx_board_console_guard_max();
+    zx_board_console_spin_reset();
+
+    zx_frame_lateness_take(&zx_frame,
+                           &zx_phase[index].zx_phase_late_min,
+                           &zx_phase[index].zx_phase_late_max,
+                           &zx_phase[index].zx_phase_late_count);
 }
 
 
@@ -1199,61 +1253,78 @@ static uint64_t zx_jitter_bound(void)
 /*  Measured on the S32Z280-594EVB; invisible on the model, whose console */
 /*  is semihosting and costs the simulation no time at all.               */
 /*                                                                        */
-/*  HALF OF THE MECHANISM IS NOW GONE AND HALF IS NOT, and the difference */
-/*  between them is worth more than either number.                        */
+/*  THE MECHANISM, NAMED AND MEASURED.  A guest's console is one          */
+/*  hypercall per character and the hypervisor answers it at EL2 with FIQ */
+/*  masked, so the boundary interrupt that ends a partition's window is   */
+/*  deferred for as long as that hypercall takes.  Nearly every one of    */
+/*  them writes the single byte the guest asked for.  THE ONE THAT OPENS  */
+/*  A LINE WRITES TWENTY-TWO: the newline a deferred close left owed (CR  */
+/*  and LF), the tag that says which partition is speaking, and then the  */
+/*  guest's own character.  At 115,200 8N1 that is 22 x 694 counts of     */
+/*  wire time; measured end to end it is 106,216 to 106,352 core cycles   */
+/*  over six runs -- 2.2 ms, about 17,640 counts of this board's 8 MHz    */
+/*  counter.                                                             */
 /*                                                                        */
-/*  GONE: THE LINE CLOSED AT THE WINDOW BOUNDARY.  A guest's console is   */
-/*  one hypercall per character through a polled UART, and a window that  */
-/*  ended mid-sentence had that line closed by the BOUNDARY HANDLER --    */
-/*  CR and LF, at EL2, with FIQ masked, on the switch path, and back to   */
-/*  back, which is the exact case the board driver's DTF-clear guard      */
-/*  exists for.  It cost 24,420 counts over sixty frames and 24,584 over  */
-/*  six hundred, EVERY RUN.  The newline is now deferred to whoever       */
-/*  speaks next, inside a window that party owns; the characters and      */
-/*  their order are unchanged and only the moment of the write moves,     */
-/*  which the host suite asserts directly.  Afterwards, over sixty        */
-/*  frames, three consecutive runs: 999, 1,159, 1,196.  A sixty-frame run */
-/*  no longer sees this at all.                                           */
+/*  The image measures all of this on the run it reports: the longest     */
+/*  hypercall in cycles, how many bytes it wrote, and -- directly -- how  */
+/*  late each window boundary arrived against the absolute deadline it    */
+/*  was armed with.  In the console phase that lateness runs 45 to some   */
+/*  9,300 counts; in every other phase it is 45 to 48.                    */
 /*                                                                        */
-/*  NOT GONE: A RARE EXCURSION OF ABOUT 15,300 COUNTS.  Over SIX HUNDRED  */
-/*  frames, seven runs across three builds of this file, gave 1,169;      */
-/*  1,169; 1,204; 1,236 -- and 30,615; 30,639; 30,689.  The large ones    */
-/*  are one long period and one short correction of some 15,300 each, so  */
-/*  they are ONE event in ninety-nine, in roughly two runs in five.  Four */
-/*  consecutive clean runs said it had gone; the fifth said it had not,   */
-/*  and the fifth is the one to believe.                                  */
+/*  THE LEADING SUSPECT WAS WRONG, and it is worth recording which one.   */
+/*  The board driver spins on a write-one-to-clear flag after each byte,  */
+/*  under a guard of a hundred thousand iterations, and a partial spin of */
+/*  it was the obvious candidate.  IT HAS NEVER SPUN AT ALL: the maximum  */
+/*  is zero iterations, in every phase of every run. The other spin --    */
+/*  the wait for the byte to go out, which had no bound whatsoever --     */
+/*  reaches 32.  Both are now bounded by TIME as well as by iterations.   */
 /*                                                                        */
-/*  It is NOT the boundary handler, which now writes nothing.  What is    */
-/*  left on the console path is the HYPERCALL: every character is still   */
-/*  written at EL2 with FIQ masked, and the driver then spins on a        */
-/*  write-one-to-clear flag under a guard of a hundred thousand           */
-/*  iterations.  A partial spin of that guard is the right order of       */
-/*  magnitude and is the first place to look.  It is not confirmed, and   */
-/*  naming a mechanism to go with a number before measuring it is how a   */
-/*  guess becomes a fact in somebody else's document.                     */
+/*  AND THE RESIDUAL WAS NEVER RARE.  Before this was instrumented, seven */
+/*  six-hundred-frame runs gave 1,169; 1,169; 1,204; 1,236 -- and 30,615; */
+/*  30,639; 30,689, which read as one event in ninety-nine appearing in   */
+/*  two runs in five.  It is not an event.  The deferral is very nearly   */
+/*  CONSTANT, and a period is a difference between two entries, so a      */
+/*  constant deferral cancels in it and only a CHANGE reaches the number  */
+/*  above.  Whether a boundary lands inside a line tag is decided by the  */
+/*  phase relationship between a fixed schedule and a guest printing a    */
+/*  fixed message -- and adding two cycle-counter reads per character,    */
+/*  under one per cent of a character time, moved that phase and made the */
+/*  excursion reproducible on EVERY run: 17,889; 17,963; 18,101; 17,943;  */
+/*  18,141; 18,327 over six.  The bound was always one line tag.  The     */
+/*  four quiet runs were luck, and they are the reason this file warns    */
+/*  against setting this bound from what a short run measures.           */
 /*                                                                        */
-/*  THE BOUND IS HALF A WINDOW, unchanged, and it is not tightened to fit */
-/*  what a sixty-frame run happens to measure.  The worst observed is     */
-/*  30,689 and it sits inside; every other phase is held to one eighth of */
-/*  a window, which is four times tighter.  Tightening it to the          */
-/*  sixty-frame figure would produce a suite that passes in CTest and     */
-/*  fails on the bench two runs in five, which is worse than no bound.    */
+/*  THAT ALSO EXPLAINS THE WIDENED BUILD, which was carried as an         */
+/*  unexplained neighbour for a whole step.  The negative build whose     */
+/*  stage-2 limit for partition A is one granule too generous used to     */
+/*  measure 19,094 in this phase where the correct build measured twelve  */
+/*  hundred, and the two differ by ONE NUMBER IN A REGION DESCRIPTOR and  */
+/*  print the same characters.  Instrumented, three runs of it give       */
+/*  12,557; 13,132; 13,714 -- and the CORRECT sixty-frame build now gives */
+/*  15,909 and 17,327, which is larger.  The two builds were never doing  */
+/*  different things.  One number in a region descriptor was enough to    */
+/*  shift the same phase relationship, and the phase relationship is what */
+/*  decided whether the boundary landed in a tag.                        */
+/*                                                                        */
+/*  THE BOUND IS HALF A WINDOW, unchanged, and it is now DERIVED rather   */
+/*  than observed.  The worst deferral is one line tag, 17,640 counts.  A */
+/*  period sees that as one long entry and one short correction, so the   */
+/*  worst jitter the mechanism can produce is twice it: 35,280 counts,    */
+/*  against a half-window bound of 40,000.  Every other phase is held to  */
+/*  one eighth of a window, which is four times tighter.  Do not tighten  */
+/*  this one to what a run happens to measure -- that was tried twice and */
+/*  both attempts passed CTest and would have failed on the bench.        */
 /*                                                                        */
 /*  WHAT THIS COSTS THE CLAIM, said here because it is the honest place.  */
 /*  A partition's period is unaffected by a neighbour that computes, that */
 /*  masks its own interrupts, or that violates its boundary ten thousand  */
 /*  times a run -- those move it by tens of counts.  It is NOT unaffected */
-/*  by a neighbour that PRINTS: that can still move it by about 15,300    */
-/*  counts, rarely.  Saying so is worth more than the sentence it costs.  */
-/*                                                                        */
-/*  AND ONE THING THAT IS NOT EXPLAINED EITHER.  The WIDENED build -- the */
-/*  negative one, whose stage-2 limit for partition A is deliberately one */
-/*  granule too generous -- measures 19,094, 19,188 and 19,284 counts in  */
-/*  this phase on three consecutive SIXTY-frame runs, where the correct   */
-/*  build measures twelve hundred and never more.  The two builds differ  */
-/*  by one number in a region descriptor and print the same characters.   */
-/*  A wrong region limit perturbing the timing as well as the memory      */
-/*  would be a useful thing to be true; it is recorded and not claimed.   */
+/*  by a neighbour that PRINTS: that moves it by up to 17,640 counts, one */
+/*  line tag, every run.  Removing that needs the character off the       */
+/*  hypercall path altogether -- a console the hypervisor can hand a byte */
+/*  to without waiting for the wire -- and until then the number and its  */
+/*  mechanism are the deliverable.  Saying so is worth more than the      */
+/*  sentence it costs.                                                    */
 /**************************************************************************/
 
 static uint64_t zx_console_bound(void)
@@ -1370,6 +1441,61 @@ static void zx_report_determinism(uint32_t core_hz)
         "  artificially good.  It is printed rather than dropped so that\n"
         "  what was discarded is visible instead of taken on trust.\n");
 
+    /* THE SECOND TABLE: WHERE THE PERTURBATION COMES FROM.  The table
+       above says what A's period did; this one says what the hypervisor's
+       console was doing while it did it, so that a reader can attribute
+       the one to the other instead of being asked to believe an
+       explanation.  Every column is measured on the run being reported.  */
+
+    zx_console_puts(
+        "\n  AND WHAT THE HYPERVISOR'S CONSOLE WAS DOING, per phase:\n"
+        "\n"
+        "    the longest guest console hypercall is the longest a window\n"
+        "    boundary can be DEFERRED, because a character is written at EL2\n"
+        "    with FIQ masked.  'bytes' is how many bytes that one hypercall\n"
+        "    put on the wire: one is the character the guest asked for, and\n"
+        "    more than one means it wrote a line tag as well.  'spin' and\n"
+        "    'guard' are the board driver's two waits, in ITERATIONS.  'late'\n"
+        "    is the boundary itself, measured against the absolute deadline\n"
+        "    it was armed with, in counter counts.\n"
+        "\n");
+
+    zx_console_puts("    phase                          longest HVC  bytes"
+                    "   HVCs    spin   guard    boundary late\n");
+
+    for (index = ZX_PHASE_WARMUP; index < ZX_PHASE_COUNT; index++)
+    {
+        zx_console_puts("    ");
+        zx_console_puts(zx_phase_name[index]);
+        zx_console_puts(" ");
+        zx_console_putdec(zx_phase[index].zx_phase_hvc_cycles);
+        zx_console_puts(" cyc  ");
+        zx_console_putdec(zx_phase[index].zx_phase_hvc_chars);
+        zx_console_puts("  ");
+        zx_console_putdec(zx_phase[index].zx_phase_hvc_calls);
+        zx_console_puts("  ");
+        zx_console_putdec(zx_phase[index].zx_phase_spin_max);
+        zx_console_puts("  ");
+        zx_console_putdec(zx_phase[index].zx_phase_guard_max);
+        zx_console_puts("  ");
+        zx_console_putdec(zx_phase[index].zx_phase_late_min);
+        zx_console_puts(" .. ");
+        zx_console_putdec(zx_phase[index].zx_phase_late_max);
+        zx_console_puts("  (");
+        zx_console_putdec(zx_phase[index].zx_phase_late_count);
+        zx_console_puts(" boundaries)\n");
+    }
+
+    zx_console_puts(
+        "\n"
+        "  READ THE LAST COLUMN AGAINST THE FIRST.  A boundary that is late\n"
+        "  by a CONSTANT costs a partition's period nothing: the period is\n"
+        "  the difference between two entries and the constant cancels.  So\n"
+        "  the number that reaches the table above is the SPREAD of the\n"
+        "  lateness, and the spread cannot exceed the longest hypercall --\n"
+        "  which is why the first column and the last one are printed side\n"
+        "  by side.\n");
+
     base_mean  = zx_phase[ZX_PHASE_BASELINE].zx_phase_mean;
     base_ticks = zx_phase[ZX_PHASE_BASELINE].zx_phase_own_ticks;
     (void)base_ticks;
@@ -1404,8 +1530,8 @@ static void zx_report_determinism(uint32_t core_hz)
            masked while the untrusted partition prints, so it is the one
            phase whose perturbation is the hypervisor's doing rather than
            the partitioning's.  That is known in advance of any
-           measurement.  See zx_console_bound for what was fixed this step,
-           what is still there, and the seven runs either side of it.  */
+           measurement.  See zx_console_bound for the mechanism, the runs
+           it was measured over, and where the half-window comes from.  */
 
         uint64_t limit = (zx_phase_behaviour[index] == (uint32_t)ZX_GB_STORM)
                              ? zx_console_bound() : bound;
@@ -1448,31 +1574,43 @@ static void zx_report_determinism(uint32_t core_hz)
         "  than in any other phase -- and the mechanism is the HYPERVISOR'S\n"
         "  OWN CONSOLE DRIVER, not the partitioning.\n"
         "\n"
-        "  HALF OF IT HAS BEEN REMOVED.  A window ending mid-sentence used\n"
+        "  THE BOUNDARY PATH IS CLEAR.  A window ending mid-sentence used\n"
         "  to have the line closed BY THE BOUNDARY HANDLER -- CR and LF into\n"
         "  a polled UART, at EL2, with FIQ masked, on the switch path --\n"
         "  which cost 24,420 counts on this board on EVERY run.  The newline\n"
         "  is now deferred to whoever speaks next, inside a window that\n"
-        "  party owns; the characters and their order are unchanged.  A\n"
-        "  sixty-frame run now measures about 1,200 counts.\n"
+        "  party owns; the characters and their order are unchanged.\n"
         "\n"
-        "  HALF OF IT IS STILL HERE.  Over six hundred frames the phase\n"
-        "  reaches about 30,600 counts in roughly two runs in five -- one\n"
-        "  long period and one short correction of some 15,300 each.  That\n"
-        "  is not the boundary handler, which now writes nothing; it is\n"
-        "  somewhere on the HYPERCALL path, where every character is still\n"
-        "  written at EL2 with FIQ masked.  It is measured, it is inside the\n"
-        "  bound below, and it is NOT explained.\n"
+        "  THE HYPERCALL PATH IS NOT, AND THE MECHANISM IS NOW NAMED.  Every\n"
+        "  character is still written at EL2 with FIQ masked, so a boundary\n"
+        "  is deferred by however long the hypercall it lands in takes.\n"
+        "  Nearly all of them write one byte.  THE ONE THAT OPENS A LINE\n"
+        "  WRITES TWENTY-TWO -- the owed newline, the tag naming the\n"
+        "  partition, and the guest's own character -- and that is 106,000\n"
+        "  core cycles, 2.2 ms, about 17,640 counts, with the boundary\n"
+        "  interrupt held off for all of it.  The table above measures it on\n"
+        "  this run: the longest hypercall, the bytes it wrote, and how late\n"
+        "  the boundary actually was.\n"
+        "\n"
+        "  AND IT IS NOT RARE.  A deferral that is CONSTANT costs a period\n"
+        "  nothing, because a period is a difference and a constant cancels\n"
+        "  in it.  What reaches the number above is the CHANGE, and whether\n"
+        "  a boundary lands inside a line tag is decided by the phase\n"
+        "  relationship between a fixed schedule and a guest printing a\n"
+        "  fixed message.  Runs that once looked clean were runs where that\n"
+        "  phase kept the boundary out of the tag.  The bound is the tag.\n"
         "\n"
         "  AND THE COMPARISON IS THE POINT.  In the same run, the untrusted\n"
         "  partition VIOLATING ITS BOUNDARY on every iteration of its own\n"
         "  loop -- ten thousand times in this run and over a million in the\n"
         "  long one -- moves the critical\n"
         "  partition's period by a few tens of counts.  Nothing a partition\n"
-        "  does through the schedule reaches its neighbour -- and, since the\n"
-        "  console stopped closing lines on the boundary path, nothing a\n"
-        "  partition does through the CONSOLE reaches it either.  That was\n"
-        "  24,420 counts on this board and is now the tail of one character.\n");
+        "  does through the SCHEDULE reaches its neighbour.  What a partition\n"
+        "  does through the CONSOLE still does, and this is the honest shape\n"
+        "  of it: not a rare excursion nobody can account for, but one line\n"
+        "  tag written with the boundary interrupt masked, every run, whose\n"
+        "  cost is on the line above and whose cure is a console the\n"
+        "  hypervisor can hand a byte to without waiting for the wire.\n");
 
     zx_check("A'S PERIOD IS STEADY WITHIN ITS BOUND IN EVERY MEASURED\n"
              "         PHASE.  max - min for each phase from the baseline\n"

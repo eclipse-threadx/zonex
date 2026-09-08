@@ -170,6 +170,9 @@ void zx_frame_configure(ZX_FRAME *frame_ptr,
     frame_ptr->zx_frame_switch_last  = 0U;
     frame_ptr->zx_frame_switch_total = 0U;
     frame_ptr->zx_frame_spurious     = 0U;
+    frame_ptr->zx_frame_late_min     = 0xFFFFFFFFU;
+    frame_ptr->zx_frame_late_max     = 0U;
+    frame_ptr->zx_frame_late_count   = 0U;
     frame_ptr->zx_frame_stopped_index = ZX_MANIFEST_NO_INDEX;
     frame_ptr->zx_frame_stop_outcome  = ZX_RUN_FRAME_DONE;
     frame_ptr->zx_frame_hook          = (ZX_FRAME_HOOK_FN)0;
@@ -352,6 +355,30 @@ static void zx_frame_after_switch(ZX_FRAME *frame_ptr, UINT index)
         frame_ptr->zx_frame_hook_frames = frames;
         frame_ptr->zx_frame_hook(frame_ptr->zx_frame_hook_argument, frames);
     }
+}
+
+
+/**************************************************************************/
+/*  zx_frame_lateness_take                                                */
+/**************************************************************************/
+
+void zx_frame_lateness_take(ZX_FRAME *frame_ptr, uint32_t *min_ptr,
+                            uint32_t *max_ptr, uint32_t *count_ptr)
+{
+    if ((frame_ptr == (ZX_FRAME *)0) || (min_ptr == (uint32_t *)0)
+        || (max_ptr == (uint32_t *)0) || (count_ptr == (uint32_t *)0))
+    {
+        return;
+    }
+
+    *count_ptr = frame_ptr->zx_frame_late_count;
+    *max_ptr   = frame_ptr->zx_frame_late_max;
+    *min_ptr   = (frame_ptr->zx_frame_late_count != 0U)
+                     ? frame_ptr->zx_frame_late_min : 0U;
+
+    frame_ptr->zx_frame_late_min   = 0xFFFFFFFFU;
+    frame_ptr->zx_frame_late_max   = 0U;
+    frame_ptr->zx_frame_late_count = 0U;
 }
 
 
@@ -606,6 +633,43 @@ ZX_GUEST_CONTEXT *zx_el2_window_boundary(void)
         zx_el2_frame_result = ZX_RUN_TRAPPED;
 
         return (ZX_GUEST_CONTEXT *)0;
+    }
+
+    /* HOW LATE THIS BOUNDARY IS, taken FIRST and before the acknowledge,
+       because everything after it is work this handler chose to do and the
+       question is what happened BEFORE the handler got the core at all.
+       The deadline read here is the ENDING window's: the schedule has not
+       been advanced yet, and zx_schedule_deadline reports the current
+       window's end.
+
+       ONE COUNTER READ, OUTSIDE THE TIMED BRACKET.  The switch figure is
+       taken from zx_pmu_cycles below and is untouched by this, so the
+       published cost of a partition switch stays comparable with every
+       figure this repository has already published.  What it does add is a
+       constant to every window, and a constant is exactly what a PERIOD
+       cannot see -- see zx_frame_after_switch on why the same argument
+       makes the period measurement free.  */
+
+    {
+        uint64_t deadline = zx_schedule_deadline(frame_ptr->zx_frame_schedule);
+        uint64_t arrived  = zx_read_cntpct();
+
+        if ((deadline != 0U) && (arrived > deadline))
+        {
+            uint32_t late = (uint32_t)(arrived - deadline);
+
+            frame_ptr->zx_frame_late_count++;
+
+            if (late < frame_ptr->zx_frame_late_min)
+            {
+                frame_ptr->zx_frame_late_min = late;
+            }
+
+            if (late > frame_ptr->zx_frame_late_max)
+            {
+                frame_ptr->zx_frame_late_max = late;
+            }
+        }
     }
 
     intid = zx_gic_el2_acknowledge();

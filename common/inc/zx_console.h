@@ -103,6 +103,62 @@ void zx_board_console_init(void);
 void zx_board_console_putc(char character);
 #endif
 
+/**************************************************************************/
+/*            WHAT THE CONSOLE COSTS, published rather than argued        */
+/*                                                                        */
+/*  A guest's console is one hypercall per character, answered at EL2      */
+/*  with FIQ masked, so the hypervisor's console driver decides how long   */
+/*  the boundary interrupt that ends a partition's window can be           */
+/*  DEFERRED.  That is a worst-case-execution-time input and it was an     */
+/*  argument for as long as nobody published a number for it.  These are   */
+/*  the numbers.                                                          */
+/*                                                                        */
+/*  Each is a MAXIMUM since the last reset rather than an average: what a  */
+/*  schedule has to survive is the worst deferral it will ever see, and a  */
+/*  mean quoted alone hides exactly that.  A regression resets them at     */
+/*  each phase boundary so that a phase's worst case is the phase's own    */
+/*  and not something inherited from the boot.                            */
+/**************************************************************************/
+
+/* Every BYTE this hypervisor has put on the console, by any route -- its own
+   reports as well as characters forwarded for a guest.  Bytes and not
+   characters, because those two numbers differ where it matters: a newline
+   is one character to a caller and TWO bytes on the wire, and it is the wire
+   that costs the time.  Counted so that what one hypercall wrote can be
+   recovered as a difference, which is what makes a burst visible.  */
+
+uint32_t zx_console_characters_written(void);
+
+/* The longest single guest console hypercall, in core cycles, and the most
+   characters any one of them wrote.  The two together are the whole
+   statement: a hypercall that wrote one character and one that wrote a
+   tag's worth cost the UART the same per character, and only the count
+   says which happened.  */
+
+uint32_t zx_console_hvc_cycles_max(void);
+uint32_t zx_console_hvc_characters_max(void);
+uint32_t zx_console_hvc_calls(void);
+
+void zx_console_hvc_measure_reset(void);
+
+/* AND WHAT THE BOARD'S DRIVER SPUN FOR, which is a different question and
+   was the leading suspect before either was measured.  The first is the
+   wait for the byte to go out, which is a character time and cannot be
+   avoided; the second is the wait for the write-one-to-clear flag to
+   de-assert afterwards, which is bounded by an ITERATION COUNT and so is
+   not a bound a WCET argument can use.  A board whose console is
+   semihosting spins for neither and reports zero for both.  */
+
+uint32_t zx_board_console_spin_max(void);
+uint32_t zx_board_console_guard_max(void);
+
+/* And every byte the board's driver has actually sent.  A board with no UART
+   sends none and says so.  */
+
+uint32_t zx_board_console_bytes(void);
+
+void zx_board_console_spin_reset(void);
+
 #ifdef __cplusplus
 }
 #endif

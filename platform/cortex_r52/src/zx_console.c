@@ -55,6 +55,7 @@
 /**************************************************************************/
 
 #include "zx_port.h"
+#include "zx_guest_console.h"
 
 /* Number of hexadecimal digits in a 32-bit value.  */
 
@@ -68,6 +69,20 @@
    console says FAIL is a finding in itself.  */
 
 uint32_t zx_run_failures = 0xFFFFFFFFU;
+
+
+/* HOW MANY CHARACTERS THIS CONSOLE HAS WRITTEN, and the cost of the
+   longest guest hypercall that wrote any of them.  See the block comment
+   in zx_console.h for why a hypervisor that prints for a guest has to
+   publish these: the character is written at EL2 with FIQ masked, so this
+   IS the bound on how long a window boundary can be deferred.  */
+
+#ifndef ZX_CONSOLE_BOARD
+static uint32_t zx_console_characters;
+#endif
+static uint32_t zx_console_hvc_cycles;
+static uint32_t zx_console_hvc_characters;
+static uint32_t zx_console_hvc_count;
 
 
 #ifndef ZX_CONSOLE_BOARD
@@ -132,6 +147,16 @@ void zx_console_puts(const char *string_ptr)
 
 #else
 
+    {
+        const char *cursor = string_ptr;
+
+        while (*cursor != '\0')
+        {
+            zx_console_characters++;
+            cursor++;
+        }
+    }
+
     (void) zx_semihost_call(ZX_SYS_WRITE0, string_ptr);
 
 #endif
@@ -188,6 +213,121 @@ void zx_console_putdec(uint32_t value)
     } while ((work != 0U) && (index > 0U));
 
     zx_console_puts(&buffer[index]);
+}
+
+
+/**************************************************************************/
+/*  zx_el2_guest_console_hypercall                                        */
+/*                                                                        */
+/*  ONE GUEST CONSOLE HYPERCALL, MEASURED.  The trap handler calls this    */
+/*  rather than zx_guest_console_putc directly, and the only thing it adds */
+/*  is the measurement -- which belongs in the PORT because it is the port */
+/*  that masks FIQ, and not in the portable tagging code that has no idea  */
+/*  what an interrupt is.                                                  */
+/*                                                                        */
+/*  WHY THE COST OF THIS CALL IS THE INTERESTING NUMBER.  The guest        */
+/*  executes HVC once per character, so it is at EL1 with the boundary FIQ */
+/*  deliverable between characters and at EL2 with it MASKED during one.   */
+/*  The window boundary can therefore be deferred by exactly as long as    */
+/*  this function takes, and by no longer -- which makes the maximum below */
+/*  the bound the determinism claim needs, and makes it measurable rather  */
+/*  than arguable.                                                        */
+/*                                                                        */
+/*  ONE CHARACTER IN, MORE THAN ONE OUT.  A hypercall that opens a line    */
+/*  also writes the tag that says who is speaking, and a hypercall that    */
+/*  opens one after a deferred close writes the newline that closes the    */
+/*  previous line as well.  Those are the expensive ones, they are decided */
+/*  by the tagging rules rather than by the guest, and the character count */
+/*  is what tells them apart from an ordinary one.                        */
+/*                                                                        */
+/*  THE PMU RATHER THAN THE SYSTEM COUNTER, because this runs once per     */
+/*  character on the path being measured: a cycle-counter read is one MRC  */
+/*  where a 64-bit CNTPCT read is a pair plus the loop that makes it       */
+/*  atomic.  Two reads and three compares against a character time of some */
+/*  four thousand cycles is under one per cent, which is the most a        */
+/*  measurement may cost the thing it measures.                            */
+/**************************************************************************/
+
+void zx_el2_guest_console_hypercall(char character)
+{
+    uint32_t start      = zx_pmu_cycles();
+    uint32_t characters = zx_console_characters_written();
+    uint32_t spent;
+
+    zx_guest_console_putc(character);
+
+    spent      = zx_pmu_cycles() - start;
+    characters = zx_console_characters_written() - characters;
+
+    zx_console_hvc_count++;
+
+    if (spent > zx_console_hvc_cycles)
+    {
+        zx_console_hvc_cycles = spent;
+    }
+
+    if (characters > zx_console_hvc_characters)
+    {
+        zx_console_hvc_characters = characters;
+    }
+}
+
+
+/**************************************************************************/
+/*  The measurements, read back                                           */
+/**************************************************************************/
+
+uint32_t zx_console_characters_written(void)
+{
+#ifdef ZX_CONSOLE_BOARD
+
+    /* THE BOARD'S OWN COUNT, because only the board knows what it put on the
+       wire: its driver expands a newline into CR and LF, so a caller
+       counting the string it handed over would be one byte short of the
+       truth for every line -- and it is the wire that costs the time.  */
+
+    return zx_board_console_bytes();
+
+#else
+
+    return zx_console_characters;
+
+#endif
+}
+
+
+uint32_t zx_console_hvc_cycles_max(void)
+{
+    return zx_console_hvc_cycles;
+}
+
+
+uint32_t zx_console_hvc_characters_max(void)
+{
+    return zx_console_hvc_characters;
+}
+
+
+uint32_t zx_console_hvc_calls(void)
+{
+    return zx_console_hvc_count;
+}
+
+
+/**************************************************************************/
+/*  zx_console_hvc_measure_reset                                          */
+/*                                                                        */
+/*  THE MAXIMA ONLY, and deliberately not the character total.  A phase's  */
+/*  worst case has to be the phase's own or the boot's output would set a  */
+/*  floor under every phase after it; the running total is what makes a    */
+/*  burst recoverable as a difference and resetting it would break that.   */
+/**************************************************************************/
+
+void zx_console_hvc_measure_reset(void)
+{
+    zx_console_hvc_cycles     = 0U;
+    zx_console_hvc_characters = 0U;
+    zx_console_hvc_count      = 0U;
 }
 
 

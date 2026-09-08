@@ -220,7 +220,11 @@ zx_el2_trap_hvc_not_nop:
     bne     zx_el2_trap_hvc_not_putc
 
     @ THE GUEST CONSOLE.  One character, in the guest's r0, printed by the
-    @ hypervisor and tagged with the partition it scheduled.  Handled HERE,
+    @ hypervisor and tagged with the partition it scheduled.  The port's
+    @ wrapper is called rather than the portable zx_guest_console_putc so
+    @ that the cost of this call is measured where it is paid: FIQ is masked
+    @ for the whole of it, so its maximum IS the bound on how long a window
+    @ boundary can be deferred by a guest that prints.  Handled HERE,
     @ in the vector, rather than by returning a result code the way a fault
     @ is: zx_el2_run_payload is a one-way transfer out, so returning through
     @ it would end the guest's excursion, and a console write must leave the
@@ -241,7 +245,7 @@ zx_el2_trap_hvc_not_nop:
     push    {r2, r3, r12, lr}
     ldr     r0, [sp, #16]                       @ the guest's r0
     uxtb    r0, r0
-    bl      zx_guest_console_putc
+    bl      zx_el2_guest_console_hypercall
     pop     {r2, r3, r12, lr}
     pop     {r0, r1}                            @ balanced with the push
     eret

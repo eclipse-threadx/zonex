@@ -1809,6 +1809,16 @@ A wrong region limit perturbing the **timing** as well as the memory would be a
 useful thing to be true. It is recorded and **not claimed**, because a
 mechanism nobody has found is not a result.
 
+> **Amended 8 Sep 2026 — everything under these two headings has since been
+> measured, and both readings above were wrong.** The excursion is not rare and
+> is not on the guard spin: it is the **line tag**, twenty-two bytes written in
+> one hypercall with FIQ masked, and it happens on every run. The widened build
+> is not perturbing anything — instrumented, it measures *less* than the
+> correct build does. Both were artefacts of a phase relationship that a change
+> of under one per cent in the per-character cost is enough to move. The
+> numbers above stand as what was seen; **D31 is what they were.** The
+> half-window bound is unchanged and is now derived rather than observed.
+
 ---
 
 ## D29 — The guest console closes a line LAZILY · **settled 3 Sep 2026, by measurement**
@@ -1918,3 +1928,121 @@ build that denies itself a console on purpose. The three fault-path exit codes
 are now named there. That is worth recording because the harness had been
 misreporting `0x5A` the same way for as long as the EL2-fault build has
 existed, and nobody noticed until a build arrived whose console was gone.
+
+---
+
+## D31 — What a neighbour that PRINTS costs, and where the cost actually is · **settled 8 Sep 2026, by measurement**
+
+**Nothing a partition does through the SCHEDULE reaches its neighbour.
+Computing, masking its own interrupts and violating its boundary without pause
+each move the critical partition's period by tens of counts.**
+
+**What reaches it is the HYPERVISOR'S OWN CONSOLE DRIVER.** A guest that prints
+moves that period by up to one line tag — 22 bytes at 115,200 8N1, 17,640
+counts of this board's 8 MHz counter — every run. That is a defect in ZoneX,
+not a limit of the partitioning, and it is bounded, derived and reproducible.
+
+### The mechanism, named and measured
+
+A guest's console is one hypercall per character. The hypervisor answers it in
+the vector, at EL2, and a hypercall is an exception to EL2 — so `PSTATE.F` is
+set for the whole of it and the FIQ that ends a partition's window is deferred
+until it returns.
+
+Nearly every one of those hypercalls writes the single byte the guest asked
+for. **The one that opens a line writes twenty-two:** the newline a deferred
+close (D29) left owed, which the board driver expands to `CR` `LF`; the tag
+that says which partition is speaking, `[P2 B (untrusted)] `; and then the
+guest's own character. Measured end to end on the S32Z280-594EVB, over seven
+runs of the six-hundred-frame regression:
+
+```
+    longest guest console hypercall    106,214 .. 106,352 core cycles
+                                       2.2 ms, about 17,640 counts
+    bytes it wrote                     22, every run
+    window boundary lateness           45 .. 9,334 counts  (console phase)
+                                       45 .. 48 counts     (every other phase)
+    A's window period jitter           17,830 · 17,889 · 17,943 · 17,963
+                                       18,101 · 18,141 · 18,327
+```
+
+The image measures all of it on the run it reports, including the boundary
+lateness — the physical count at the top of the boundary handler against the
+absolute deadline the ending window was armed with. That column and the
+hypercall column are printed side by side because the second bounds the first.
+
+### The leading suspect was wrong, and which one it was
+
+The board driver clears `UARTSR.DTF` after each byte and then spins waiting for
+the write-one-to-clear to take effect, under a guard of a hundred thousand
+iterations. A partial spin of that guard was the obvious candidate for a
+millisecond-scale excursion and had been carried as such.
+
+**It has never spun. The maximum is zero iterations, in every phase of every
+run.** The spin that does cost something is the *other* one — the wait for the
+byte to go out, which is a character time by construction and **had no bound at
+all**. It reaches 32 iterations. Both are now bounded by **time** as well as by
+iterations: ten character times, computed from the counter frequency and the
+baud rate, which is the same "ten times the worst legitimate case" rule D28
+uses for the jitter bound. Both bounds are kept, for the reason `zx_el2_dwell`
+keeps both: the time bound is what a WCET argument reads, and the iteration
+bound is what survives a counter that is not running.
+
+### The residual was never rare, and that is the finding
+
+Before any of this was instrumented, seven six-hundred-frame runs gave 1,169;
+1,169; 1,204; 1,236 — and 30,615; 30,639; 30,689. That reads as one event in
+ninety-nine appearing in roughly two runs in five, and it was recorded that way.
+
+**It is not an event.** The deferral is very nearly constant, and a period is a
+difference between two entries, so a constant deferral cancels in it and only a
+*change* reaches the number. Whether a boundary lands inside a line tag is
+decided by the phase relationship between a fixed schedule and a guest printing
+a fixed message. Adding two cycle-counter reads per character — under one per
+cent of a character time — moved that phase, and the excursion became
+reproducible on every run.
+
+The four quiet runs were luck about where the boundary fell. **The bound was
+always one line tag**, and this is why the regression file warns against
+setting the console bound from what a short run measures.
+
+### And it explains the widened build, carried unexplained since D28
+
+The negative build whose stage-2 limit for partition A is deliberately one
+granule too generous used to measure 19,094 counts in this phase where the
+correct build measured twelve hundred — two builds differing by **one number in
+a region descriptor**, printing the same characters. "A wrong region limit
+perturbs the timing as well as the memory" was recorded as a possibility and
+not claimed.
+
+It was never true. Instrumented, three runs of the widened build give 12,557;
+13,132; 13,714 — and the **correct** sixty-frame build now gives 15,909 and
+17,327, which is larger. Both show the same 22-byte hypercall and the same
+lateness shape. One number in a region descriptor was enough to shift the phase
+relationship, and the phase relationship is what decided whether the boundary
+landed in a tag. **The anomaly is closed as a measurement artefact of that
+phase, not as a property of the region descriptor.**
+
+### Why it is not fixed here, said plainly
+
+The tag cannot be shortened without changing the contract D8 settles — the id
+and the name are both there so a reader can get from a log line back to the
+manifest that produced it. It cannot be split across hypercalls without letting
+another partition's tag into the middle of a line, which is the one thing the
+tagging rules exist to prevent. And it cannot be made cheaper: a guest emits
+one byte per hypercall and the console must put about 1.65 bytes on the wire
+for each one, so no scheme that writes a single byte per hypercall can keep up.
+
+**What removes it is a console the hypervisor can hand a byte to without
+waiting for the wire** — an interrupt-driven driver with a polled fallback the
+fault path forces, because `zx_el2_hypervisor_fault` and
+`zx_el2_unexpected_vector` print at the moment ZoneX has already failed once.
+That is a driver and two code paths and a test that proves the fallback works.
+It is named, it is costed, and it is not this change.
+
+**The bound stands at half a window and is now derived rather than observed.**
+The worst deferral is one line tag, 17,640 counts. A period sees that as one
+long entry and one short correction, so the worst jitter the mechanism can
+produce is twice it — 35,280 counts, against a half-window bound of 40,000.
+Every other phase is held to one eighth of a window, which is four times
+tighter.

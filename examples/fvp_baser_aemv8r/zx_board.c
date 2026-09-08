@@ -51,6 +51,43 @@ void zx_board_init(void)
 
 
 /**************************************************************************/
+/*  zx_board_console_spin_max, zx_board_console_guard_max                 */
+/*                                                                        */
+/*  ZERO, AND NOT BECAUSE NOBODY LOOKED.  This target's console is         */
+/*  semihosting: there is no transmitter to wait for and no flag to watch  */
+/*  de-assert, so the two spins these report do not exist here at all.     */
+/*  Zero is the honest answer and it is also the reason the model can say  */
+/*  nothing about this step -- a console that costs the simulation no time */
+/*  cannot defer anything.  The functions exist so that the regression     */
+/*  reports the same table on both targets, with the difference visible    */
+/*  rather than compiled out.                                             */
+/**************************************************************************/
+
+uint32_t zx_board_console_spin_max(void)
+{
+    return 0U;
+}
+
+
+uint32_t zx_board_console_bytes(void)
+{
+    return 0U;
+}
+
+
+uint32_t zx_board_console_guard_max(void)
+{
+    return 0U;
+}
+
+
+void zx_board_console_spin_reset(void)
+{
+    /* Intentionally empty; there is nothing to reset.  */
+}
+
+
+/**************************************************************************/
 /*  zx_board_mmio_region_count                                            */
 /**************************************************************************/
 

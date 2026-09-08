@@ -15,7 +15,7 @@ SPDX-License-Identifier: MIT and CC0-1.0
 
 # Data dependence on the switch and trap paths
 
-*Eclipse ThreadX ZoneX. Last read through 3 September 2026.*
+*Eclipse ThreadX ZoneX. Last read through 8 September 2026.*
 
 **Input to the worst-case-execution-time work, written by the people who wrote
 the code.** Every path a partition switch or a trap can take was read with one
@@ -73,7 +73,7 @@ straight-line and bounded and appends without searching.
 
 ## 2. Data-dependent, and known
 
-### 2.1 The console, on the hypercall path · **the open item**
+### 2.1 The console, on the hypercall path · **measured, bounded, still there**
 
 A guest's console is one hypercall per character, written at EL2 **with FIQ
 masked**, through a polled UART. The boundary FIQ that ends a partition's
@@ -81,7 +81,7 @@ window is therefore deferred for as long as the hypervisor is inside a console
 hypercall — and how often that happens is decided by how much the *guest*
 chooses to print.
 
-Two costs, and only one of them is gone:
+Two costs. One is gone; the other is now named and bounded rather than open.
 
 * **The line closed at the window boundary — REMOVED.** A window ending
   mid-sentence used to have that line closed by the boundary handler, `CR` and
@@ -89,32 +89,67 @@ Two costs, and only one of them is gone:
   the outgoing guest had been printing. It moved the critical partition's
   window period by **24,420 counts** — three per cent of a major frame — on
   every run. The newline is now deferred to whoever speaks next, inside a
-  window that party owns.
-* **The character itself — STILL THERE.** One character is ten bits at 115,200
-  baud, about 86.8 µs, about **694 counts**. Over sixty frames that is all that
-  remains and the phase measures 999–1,196 counts. Over six hundred frames,
-  in roughly **two runs in five**, an excursion of about **15,300 counts**
-  appears — one long period and one short correction. It is not the boundary
-  handler, which now writes nothing. It is somewhere on the hypercall path and
-  **the mechanism is not confirmed**; the leading suspect is the board driver's
-  write-one-to-clear guard (§2.2).
+  window that party owns (D29).
+* **The line TAG — STILL THERE, and it is the whole of what is left.** Nearly
+  every console hypercall writes the one byte the guest asked for, about 694
+  counts. **The one that opens a line writes twenty-two:** the owed newline as
+  `CR` `LF`, the tag naming the partition, and the guest's character. That is
+  **106,214 to 106,352 core cycles** measured over seven runs — 2.2 ms, about
+  **17,640 counts** — with the boundary interrupt masked throughout.
 
-**Consequence:** a partition's window period is unaffected by a neighbour that
-computes, that masks its own interrupts, or that violates its boundary ten
-thousand times a run — those move it by tens of counts. It is **not** unaffected
-by a neighbour that prints.
+**The trip count is not the guest's.** It is set by the tagging rules: the tag
+length is a property of the manifest's partition name, and the owed newline by
+whether the previous window ended mid-line. A guest decides *how often* a line
+opens, not what one costs.
 
-### 2.2 The console driver's write-one-to-clear guard
+**Measured directly, not inferred.** The regression image records how late each
+window boundary arrived against the absolute deadline the ending window was
+armed with. In the console phase that is **45 to 9,334 counts**; in every other
+phase, **45 to 48**. The lateness and the longest hypercall are reported side
+by side because the second bounds the first.
 
-`zx_board_console_putc` clears `UARTSR.DTF` and then spins waiting for the clear
-to take effect, bounded by an **iteration count of 100,000** rather than by
-time. The spin exists for a measured reason — without it the next byte's poll
-observes the previous byte's flag and its write is silently dropped, which cost
-the first character of every line — but **an iteration count is not a bound a
-WCET argument can use**, and this spin runs at EL2 with FIQ masked.
+**What a period sees is the CHANGE in the deferral, not the deferral.** A
+period is a difference between two entries, so a constant deferral cancels in
+it. This is why the excursion once looked rare: for a fixed schedule and a
+guest printing a fixed message, whether the boundary falls inside a line tag is
+decided by a phase relationship, and a change of under one per cent in the
+per-character cost moves it. Instrumented, the jitter is 17,830 to 18,327
+counts on every run of seven. See D31.
 
-Nobody has measured how long it can actually take. That measurement, and a
-bound expressed in counter counts, is the smallest useful thing to do here.
+*For a WCET argument the relevant statement is: a boundary is deferred by at
+most one console hypercall; a console hypercall is at most one line tag, whose
+length is `(2 + strlen(tag) + 1)` bytes at the configured baud rate plus about
+95 counts per byte of hypervisor overhead; and a partition's period is
+perturbed by at most twice that.*
+
+### 2.2 The console driver's two spins · **both now bounded by time**
+
+`zx_board_console_putc` contains two spins, and until this was measured the
+attention was on the wrong one.
+
+* **The wait for the byte to go out** polls `UARTSR.DTF` until the transmitter
+  reports the byte gone. It is a character time by construction — 32 iterations
+  measured — and it **had no bound at all**. An unbounded spin at EL2 with FIQ
+  masked is the larger WCET hole of the two, and it was there because nobody
+  had asked the question of this loop.
+* **The write-one-to-clear guard** clears `DTF` and waits for the clear to take
+  effect, bounded by an iteration count of 100,000. This was the leading
+  suspect for the millisecond-scale excursion in §2.1. **It has never spun: the
+  maximum is zero iterations, in every phase of every run.** The spin exists
+  for a measured reason — without it the next byte's poll observes the previous
+  byte's flag and its write is silently dropped, which cost the first character
+  of every line — and it earns its place by being correct, not by being taken.
+
+**Both are now bounded by time as well as by iterations**, sharing one deadline
+taken before either: **ten character times**, computed from the counter
+frequency and the baud rate, which is the same "ten times the worst legitimate
+case" rule D28 uses for the jitter bound. An iteration count is not a bound a
+WCET argument can use; a cap in counter counts is.
+
+**Both bounds are kept, and that is deliberate.** The time bound is the one a
+WCET argument reads. The iteration bound is what survives a counter that is not
+running, which would otherwise turn the time bound into the infinite loop it
+was introduced to remove. Same pair, same reason, as `zx_el2_dwell` (§2.4).
 
 ### 2.3 Burning a stopped partition's window
 
@@ -177,15 +212,20 @@ comparison.
 
 ## 4. Where the funded work should start
 
-1. **Measure the console driver's guard spin (§2.2)** and bound it in counter
-   counts. It is the smallest item, it is on a path with FIQ masked, and it is
-   the leading suspect for the one unexplained figure in this document.
+1. ~~Measure the console driver's guard spin and bound it in counter counts.~~
+   **Done, and it was the wrong suspect** — the guard has never spun. Both
+   spins are bounded in counter counts now, and the excursion turned out to be
+   the line tag (§2.1, §2.2, D31).
 2. **Take the console off the hypercall path (§2.1)**, which is the change that
-   makes the temporal claim unconditional rather than qualified.
+   makes the temporal claim unconditional rather than qualified. It is now the
+   *only* thing between the two, and it is scoped: an interrupt-driven driver
+   with a polled fallback that the fault path can force, plus a test that
+   proves the fallback works. Two code paths, not one.
 3. **Bound interrupt latency**, which this phase does not attempt at all. Guest
    interrupts go straight to EL1 and cost what they always did; bounding them
    needs the List Registers this core has and this phase does not use.
 4. **Structural coverage of the port**, which needs its own tooling — see
    `docs/coverage.md`.
 
-The first two are the difference between "measured on one bench" and "bounded".
+Item 2 is now the whole of the difference between a temporal claim that needs a
+clause carved out of it and one that does not.
