@@ -85,7 +85,34 @@ case "${command}" in
         # and the symptom is a SanityCheckError naming a file that "doesn't
         # exist but no error from GCOV detected".  ThreadX paid for that one.
         mkdir -p "${ROOT}/coverage_report"
-        gcovr --root "${ROOT}" \
+
+        # THE gcov MUST MATCH THE gcc THAT INSTRUMENTED.  gcovr shells out to
+        # plain `gcov` unless told otherwise, and gcov refuses a .gcno written
+        # by a different major -- "version 'B42*', prefer 'B33*'" -- which
+        # ends the run with no coverage rather than with wrong coverage.
+        #
+        # CI builds with CC=gcc-14 while the image's default gcc is 13, so
+        # this is not hypothetical: it is what the first pull request run
+        # failed on. Derive gcov from CC when CC names a versioned gcc, and
+        # otherwise leave gcovr to its default so a plain local run is
+        # unchanged.
+        gcov_args=()
+        case "${CC:-}" in
+            *gcc-[0-9]*)
+                gcov_candidate="${CC/gcc-/gcov-}"
+                if command -v "${gcov_candidate}" >/dev/null 2>&1; then
+                    gcov_args=(--gcov-executable "${gcov_candidate}")
+                    echo "Using ${gcov_candidate} to match ${CC}."
+                else
+                    echo "run.sh: ${CC} is set but ${gcov_candidate} is not" >&2
+                    echo "run.sh: installed; coverage would fail on a gcov" >&2
+                    echo "run.sh: version mismatch." >&2
+                    exit 1
+                fi
+                ;;
+        esac
+
+        gcovr "${gcov_args[@]}" --root "${ROOT}" \
               --filter "${ROOT}/core/" \
               --filter "${ROOT}/common/" \
               --html-details "${ROOT}/coverage_report/index.html" \
@@ -154,7 +181,7 @@ case "${command}" in
         # dying with a threshold the reader has to go and look up.
         echo ""
         echo "Enforcing the coverage floor on the fully reachable core:"
-        gcovr --root "${ROOT}" \
+        gcovr "${gcov_args[@]}" --root "${ROOT}" \
               --filter "${ROOT}/core/src/zx_fault.c" \
               --filter "${ROOT}/core/src/zx_fault_log.c" \
               --filter "${ROOT}/core/src/zx_guest_console.c" \

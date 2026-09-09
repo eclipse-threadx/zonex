@@ -208,6 +208,7 @@ if(ZX_THREADX_SOURCE_DIR)
             CMAKE_GENERATOR ${CMAKE_GENERATOR}
             CMAKE_ARGS
                 -DCMAKE_TOOLCHAIN_FILE=${ZX_GUEST_TOOLCHAIN}
+                ${ZX_GUEST_ATFE_ARG}
                 -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
                 -DZX_THREADX_SOURCE_DIR=${ZX_THREADX_SOURCE_DIR}
                 -DZX_GUEST_COMMON_DIR=${ZX_COMMON_DIR}
@@ -235,6 +236,26 @@ if(ZX_THREADX_SOURCE_DIR)
             USES_TERMINAL_BUILD     FALSE
         )
     endfunction()
+
+    # AND THE COMPILER'S LOCATION HAS TO CROSS THE BOUNDARY UNDER ITS OTHER
+    # NAME.  ZoneX's clang toolchain file takes ZX_ATFE_TOOLCHAIN_PATH;
+    # ThreadX's takes ATFE_TOOLCHAIN_PATH, without the prefix.  Nothing
+    # bridged the two, so the guest sub-build fell back to whatever `clang`
+    # was on PATH -- which on a machine that keeps ATfE at the default
+    # location happens to be right, and on a CI runner that unpacks it into
+    # the workspace is the system clang, unable to compile for a bare-metal
+    # Cortex-R52.  The lane passed locally and failed in CI for exactly that
+    # reason.
+    #
+    # The compiler's own directory is forwarded rather than the variable,
+    # because that is correct however the toolchain file found it: passed on
+    # the command line, or defaulted.
+    if(CMAKE_C_COMPILER_ID STREQUAL "Clang")
+        get_filename_component(ZX_GUEST_ATFE_BIN "${CMAKE_C_COMPILER}" DIRECTORY)
+        set(ZX_GUEST_ATFE_ARG -DATFE_TOOLCHAIN_PATH=${ZX_GUEST_ATFE_BIN})
+    else()
+        set(ZX_GUEST_ATFE_ARG "")
+    endif()
 
     zx_add_guest_project(guest_a ${ZX_PART_A_BASE} ${ZX_PART_A_SIZE})
     zx_add_guest_project(guest_b ${ZX_PART_B_BASE} ${ZX_PART_B_SIZE})
