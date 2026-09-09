@@ -36,7 +36,7 @@
 /*    their call sites: the EL1 count lives in MPUIR[15:8] and the EL2     */
 /*    count in HMPUIR[7:0].  Different registers, different fields.        */
 /*                                                                        */
-/*  MISRA C:2012 deviations (justified)                                    */
+/*  MISRA C:2012 notes: deviations and compliance                          */
 /*                                                                        */
 /*    Directive 4.3 (assembly shall be encapsulated and isolated) --       */
 /*      observed rather than violated: every asm statement in this file is */

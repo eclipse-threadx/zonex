@@ -25,7 +25,7 @@
 /*    example image that launches one.  See zx_guest_launch.h for why it  */
 /*    is shared and what is deliberately left with each experiment.       */
 /*                                                                        */
-/*  MISRA C:2012 deviations (justified)                                   */
+/*  MISRA C:2012 notes: deviations and compliance                         */
 /*                                                                        */
 /*    Rule 11.4/11.6 -- casting a partition window's address to a         */
 /*      volatile pointer is inherent to a hypervisor writing a guest's    */

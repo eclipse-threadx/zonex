@@ -55,7 +55,7 @@
 /*    Both are masked in zx_region_bar/zx_region_lar below, which is why  */
 /*    programming a region is a function call and not two stores.         */
 /*                                                                        */
-/*  MISRA C:2012 deviations (justified)                                    */
+/*  MISRA C:2012 notes: deviations and compliance                          */
 /*                                                                        */
 /*    Directive 4.3 -- every asm statement below is alone in a function    */
 /*      that does nothing else.                                           */

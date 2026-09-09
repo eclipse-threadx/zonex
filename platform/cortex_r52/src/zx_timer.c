@@ -53,7 +53,7 @@
 /*    context block; zx_context.c holds that version, using the same       */
 /*    arithmetic against the same register.                                */
 /*                                                                        */
-/*  MISRA C:2012 deviations (justified)                                   */
+/*  MISRA C:2012 compliance notes                                         */
 /*                                                                        */
 /*    Directive 4.3 -- each asm statement below is one coprocessor        */
 /*      operation in a function that does nothing else.                   */
@@ -384,7 +384,7 @@ void zx_el2_dwell(uint32_t counts)
 /*    gap is the other partition's window, and closing it is what makes    */
 /*    the two clocks independent.                                         */
 /*                                                                        */
-/*  MISRA C:2012 deviations (justified)                                   */
+/*  MISRA C:2012 compliance notes                                         */
 /*                                                                        */
 /*    Directive 4.3 -- CNTVOFF is reachable only through a 64-bit          */
 /*      coprocessor transfer, and every such access is encapsulated in     */
@@ -634,7 +634,7 @@ void zx_el2_guest_timer_stop(void)
 /*    miss that the checking itself caused.  One read, taken after the     */
 /*    comparator is set, is both the cheapest and the only honest answer.  */
 /*                                                                        */
-/*  MISRA C:2012 deviations (justified)                                   */
+/*  MISRA C:2012 compliance notes                                         */
 /*                                                                        */
 /*    Directive 4.3 -- CNTHP_CVAL is reachable only through a 64-bit       */
 /*      coprocessor transfer, encapsulated here.                           */

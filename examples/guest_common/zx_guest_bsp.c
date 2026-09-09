@@ -60,7 +60,7 @@
 /*    and read a clock; it may not decide which interrupts exist or how   */
 /*    fast time runs.                                                     */
 /*                                                                        */
-/*  MISRA C:2012 deviations (justified)                                   */
+/*  MISRA C:2012 notes: deviations and compliance                         */
 /*                                                                        */
 /*    Directive 4.3 -- every asm statement below is one hypercall or one  */
 /*      coprocessor operation, in a function that does nothing else.      */

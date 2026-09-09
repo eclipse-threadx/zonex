@@ -71,7 +71,7 @@
 /*    mistake available for no benefit: nothing in ZoneX wants one        */
 /*    without the other.                                                  */
 /*                                                                        */
-/*  MISRA C:2012 deviations (justified)                                   */
+/*  MISRA C:2012 notes: deviations and compliance                         */
 /*                                                                        */
 /*    Directive 4.3 (assembly shall be encapsulated and isolated) --      */
 /*      observed rather than violated: every asm statement below is one   */

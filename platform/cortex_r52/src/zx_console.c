@@ -44,7 +44,7 @@
 /*    decision, docs/decisions.md D8, deliberately left to the step that  */
 /*    first has two guests wanting it.                                    */
 /*                                                                        */
-/*  MISRA C:2012 deviations (justified)                                    */
+/*  MISRA C:2012 notes: deviations and compliance                          */
 /*                                                                        */
 /*    Directive 4.3 -- the single asm statement is alone in                */
 /*      zx_semihost_call and appears nowhere else in this file.            */

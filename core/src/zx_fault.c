@@ -30,7 +30,7 @@
 /*    matters more for this file than for most, because the alternative   */
 /*    is testing a fault decoder by provoking faults.                     */
 /*                                                                        */
-/*  MISRA C:2012 deviations (justified)                                   */
+/*  MISRA C:2012 notes: deviations and compliance                         */
 /*                                                                        */
 /*    Rule 15.5 (single point of exit) -- deviated in the two name        */
 /*      lookups below, which return from inside a switch.  The           */
