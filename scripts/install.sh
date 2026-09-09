@@ -65,10 +65,25 @@ retry() {
 }
 
 retry sudo "${TIMEOUT[@]}" apt-get "${APT_OPTIONS[@]}" update
+# gcc-14 and g++-14 EXPLICITLY, alongside build-essential.
+#
+# build-essential on ubuntu-24.04 is GCC 13, and GCC 14 is the compiler the
+# project names as its Linux reference -- so installing only build-essential
+# left CONTRIBUTING.md claiming a version CI did not have.  Both are
+# installed: build-essential brings the rest of the toolchain furniture that
+# gcc-14 alone does not.
+#
+# This does NOT rewire the default `gcc`, deliberately.  A dependency
+# installer should not change which compiler every other build on the machine
+# picks up.  The workflows name CC and CXX where the version has to be exact;
+# a local build uses whatever `gcc` you have, which is what the "verified
+# once it passes with the versions above" wording in CONTRIBUTING.md is for.
 retry sudo "${TIMEOUT[@]}" apt-get "${APT_OPTIONS[@]}" install -y \
     --no-install-recommends \
     build-essential \
     cmake \
+    g++-14 \
+    gcc-14 \
     git \
     ninja-build \
     python3 \

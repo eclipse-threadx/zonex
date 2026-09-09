@@ -16,8 +16,11 @@
 name: host_tests
 
 # Builds and runs the ZoneX host unit-test suite, under the strict warning set
-# with warnings as errors, and reports coverage.  Also runs the repository
-# checks that need no toolchain.
+# with warnings as errors, and enforces the coverage floor.
+#
+# The repository-wide terminology and reference checks used to run here and
+# now live in repo_checks.yml, unfiltered: this workflow is path-filtered, and
+# a check that scans every tracked file must not be.
 #
 # What this suite covers, and what it deliberately does not: it exercises the
 # architecture-independent half of ZoneX -- the manifest and its validator, the
@@ -65,28 +68,6 @@ on:
       - "test/host/**"
 
 jobs:
-  # Cheap, and independent of every toolchain, so it runs as its own job and
-  # gives an unambiguous answer rather than being buried in a build log.
-  terminology:
-    runs-on: ubuntu-24.04
-    steps:
-    # Actions are pinned to a commit SHA with the version in the trailing
-    # comment.  A tag can be moved; a SHA cannot, which is what makes "which
-    # code ran in our CI" answerable from the repository -- something the
-    # certification work needs on its own account.  Dependabot moves these pins
-    # and rewrites the comments with them; see .github/dependabot.yml.
-    - name: Check out the repository
-      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-    - name: Check for A-profile and RISC-V terminology
-      run: scripts/check_terminology.sh
-
-    # Both checks run in the same job, and both run even if the first fails,
-    # so that one push reports every finding rather than one per re-run.
-    - name: Check for local paths and unreachable references
-      if: '!cancelled()'
-      run: scripts/check_references.sh
-
   host:
     runs-on: ubuntu-24.04
     steps:
@@ -99,9 +80,17 @@ jobs:
     # ci-strict rather than the default preset: CMAKE_COMPILE_WARNING_AS_ERROR
     # is on there, and the point of the strict warning set is that CI enforces
     # it while a developer build stays warning-tolerant.
+    # GCC 14 explicitly.  build-essential on ubuntu-24.04 is GCC 13, so
+    # without naming the compiler CI would build with a version the project
+    # does not treat as its reference -- and CONTRIBUTING.md would be claiming
+    # a pin that did not exist.  install.sh provides gcc-14.
     - name: Build and test, warnings as errors
+      env:
+        CC: gcc-14
+        CXX: g++-14
       run: |
         set -eu
+        gcc-14 --version | head -1
         cmake --preset ci-strict
         cmake --build --preset ci-strict
         ctest --preset ci-strict
@@ -109,7 +98,13 @@ jobs:
     # A separate, instrumented build.  Coverage instrumentation changes code
     # generation, so the run that gates the pull request should not be the
     # instrumented one.
-    - name: Coverage
+    # The floor is ENFORCED here, not merely reported: test_host.sh coverage
+    # runs a second gcovr invocation that fails if the fully reachable core is
+    # below 100% of lines or of branches.
+    - name: Coverage, and the floor it enforces
+      env:
+        CC: gcc-14
+        CXX: g++-14
       run: scripts/test_host.sh coverage
 
     - name: Upload the coverage report

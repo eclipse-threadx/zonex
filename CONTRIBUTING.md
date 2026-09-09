@@ -90,6 +90,8 @@ Compilers:
 
 These versions are what CI pins and what the project treats as the reference. Building with a different version is fine while you develop, but a contribution is only considered verified once it passes with the versions above.
 
+The host compiler is named explicitly rather than inherited: `build-essential` on the runner image is GCC 13, so `scripts/install.sh` installs `gcc-14` alongside it and the workflow sets `CC` and `CXX`. It does not rewire the default `gcc` on your machine — a dependency installer should not change which compiler every other build picks up.
+
 All assembly code targeting Linux toolchains must use GCC syntax.
 
 ## Building and testing
@@ -98,14 +100,24 @@ ZoneX follows the convention the other Eclipse ThreadX repositories use: `script
 
 | Script pair | Target | What it does |
 | ----------- | ------ | ------------ |
-| `scripts/build_host.sh`, `scripts/test_host.sh` | host | Builds and runs the host unit tests over the architecture-independent code. Pass `coverage` to `test_host.sh` for a gcovr report. |
-| `scripts/build_fvp.sh`, `scripts/test_fvp.sh` | Armv8-R AEM FVP | Cross-builds the Cortex-R52 images and executes them on the model. |
-| `scripts/build_s32z280.sh`, `scripts/test_s32z280.sh` | NXP S32Z280-594EVB | Cross-builds the same images for silicon. Running them needs the board. |
+| `scripts/build_host.sh`, `scripts/test_host.sh` | host | Builds and runs the host unit tests over the architecture-independent code. Pass `coverage` to `test_host.sh` to build instrumented, run the suite, write an HTML and XML report, and **enforce the coverage floor** - see below. |
+| `scripts/build_fvp.sh`, `scripts/test_fvp.sh` | Armv8-R AEM FVP | Cross-builds the Cortex-R52 images and executes them on the model. Set `ZX_THREADX` to build the ThreadX guest images too - see below. |
+| `scripts/build_s32z280.sh`, `scripts/test_s32z280.sh` | NXP S32Z280-594EVB | Cross-builds the same images for silicon. Running them needs the board, and `ZX_THREADX` again for the guest images. |
 | `scripts/install.sh` | — | Installs the build and test dependencies on Ubuntu. |
 | `scripts/check_terminology.sh` | — | Rejects register and concept names that belong to other architectures. See below. |
 | `scripts/check_references.sh` | — | Rejects local absolute paths, citations of documents that are not in the repository, and a tracked agent-instruction file. |
 
 `CMakePresets.json` offers the same builds directly: `--preset default` for a warning-tolerant host build, `--preset ci-strict` for the host build with warnings as errors, `--preset coverage`, and `--preset fvp` / `--preset s32z280` for the cross builds.
+
+**The coverage floor is enforced, not reported.** `test_host.sh coverage` writes a report and then runs `gcovr` a second time over the seven files of `core/src` that are reachable in full from a workstation, and **fails the build** if any is below 100% of lines *or* of branches. It is a floor rather than a target: a validator rule added without a case that rejects anything drops the number and breaks the build, which is the point - a rule nothing has ever seen reject anything is a comment, not a rule. Branches matter as much as lines, because the failures those files exist to prevent live in the arms nobody took. [`docs/coverage.md`](docs/coverage.md) records which files are held to the floor, which are not, and what stands in for the ones that are not.
+
+**Building the ThreadX guest images needs `ZX_THREADX`.** ZoneX runs ThreadX kernels inside its partitions, but it does not link ThreadX and keeps no copy of it, so the guest images are built from a checkout you point it at:
+
+```sh
+ZX_THREADX=/path/to/a/threadx/checkout scripts/test_fvp.sh
+```
+
+Leave it unset and the guest images are skipped - with a message at configure time, not an error - while the stage-2 probe images still build and run. That is deliberate, so a contributor with no ThreadX to hand can still exercise most of the suite; but a change touching the guest launch path, the partition switch or anything temporal is not verified until it has been run with the variable set.
 
 **Which suite does your change belong in?** ZoneX runs two, and the split is deliberate. Architecture-independent logic — the partition manifest and its validator, the partition tables, the schedule arithmetic — is covered by the host suite, which runs anywhere in seconds. Stage-2 MPU programming, the trap path, isolation and every timing claim are only true on the FVP and on silicon and are tested there; a host simulator would be testing a simulation of the mechanism rather than the mechanism. [`docs/decisions.md`](docs/decisions.md) D11 has the full reasoning, including why ZoneX does not hold the suite's usual coverage threshold over the whole repository.
 
@@ -119,11 +131,14 @@ Whatever you build, describe in your pull request how you verified your change. 
 
 ## Continuous integration
 
-Four GitHub Actions workflows. **Every one of them triggers on `pull_request` against `dev` and `main`, and on `push` to `dev` and `main`** — a workflow that gates no pull request anybody opens is worse than no workflow, because it looks like coverage.
+Five GitHub Actions workflows. **Every one triggers on `pull_request` against `dev` and `main`, and on `push` to the same two branches** — a workflow that gates no pull request anybody opens is worse than no workflow, because it looks like coverage.
+
+**Four of the five are additionally path-filtered, and one deliberately is not.** A filter keeps a cross-build lane from running when nothing it compiles has changed. But the terminology and reference checks select their input with `git ls-files` and scan *every* tracked file, so any file at all can carry a finding — a stale AArch64 register name in a design note, a local path in a script, a citation of a document nobody else has. Filtering those would skip precisely the prose they exist to police, so `repo_checks.yml` carries no `paths:` on either trigger and runs on everything.
 
 | Workflow | What it checks |
 | -------- | -------------- |
-| `host_tests.yml` | The host unit tests, built with warnings as errors, plus a coverage report. Runs `check_terminology.sh` and `check_references.sh` in a separate job so their answers are unambiguous. |
+| `repo_checks.yml` | `check_terminology.sh` and `check_references.sh`, over every tracked file. Unfiltered, and needs no toolchain, no build and no cache. |
+| `host_tests.yml` | The host unit tests, built with warnings as errors under GCC 14, and the coverage floor — which it enforces rather than reports. |
 | `gcc_check.yml` | Cross-builds every Cortex-R52 configuration — FVP, S32Z280, hard float — with the Arm GNU Toolchain and warnings as errors. Compiles and links; executes nothing. |
 | `clang_check.yml` | The same sources with Arm Toolchain for Embedded. GNU `as` accepts non-canonical assembly forms that LLVM's assembler rejects, and ZoneX is going to be substantially assembly. |
 | `zx_fvp.yml` | Builds the Cortex-R52 images and **executes** them on the Armv8-R AEM FVP, judging each by its self-reported result. There is no static check for "the partition still runs". |
