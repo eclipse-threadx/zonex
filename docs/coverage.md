@@ -102,7 +102,7 @@ reached ones do what they claim.
 
 Not measured and not a target. They are the test harness, not the product.
 
-### Structural coverage of target code is a later, funded concern
+### Structural coverage of target code belongs to the certification phase
 
 MC/DC and structural coverage of the port belong to the certification phase and
 need their own tooling — an instrumenting target build, or a trace-based

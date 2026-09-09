@@ -24,7 +24,7 @@ outside the hypervisor controls, an early exit, conditional cache maintenance, a
 print in a fault path.
 
 This is not a WCET analysis. It is the list of places where one would have to
-start, with what is known about each, so that the funded work begins from
+start, with what is known about each, so that later work begins from
 measurements rather than from a fresh reading of the source.
 
 Figures are from the S32Z280-594EVB: 8 MHz system counter, 48.19 MHz core
@@ -210,7 +210,7 @@ comparison.
 
 ---
 
-## 4. Where the funded work should start
+## 4. Where the next work should start
 
 1. ~~Measure the console driver's guard spin and bound it in counter counts.~~
    **Done, and it was the wrong suspect** — the guard has never spun. Both

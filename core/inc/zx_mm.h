@@ -47,7 +47,7 @@
 /*    it can be if it is interleaved with CP15 writes.  The alternative   */
 /*    -- passing the programmer in as a function pointer -- would keep    */
 /*    one function but put an indirect call on the partition-switch path  */
-/*    of a codebase whose certification back end is funded.               */
+/*    of a codebase intended for certification.                           */
 /*                                                                        */
 /**************************************************************************/
 

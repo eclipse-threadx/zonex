@@ -45,8 +45,8 @@
 /*                                                                        */
 /*    Every condition is its own if with a single predicate.  That costs  */
 /*    nothing at run time and it is what makes MC/DC coverage achievable  */
-/*    later, on a codebase whose certification back end is funded.  There */
-/*    are no compound predicates and no side effects inside a condition.  */
+/*    in the certification phase.  There are no compound predicates and   */
+/*    no side effects inside a condition.                                 */
 /*                                                                        */
 /*    There is no goto: project policy forbids it.  The function returns  */
 /*    on first failure instead, which is also the behaviour the callers   */
