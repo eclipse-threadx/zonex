@@ -68,11 +68,13 @@ For more information, please see the Eclipse Committer Handbook: https://www.ecl
 
 ## Required tooling
 
-Eclipse ThreadX components build with CMake and Ninja. There is no dependency on any IDE, and on Windows there is deliberately no dependency on Visual Studio itself - the Visual Studio Build Tools are enough.
+Eclipse ThreadX components build with CMake and Ninja. There is no dependency on any IDE.
+
+**ZoneX is built and tested on Linux only.** Its targets are the Armv8-R AEM FVP and the NXP S32Z280-594EVB, both cross-compiled with the Arm toolchains, and its host unit tests are built with GCC. There is no Windows build and no PowerShell script set; see [`docs/decisions.md`](docs/decisions.md) D13, which also records how cheaply that could change if ZoneX ever acquires a reason for it. Other components of the suite do support Windows through the Visual Studio Build Tools, with deliberately no dependency on Visual Studio itself.
 
 | Tool | Requirement |
 | ---- | ----------- |
-| CMake | 3.13 or later |
+| CMake | 3.28 or later |
 | Ninja | any recent release |
 | Git | any recent release |
 | Python | 3.x, with `gcovr` 8.6 for coverage reports |
@@ -88,21 +90,64 @@ Compilers:
 
 These versions are what CI pins and what the project treats as the reference. Building with a different version is fine while you develop, but a contribution is only considered verified once it passes with the versions above.
 
+The host compiler is named explicitly rather than inherited: `build-essential` on the runner image is GCC 13, so `scripts/install.sh` installs `gcc-14` alongside it and the workflow sets `CC` and `CXX`. It does not rewire the default `gcc` on your machine — a dependency installer should not change which compiler every other build picks up.
+
 All assembly code targeting Linux toolchains must use GCC syntax.
 
 ## Building and testing
 
-ZoneX does not ship a regression suite yet. This section will be completed once the test harness lands.
+ZoneX follows the convention the other Eclipse ThreadX repositories use: `scripts/` holds one build script and one test script per test target, each a thin wrapper over a `run.sh` under `test/` where the logic actually lives.
 
-The suite will follow the conventions already in use across the Eclipse ThreadX repositories: a `scripts/` directory holding one build script and one test script per test target, shell scripts for Linux and PowerShell scripts for Windows, and CMake presets under `test/`. Each script's role - which target it covers - will be documented here alongside it.
+| Script pair | Target | What it does |
+| ----------- | ------ | ------------ |
+| `scripts/build_host.sh`, `scripts/test_host.sh` | host | Builds and runs the host unit tests over the architecture-independent code. Pass `coverage` to `test_host.sh` to build instrumented, run the suite, write an HTML and XML report, and **enforce the coverage floor** - see below. |
+| `scripts/build_fvp.sh`, `scripts/test_fvp.sh` | Armv8-R AEM FVP | Cross-builds the Cortex-R52 images and executes them on the model. Set `ZX_THREADX` to build the ThreadX guest images too - see below. |
+| `scripts/build_s32z280.sh`, `scripts/test_s32z280.sh` | NXP S32Z280-594EVB | Cross-builds the same images for silicon. Running them needs the board, and `ZX_THREADX` again for the guest images. |
+| `scripts/install.sh` | — | Installs the build and test dependencies on Ubuntu. |
+| `scripts/check_terminology.sh` | — | Rejects register and concept names that belong to other architectures. See below. |
+| `scripts/check_references.sh` | — | Rejects local absolute paths, citations of documents that are not in the repository, and a tracked agent-instruction file. |
 
-Until then, please describe in your pull request how you verified your change.
+`CMakePresets.json` offers the same builds directly: `--preset default` for a warning-tolerant host build, `--preset ci-strict` for the host build with warnings as errors, `--preset coverage`, and `--preset fvp` / `--preset s32z280` for the cross builds.
+
+**The coverage floor is enforced, not reported.** `test_host.sh coverage` writes a report and then runs `gcovr` a second time over the seven files of `core/src` that are reachable in full from a workstation, and **fails the build** if any is below 100% of lines *or* of branches. It is a floor rather than a target: a validator rule added without a case that rejects anything drops the number and breaks the build, which is the point - a rule nothing has ever seen reject anything is a comment, not a rule. Branches matter as much as lines, because the failures those files exist to prevent live in the arms nobody took. [`docs/coverage.md`](docs/coverage.md) records which files are held to the floor, which are not, and what stands in for the ones that are not.
+
+**Building the ThreadX guest images needs `ZX_THREADX`.** ZoneX runs ThreadX kernels inside its partitions, but it does not link ThreadX and keeps no copy of it, so the guest images are built from a checkout you point it at:
+
+```sh
+ZX_THREADX=/path/to/a/threadx/checkout scripts/test_fvp.sh
+```
+
+Leave it unset and the guest images are skipped - with a message at configure time, not an error - while the stage-2 probe images still build and run. That is deliberate, so a contributor with no ThreadX to hand can still exercise most of the suite; but a change touching the guest launch path, the partition switch or anything temporal is not verified until it has been run with the variable set.
+
+**Which suite does your change belong in?** ZoneX runs two, and the split is deliberate. Architecture-independent logic — the partition manifest and its validator, the partition tables, the schedule arithmetic — is covered by the host suite, which runs anywhere in seconds. Stage-2 MPU programming, the trap path, isolation and every timing claim are only true on the FVP and on silicon and are tested there; a host simulator would be testing a simulation of the mechanism rather than the mechanism. [`docs/decisions.md`](docs/decisions.md) D11 has the full reasoning, including why ZoneX does not hold the suite's usual coverage threshold over the whole repository.
+
+**A note on terminology.** ZoneX targets Armv8-R AArch32, where both stages of address control are region-based MPUs. Register names from the AArch64 system-register set, the translation-table registers, and RISC-V memory-protection vocabulary are wrong here by construction, and code that uses one was written against the wrong architecture. `scripts/check_terminology.sh` checks this mechanically and runs in CI; [`docs/armv8r-el2-reference.md`](docs/armv8r-el2-reference.md) holds the verified names, encodings and field layouts. Read it before writing anything that touches a register.
+
+**A note on what a comment may cite.** Write for someone who has only this repository. A comment that points at a local path, or at a numbered step of a document that is not here, tells that reader nothing and dates badly besides — and in a build script a local path means the script runs on one machine. Keep the fact and drop the citation. "A real guest comes later" survives both the reader and the schedule; a comment deferring to a numbered stage of an external plan survives neither. `scripts/check_references.sh` checks this mechanically and runs in CI.
+
+**ZoneX is written to C17**, not C99 — it is the one component of the suite born on that baseline. Extensions are off and `-Wpedantic` is in force, so GNU-only constructs are rejected.
+
+Whatever you build, describe in your pull request how you verified your change. "It builds" is not verification.
 
 ## Continuous integration
 
-ZoneX has no CI workflows yet. They will be added with the test harness, and this section will describe each check and when it runs.
+Five GitHub Actions workflows. **Every one triggers on `pull_request` against `dev` and `main`, and on `push` to the same two branches** — a workflow that gates no pull request anybody opens is worse than no workflow, because it looks like coverage.
 
-CI will follow the conventions used across the Eclipse ThreadX repositories: GitHub Actions workflows running on pull requests against `dev` and on pushes to `dev` and `main`, covering compiler checks on the reference toolchains, port build checks, and the regression suite with coverage reporting. Third-party actions are pinned to a commit SHA rather than a tag.
+**Four of the five are additionally path-filtered, and one deliberately is not.** A filter keeps a cross-build lane from running when nothing it compiles has changed. But the terminology and reference checks select their input with `git ls-files` and scan *every* tracked file, so any file at all can carry a finding — a stale AArch64 register name in a design note, a local path in a script, a citation of a document nobody else has. Filtering those would skip precisely the prose they exist to police, so `repo_checks.yml` carries no `paths:` on either trigger and runs on everything.
+
+| Workflow | What it checks |
+| -------- | -------------- |
+| `repo_checks.yml` | `check_terminology.sh` and `check_references.sh`, over every tracked file. Unfiltered, and needs no toolchain, no build and no cache. |
+| `host_tests.yml` | The host unit tests, built with warnings as errors under GCC 14, and the coverage floor — which it enforces rather than reports. |
+| `gcc_check.yml` | Cross-builds every Cortex-R52 configuration — FVP, S32Z280, hard float — with the Arm GNU Toolchain and warnings as errors. Compiles and links; executes nothing. |
+| `clang_check.yml` | The same sources with Arm Toolchain for Embedded. GNU `as` accepts non-canonical assembly forms that LLVM's assembler rejects, and ZoneX is going to be substantially assembly. |
+| `zx_fvp.yml` | Builds the Cortex-R52 images and **executes** them on the Armv8-R AEM FVP, judging each by its self-reported result. There is no static check for "the partition still runs". |
+
+Arm distributes the Armv8-R AEM FVP free of charge but behind a click-through licence with no stable unauthenticated URL, so `zx_fvp.yml` takes the download location from the `FVP_AEMV8R_URL` repository variable (with an optional `FVP_AEMV8R_SHA256`). When it is unset the build lanes still run and still gate the pull request; only execution is skipped, and it says so in the log and in the job summary rather than passing quietly.
+
+Toolchain versions are pinned explicitly, so a bump is a reviewable commit. Third-party actions are pinned to a commit SHA rather than a tag, and `.github/dependabot.yml` keeps those pins moving — a SHA pin without Dependabot freezes CI on whatever was current the day it was written.
+
+**One thing to know if you have a pull request open already:** a workflow added after your branch was cut does not appear on it. Only a rebase makes new checks show up.
 
 ## Pull request acceptance criteria
 
@@ -120,7 +165,7 @@ Before requesting a review, check your contribution against this list.
 
 **Code**
 
-* The code is C99-compatible.
+* The code is C17-compatible, and compiles clean with extensions off and `-Wpedantic`. (ZoneX differs from the rest of the suite here; see [`docs/decisions.md`](docs/decisions.md) D12.)
 * It follows the coding style of the surrounding code.
 * New functions and structures are documented in comments, as in existing code.
 * MISRA C rules are followed as closely as practical, taking MISRA C 2004, 2012 and 2023 into account. Any deviation is explicit, names the rule being circumvented, and justifies it in a comment.
@@ -152,20 +197,25 @@ Two things are non-negotiable:
 
 This is consistent with the Eclipse Foundation's [Generative AI Usage Guidelines](https://www.eclipse.org/projects/guidelines/genai/) and the [Eclipse Project Handbook](https://www.eclipse.org/projects/handbook/#genai). Please read them before submitting AI-assisted work.
 
-### AGENTS.md
+### Using a coding agent
 
-The repository root carries an `AGENTS.md` file that coding agents read automatically. It restates the rules in this document in a form agents can follow, and covers:
+There is no `AGENTS.md` in this repository, and no other Eclipse ThreadX repository carries one either. This document is the authority, and it is what to point an agent at. A per-repository restatement of these rules would be one more place for them to drift out of step with the document that governs them.
 
-* **General and style rules** - C99, existing coding style, MISRA C, no `goto`, documented functions and structures, optimise for speed and code size.
-* **Compilers** - GCC 14 on Linux, MSVC on Windows, GCC assembly syntax, CMake and Ninja for all builds and tests.
-* **Headers** - the copyright and AI-disclosure templates reproduced below.
-* **Dependencies** - external dependencies forbidden; never copy code from other implementations of a standard.
-* **Regression tests** - 100% coverage, tests ship with the feature.
-* **Git** - feature branches based on `dev`, never commit to `main` or `dev` directly, past-tense commit subjects, `Assisted-by` attribution.
-* **Security advisories** - draft a GHSA when an agent finds a security issue.
-* **Documentation** - documentation changes belong in `rtos-docs-asciidoc`.
+Most agents read a file named `AGENTS.md` or `CLAUDE.md` from the working tree automatically. If you keep one, keep it untracked.
 
-If you use an agent, point it at `AGENTS.md`. If you contribute a change that alters any of these conventions, update `AGENTS.md` in the same pull request.
+What an agent working on ZoneX has to be told, all of it either covered below or linked from here:
+
+* **What is different about ZoneX** - C17 rather than C99, the `zx_` / `ZX_` prefix, and the Armv8-R AArch32 terminology rules that `scripts/check_terminology.sh` enforces in CI. See [`docs/decisions.md`](docs/decisions.md) D12 and D1, and [`docs/armv8r-el2-reference.md`](docs/armv8r-el2-reference.md) for the verified register names.
+* **General and style rules** - follow the surrounding code, MISRA C, no `goto`, document new functions and structures, optimise for speed, code size and predictable worst-case timing.
+* **Compilers** - Arm GNU Toolchain 14.3.rel1 and ATfE 22.1.0 for cross builds, GCC 14 for the host build, GNU assembly syntax, CMake and Ninja for everything.
+* **Headers** - the copyright and AI-disclosure templates below. Every file in this repository is new, so the new-file form is the only one ZoneX needs.
+* **Dependencies** - external dependencies are forbidden; never copy code from another implementation of a standard.
+* **Regression tests** - 100% coverage, tests ship with the feature, and the change goes in whichever of the two suites can actually exercise it. See "Building and testing" above.
+* **Git** - feature branches based on `dev`, never commit to `main` or `dev` directly, past-tense commit subjects, `Assisted-by` attribution and never `Co-Authored-By`.
+* **Security advisories** - draft a GHSA rather than describing the issue in a public pull request.
+* **Documentation** - manual changes belong in `rtos-docs-asciidoc`; design decisions belong in [`docs/decisions.md`](docs/decisions.md) and verified hardware facts in [`docs/armv8r-el2-reference.md`](docs/armv8r-el2-reference.md).
+
+Whatever the agent produced, you are the contributor. The checklist under "Pull request acceptance criteria" above applies unchanged.
 
 ### Header for new files
 
@@ -252,7 +302,7 @@ Fixed the guest context switch on AArch64
 The saved SPSR was restored before the general-purpose registers, so a
 guest resuming from an exception observed the wrong PSTATE.
 
-Assisted-by: Claude Code (Opus 5)
+Assisted-by: Claude Code (Opus 5) <noreply@anthropic.com>
 ```
 
 ## Release model and support
