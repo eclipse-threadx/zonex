@@ -143,7 +143,7 @@ Five GitHub Actions workflows. **Every one triggers on `pull_request` against `d
 | `clang_check.yml` | The same sources with Arm Toolchain for Embedded. GNU `as` accepts non-canonical assembly forms that LLVM's assembler rejects, and ZoneX is going to be substantially assembly. |
 | `zx_fvp.yml` | Builds the Cortex-R52 images and **executes** them on the Armv8-R AEM FVP, judging each by its self-reported result. There is no static check for "the partition still runs". |
 
-Arm distributes the Armv8-R AEM FVP free of charge but behind a click-through licence with no stable unauthenticated URL, so `zx_fvp.yml` takes the download location from the `FVP_AEMV8R_URL` repository variable (with an optional `FVP_AEMV8R_SHA256`). When it is unset the build lanes still run and still gate the pull request; only execution is skipped, and it says so in the log and in the job summary rather than passing quietly.
+`zx_fvp.yml` downloads the Armv8-R AEM FVP from Arm's public permalink, verifies it against a SHA-256 pinned in the workflow, and installs it with Arm's installer, so every run executes the images. A missing model fails the job.
 
 Toolchain versions are pinned explicitly, so a bump is a reviewable commit. Third-party actions are pinned to a commit SHA rather than a tag, and `.github/dependabot.yml` keeps those pins moving — a SHA pin without Dependabot freezes CI on whatever was current the day it was written.
 
